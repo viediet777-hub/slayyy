@@ -733,31 +733,16 @@ class SlayScanEngine:
                     
                     # ===== CLEAN CODE FOUND MESSAGE - NO BANNER =====
                     code_msg = f"""
-✅ <b>VALID CODE FOUND</b>
+⚡ <b>VIEDIET HIT</b>
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 <code>{code}</code>
+📱 <code>{masked_mobile}</code>
+{f'💰 <code>{reward}</code>' if reward else ''}
+🕒 <code>{datetime.now().strftime('%H:%M:%S')}</code>
 
-🎯 <b>Code:</b> <code>{code}</code>
-📱 <b>Mobile:</b> <code>{masked_mobile}</code>
-{f"💰 <b>Reward:</b> <code>{reward}</code>" if reward else ""}
-🕐 <b>Found at:</b> <code>{datetime.now().strftime('%H:%M:%S')}</code>
+📈 <code>{self.valid_count}</code>/<code>{self.tested_count}</code> valid
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-<b>📊 Scan Stats:</b>
-├─ Codes Tested: <code>{self.tested_count}</code>
-└─ Valid Codes: <code>{self.valid_count}</code>
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-<b>📌 Next Steps:</b>
-1️⃣ Go to https://slayyourplaypromo.in/
-2️⃣ Enter this code
-3️⃣ Claim your reward!
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💾 Code saved in <b>"My Codes"</b> section
+💾 <b>Stored in My Codes</b>
 """
                     self.bot.send_message(
                         self.chat_id,
