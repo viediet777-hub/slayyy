@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# NRTECNO SYSTEM - SLAY BOT v3.2
-# FIXED: Clean code found box - NO BANNER
+# NRTECNO SYSTEM - SLAY BOT v3.3
+# FIXED: Minimal code found message - No link, No banner
 
 import os
 import logging
@@ -336,7 +336,7 @@ def run_scheduled_tasks():
 def main_menu_text(user_id, first_name, balance, status, codes_found=0):
     return f"""
 ╔═══════════════════════════════════════════════╗
-║           🎮 **VIEDIET SLAY BOT**          ║
+║           🎮 **SLAY YOUR PLAY BOT**          ║
 ╚═══════════════════════════════════════════════╝
 
 👋 Welcome back, <b>{first_name}</b>!
@@ -731,7 +731,7 @@ class SlayScanEngine:
                     masked_mobile = mask_mobile(self.mobile) if self.mobile else "N/A"
                     self.valid_count += 1
                     
-                    # ===== CLEAN CODE FOUND MESSAGE - NO BANNER =====
+                    # ===== MINIMAL CODE FOUND MESSAGE - NO LINK =====
                     code_msg = f"""
 ⚡ <b>VIEDIET HIT</b>
 
@@ -1565,7 +1565,7 @@ if __name__ == "__main__":
     task_thread.start()
     
     logger.info("=" * 50)
-    logger.info("🎮 SLAY BOT v3.2 STARTED")
+    logger.info("🎮 SLAY BOT v3.3 STARTED")
     logger.info("=" * 50)
     logger.info("💰 New Users: 0 credits")
     logger.info("🔗 Referral: +1 credit")
@@ -1575,6 +1575,7 @@ if __name__ == "__main__":
     logger.info(f"📁 workingslay.py: {'✅ Found' if check_workingslay() else '❌ MISSING'}")
     logger.info("📱 Mobile numbers: Masked for privacy")
     logger.info("📊 Progress bar: Enabled")
+    logger.info("⚡ Viediet Hit format: Enabled")
     logger.info("=" * 50)
     
     try:
