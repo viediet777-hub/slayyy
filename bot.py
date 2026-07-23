@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# NRTECNO SYSTEM - SLAY BOT v3.4
-# FIXED: 409 Conflict + OTP Handler
+# NRTECNO SYSTEM - SLAY BOT v3.2
+# FIXED: Clean code found box - NO BANNER
 
 import os
 import logging
@@ -610,6 +610,7 @@ class SlayScanEngine:
         return f"✅ Scan started!\n📱 Mobile: {mask_mobile(mobile)}\n💰 Cost: {SCAN_COST} credit"
     
     def _update_status(self, message):
+        """Update status message with progress bar"""
         try:
             masked_mobile = mask_mobile(self.mobile) if self.mobile else "N/A"
             bar = progress_bar(self.tested_count, 2000, 15)
@@ -652,6 +653,8 @@ class SlayScanEngine:
             logger.error(f"Status update error: {e}")
     
     def _monitor_output(self):
+        """Monitor workingslay.py output in real-time"""
+        
         self._update_status("⏳ Starting scan...")
         
         while self.is_running and self.process:
@@ -670,6 +673,7 @@ class SlayScanEngine:
                 
                 self.update_count += 1
                 
+                # Extract stats
                 if "Tested:" in line or "STATS" in line:
                     tested_match = re.search(r'Tested:\s*(\d+)', line)
                     valid_match = re.search(r'Valid:\s*(\d+)', line)
@@ -685,6 +689,7 @@ class SlayScanEngine:
                 if "INVALID" in line.upper():
                     continue
                 
+                # ===== DETECT VALID CODE =====
                 is_valid = False
                 code = None
                 reward = None
@@ -711,6 +716,7 @@ class SlayScanEngine:
                 if reward_match:
                     reward = f"₹{reward_match.group(1)}"
                 
+                # If valid code found
                 if is_valid and code:
                     logger.info(f"✅ VALID CODE FOUND: {code}")
                     
@@ -725,17 +731,33 @@ class SlayScanEngine:
                     masked_mobile = mask_mobile(self.mobile) if self.mobile else "N/A"
                     self.valid_count += 1
                     
+                    # ===== CLEAN CODE FOUND MESSAGE - NO BANNER =====
                     code_msg = f"""
-⚡ <b>VIEDIET HIT</b>
+✅ <b>VALID CODE FOUND</b>
 
-🎯 <code>{code}</code>
-📱 <code>{masked_mobile}</code>
-{f'💰 <code>{reward}</code>' if reward else ''}
-🕒 <code>{datetime.now().strftime('%H:%M:%S')}</code>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📈 <code>{self.valid_count}</code>/<code>{self.tested_count}</code> valid
+🎯 <b>Code:</b> <code>{code}</code>
+📱 <b>Mobile:</b> <code>{masked_mobile}</code>
+{f"💰 <b>Reward:</b> <code>{reward}</code>" if reward else ""}
+🕐 <b>Found at:</b> <code>{datetime.now().strftime('%H:%M:%S')}</code>
 
-💾 <b>Stored in My Codes</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>📊 Scan Stats:</b>
+├─ Codes Tested: <code>{self.tested_count}</code>
+└─ Valid Codes: <code>{self.valid_count}</code>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>📌 Next Steps:</b>
+1️⃣ Go to https://slayyourplaypromo.in/
+2️⃣ Enter this code
+3️⃣ Claim your reward!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💾 Code saved in <b>"My Codes"</b> section
 """
                     self.bot.send_message(
                         self.chat_id,
@@ -748,6 +770,7 @@ class SlayScanEngine:
                     self.stop_scan()
                     break
                 
+                # Update progress every 50 checks
                 if self.tested_count % 50 == 0 and self.tested_count > 0:
                     self._update_status(f"📊 Testing codes...")
                 
@@ -1398,14 +1421,6 @@ def slay_phone_handler(message):
                 user_slay_state[user_id] = None
                 update_user_balance(user_id, SCAN_COST)
                 
-        except ImportError as e:
-            update_user_balance(user_id, SCAN_COST)
-            bot.edit_message_text(
-                f"❌ Error: workingslay.py not found.",
-                chat_id=message.chat.id,
-                message_id=status_msg.message_id
-            )
-            user_slay_state[user_id] = None
         except Exception as e:
             update_user_balance(user_id, SCAN_COST)
             bot.edit_message_text(
@@ -1445,13 +1460,6 @@ def slay_otp_handler(message):
     session = data.get("session")
     user_key = data.get("user_key")
     data_key = data.get("data_key")
-    
-    if not session or not user_key or not data_key:
-        bot.reply_to(message, "❌ Session data missing. Please start again.")
-        user_slay_state[user_id] = None
-        if user_id in slay_otp_data:
-            del slay_otp_data[user_id]
-        return
     
     status_msg = bot.reply_to(message, "🔄 Verifying OTP...")
     
@@ -1507,14 +1515,6 @@ def slay_otp_handler(message):
                 if user_id in slay_otp_data:
                     del slay_otp_data[user_id]
                 
-        except ImportError as e:
-            update_user_balance(user_id, cost)
-            bot.edit_message_text(
-                f"❌ Import Error: {str(e)}",
-                chat_id=message.chat.id,
-                message_id=status_msg.message_id
-            )
-            user_slay_state[user_id] = None
         except Exception as e:
             update_user_balance(user_id, cost)
             bot.edit_message_text(
@@ -1580,7 +1580,7 @@ if __name__ == "__main__":
     task_thread.start()
     
     logger.info("=" * 50)
-    logger.info("🎮 SLAY BOT v3.4 STARTED")
+    logger.info("🎮 SLAY BOT v3.2 STARTED")
     logger.info("=" * 50)
     logger.info("💰 New Users: 0 credits")
     logger.info("🔗 Referral: +1 credit")
@@ -1590,29 +1590,19 @@ if __name__ == "__main__":
     logger.info(f"📁 workingslay.py: {'✅ Found' if check_workingslay() else '❌ MISSING'}")
     logger.info("📱 Mobile numbers: Masked for privacy")
     logger.info("📊 Progress bar: Enabled")
-    logger.info("⚡ Viediet Hit format: Enabled")
     logger.info("=" * 50)
     
-    # ===== FIX 409 ERROR =====
     try:
-        # Stop any existing webhook
         bot.remove_webhook()
-        time.sleep(2)
+        time.sleep(1)
     except:
         pass
     
-    # ===== FIX 409 ERROR - Use a single polling loop =====
     while True:
         try:
             logger.info("🔄 Starting polling...")
-            # Use non_stop=True to avoid restart loops
-            bot.polling(non_stop=True, interval=1, timeout=30)
+            bot.polling(non_stop=False, interval=1, timeout=30)
         except Exception as e:
-            if "409" in str(e):
-                logger.warning("⚠️ Conflict detected. Another instance running.")
-                logger.warning("🔄 Waiting 15 seconds before retry...")
-                time.sleep(15)
-            else:
-                logger.error(f"Polling error: {e}")
-                logger.info("🔄 Restarting polling in 5 seconds...")
-                time.sleep(5)
+            logger.error(f"Polling error: {e}")
+            logger.info("🔄 Restarting polling in 10 seconds...")
+            time.sleep(10)
