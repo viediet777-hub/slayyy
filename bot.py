@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# NRTECNO SYSTEM - SLAY BOT v2.5
-# FIXED: Channel join force + Clean code display
+# NRTECNO SYSTEM - SLAY BOT v3.0
+# FIXED: Valid code detection + Better UI + Mobile hiding
 
 import os
 import logging
@@ -24,7 +24,7 @@ if not BOT_TOKEN:
     exit(1)
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 1364476174))
-CHANNEL_USERNAME = "viedietlooters"  # Channel username without @
+CHANNEL_USERNAME = "viedietlooters"
 
 # Credit System
 NEW_USER_BONUS = 0
@@ -243,13 +243,14 @@ def update_channel_status(user_id, status):
     conn.commit()
     conn.close()
 
-def get_channel_status(user_id):
-    user = get_user(user_id)
-    return user.get('channel_joined', 0) if user else 0
+def mask_mobile(mobile):
+    """Mask mobile number - show only first 2 and last 2 digits"""
+    if not mobile or len(mobile) < 4:
+        return mobile
+    return f"{mobile[:2]}******{mobile[-2:]}"
 
 # ==================== CHANNEL CHECK ====================
 def check_channel_membership(user_id):
-    """Check if user is member of required channel"""
     try:
         member = bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
         is_member = member.status in ['member', 'administrator', 'creator']
@@ -260,7 +261,6 @@ def check_channel_membership(user_id):
         return False
 
 def channel_join_force_keyboard():
-    """Keyboard for channel join force"""
     kb = InlineKeyboardMarkup(row_width=1)
     kb.row(InlineKeyboardButton("📢 JOIN CHANNEL", url=f"https://t.me/{CHANNEL_USERNAME}"))
     kb.row(InlineKeyboardButton("✅ CHECKED JOINED", callback_data="check_channel"))
@@ -277,13 +277,6 @@ def channel_join_message():
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 📢 <b>Channel:</b> @{CHANNEL_USERNAME}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-<b>Why join?</b>
-• Get latest updates
-• Exclusive offers
-• Support community
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -331,9 +324,9 @@ def run_scheduled_tasks():
 # ==================== MENU FUNCTIONS ====================
 def main_menu_text(user_id, first_name, balance, status, codes_found=0):
     return f"""
-═══════════════════════════════════════════════
-           🎮 VIEDIET SLAY BOT        
-
+╔═══════════════════════════════════════════════╗
+║           🎮 **SLAY YOUR PLAY BOT**          ║
+╚═══════════════════════════════════════════════╝
 
 👋 Welcome back, <b>{first_name}</b>!
 
@@ -347,7 +340,6 @@ def main_menu_text(user_id, first_name, balance, status, codes_found=0):
 <b>⚡ Quick Actions:</b>
 • Click <b>🎮 START SCAN</b> to find codes
 • Share <b>🔗 REFERRAL</b> to earn credits
-• Check <b>📊 STATUS</b> for your stats
 
 <b>💡 Pro Tip:</b> 
 • <b>1 scan = {SCAN_COST} credit</b>
@@ -450,11 +442,12 @@ Click <b>🎮 START SCAN</b> from the menu.
 """
     
     for code, mobile, reward, found_at in codes:
+        masked_mobile = mask_mobile(mobile) if mobile else "N/A"
         reward_text = f"💰 Reward: {reward}" if reward else ""
         text += f"""
 ┌─────────────────────────────────────────────┐
 │ ✅ <b>CODE:</b> <code>{code}</code>               │
-│ 📱 Mobile: <code>{mobile}</code>               │
+│ 📱 Mobile: <code>{masked_mobile}</code>         │
 │ {reward_text}                               │
 │ 📅 Found: {found_at[:10]}                   │
 └─────────────────────────────────────────────┘
@@ -464,7 +457,6 @@ Click <b>🎮 START SCAN</b> from the menu.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 💡 <b>Tip:</b> Submit this code on SlayYourPlay!
 """
-    
     return text
 
 def my_codes_keyboard():
@@ -537,6 +529,8 @@ class SlayScanEngine:
         self.found_code = None
         self.mobile = None
         self.codes_found = []
+        self.tested_count = 0
+        self.valid_count = 0
     
     def start_scan(self, mobile: str, reward_mobile: str = None) -> str:
         if self.is_running:
@@ -551,6 +545,8 @@ class SlayScanEngine:
         reward = reward_mobile or mobile
         self.mobile = mobile
         self.codes_found = []
+        self.tested_count = 0
+        self.valid_count = 0
         
         balance = get_user_balance(self.user_id)
         if balance < SCAN_COST:
@@ -562,7 +558,7 @@ class SlayScanEngine:
             sys.executable, "workingslay.py",
             "--mobile", mobile,
             "--reward-mobile", reward,
-            "--delay", "0.2",
+            "--delay", "0.5",  # Slower delay for better validation
             "--expiry", "30",
             "--no-proxy"
         ]
@@ -598,10 +594,11 @@ class SlayScanEngine:
         self.thread = threading.Thread(target=self._monitor_output, daemon=True)
         self.thread.start()
         
-        return f"✅ Scan started!\n📱 Mobile: {mobile}\n💰 Cost: {SCAN_COST} credit"
+        return f"✅ Scan started!\n📱 Mobile: {mask_mobile(mobile)}\n💰 Cost: {SCAN_COST} credit"
     
     def _monitor_output(self):
         """Monitor workingslay.py output in real-time"""
+        last_stats_update = time.time()
         
         while self.is_running and self.process:
             try:
@@ -619,41 +616,52 @@ class SlayScanEngine:
                 
                 self.update_count += 1
                 
-                # Send raw output to user (filtered)
-                self._send_update(line)
+                # Extract stats from line
+                if "Tested:" in line or "STATS" in line:
+                    # Parse stats
+                    tested_match = re.search(r'Tested:\s*(\d+)', line)
+                    valid_match = re.search(r'Valid:\s*(\d+)', line)
+                    if tested_match:
+                        self.tested_count = int(tested_match.group(1))
+                    if valid_match:
+                        self.valid_count = int(valid_match.group(1))
+                    self._send_update(f"📊 {line}")
+                    continue
+                
+                # Skip invalid codes to avoid spam
+                if "INVALID" in line.upper():
+                    continue
+                
+                # Send important messages
+                keywords = ["VALID", "REWARD", "FOUND", "ERROR", "FINAL", "CODE", "LIVE"]
+                if any(k in line.upper() for k in keywords):
+                    self._send_update(f"📡 {line[:200]}")
                 
                 # ===== DETECT VALID CODE =====
                 is_valid = False
                 code = None
                 reward = None
                 
-                # Pattern 1: "VALID CODE MILA: 123456789012"
+                # Pattern 1: "VALID CODE MILA: 123456789012" or "VALID" in line
                 if "VALID" in line.upper() or "CODE MILA" in line:
                     is_valid = True
-                    code_match = re.search(r'\b\d{10,12}\b', line)
+                    code_match = re.search(r'\b\d{12}\b', line)
                     if code_match:
                         code = code_match.group()
                 
                 # Pattern 2: "[LIVE] 123456789012 | VALID"
                 if "[LIVE]" in line and "VALID" in line.upper():
                     is_valid = True
-                    code_match = re.search(r'\b\d{10,12}\b', line)
+                    code_match = re.search(r'\b\d{12}\b', line)
                     if code_match:
                         code = code_match.group()
                 
                 # Pattern 3: "[REWARD] Valid code: 123456789012"
                 if "[REWARD]" in line and "Valid code" in line:
                     is_valid = True
-                    code_match = re.search(r'\b\d{10,12}\b', line)
+                    code_match = re.search(r'\b\d{12}\b', line)
                     if code_match:
                         code = code_match.group()
-                
-                # Pattern 4: Simple 12-digit number with VALID context
-                if not is_valid:
-                    digits = re.findall(r'\b\d{10,12}\b', line)
-                    if digits and ("VALID" in line.upper() or "FOUND" in line.upper() or "CODE" in line.upper()):
-                        is_valid = True
-                        code = digits[0]
                 
                 # Extract reward amount if present
                 reward_match = re.search(r'₹\s*(\d+)', line)
@@ -678,14 +686,24 @@ class SlayScanEngine:
                     conn.commit()
                     conn.close()
                     
-                    # Send CLEAN code to user (without banner)
+                    masked_mobile = mask_mobile(self.mobile) if self.mobile else "N/A"
+                    
+                    # Send CLEAN code to user with masked mobile
                     code_msg = f"""
 ✅ <b>VALID CODE FOUND!</b>
 
-<b>🎯 Code:</b> <code>{code}</code>
-📱 Mobile: <code>{self.mobile or 'N/A'}</code>
-{f"💰 Reward: <code>{reward}</code>" if reward else ""}
-🕐 Found at: <code>{datetime.now().strftime('%H:%M:%S')}</code>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 <b>Code:</b> <code>{code}</code>
+📱 <b>Mobile:</b> <code>{masked_mobile}</code>
+{f"💰 <b>Reward:</b> <code>{reward}</code>" if reward else ""}
+🕐 <b>Found at:</b> <code>{datetime.now().strftime('%H:%M:%S')}</code>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+<b>📊 Scan Stats:</b>
+├─ Codes Tested: <code>{self.tested_count or self.update_count}</code>
+└─ Valid Codes: <code>{self.valid_count + 1}</code>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -711,8 +729,15 @@ class SlayScanEngine:
                     self.stop_scan()
                     break
                 
+                # Update stats every 5 seconds
+                if time.time() - last_stats_update > 5:
+                    last_stats_update = time.time()
+                    if self.tested_count > 0:
+                        self._send_update(f"📊 Codes Tested: {self.tested_count} | Valid: {self.valid_count}")
+                
                 # Check for "FINAL" stats - scan ending
                 if "FINAL" in line.upper() and "STATS" in line.upper():
+                    # Check if any code was found in this scan
                     if not self.codes_found:
                         self._send_update("❌ No valid codes found in this scan.")
                     else:
@@ -730,30 +755,27 @@ class SlayScanEngine:
             self.is_running = False
         
         if not self.codes_found:
-            self._send_update("❌ Scan ended. No valid codes found.")
+            self._send_update(f"❌ Scan ended. Tested {self.tested_count or self.update_count} codes, no valid found.")
         else:
             self._send_update(f"✅ Scan completed! Found {len(self.codes_found)} valid codes.")
     
     def _send_update(self, message):
         """Send update to Telegram"""
         try:
-            # Skip invalid codes to avoid spam
-            if "INVALID" in message.upper():
-                return
+            # Clean the message
+            clean_msg = message[:500]
             
-            # Only send important messages
-            keywords = ["VALID", "REWARD", "FOUND", "STATS", "ERROR", "FINAL", "CODE", "LIVE", "[LIVE]", "[REWARD]", "[STATS]"]
-            if any(k in message.upper() for k in keywords):
-                clean_msg = message[:500]
+            # Send important messages only
+            if "📊" in message or "VALID" in message or "REWARD" in message or "FOUND" in message:
                 self.bot.send_message(
                     self.chat_id,
-                    f"📡 `{clean_msg}`",
-                    parse_mode="Markdown"
+                    f"{clean_msg}",
+                    parse_mode="Markdown" if "**" in message else "HTML"
                 )
             elif "STATS" in message.upper() or "Tested:" in message:
                 self.bot.send_message(
                     self.chat_id,
-                    f"📊 `{message[:500]}`",
+                    f"📊 `{clean_msg}`",
                     parse_mode="Markdown"
                 )
         except Exception as e:
@@ -1189,7 +1211,6 @@ def callback_handler(call):
     
     # ===== SLAY START =====
     if data == "slay_start":
-        # Check channel first
         if not check_channel_membership(user_id):
             bot.answer_callback_query(call.id, "❌ Please join channel first!", show_alert=True)
             return
@@ -1206,7 +1227,7 @@ def callback_handler(call):
         
         try:
             bot.edit_message_text(
-                "📱 Enter your 10-digit mobile number for Slay Your Play:\n\nSend /cancel to abort.",
+                "📱 Enter your 10-digit mobile number:\n\nSend /cancel to abort.",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 reply_markup=kb
@@ -1223,7 +1244,7 @@ def callback_handler(call):
             del slay_otp_data[user_id]
         try:
             bot.edit_message_text(
-                "❌ Slay operation cancelled.",
+                "❌ Operation cancelled.",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 reply_markup=back_button()
@@ -1328,7 +1349,7 @@ def slay_phone_handler(message):
     
     if phone.lower() in ['/cancel', 'cancel']:
         user_slay_state[user_id] = None
-        bot.reply_to(message, "❌ Slay scan cancelled.", reply_markup=back_button())
+        bot.reply_to(message, "❌ Scan cancelled.", reply_markup=back_button())
         return
     
     if not phone.isdigit() or len(phone) != 10:
@@ -1355,7 +1376,7 @@ def slay_phone_handler(message):
         try:
             if not check_workingslay():
                 bot.edit_message_text(
-                    "❌ workingslay.py not found! Please add the file.",
+                    "❌ workingslay.py not found!",
                     chat_id=message.chat.id,
                     message_id=status_msg.message_id
                 )
@@ -1371,7 +1392,7 @@ def slay_phone_handler(message):
             user_key, data_key = init_session(session, master_key)
             if not user_key:
                 bot.edit_message_text(
-                    "❌ Failed to initialize session. Please try again.",
+                    "❌ Failed to initialize session.",
                     chat_id=message.chat.id,
                     message_id=status_msg.message_id
                 )
@@ -1383,7 +1404,7 @@ def slay_phone_handler(message):
             
             if success:
                 bot.edit_message_text(
-                    f"✅ OTP sent to +91{phone}!\n\nEnter the 6-digit OTP code:\nSend /cancel to abort.",
+                    f"✅ OTP sent to +91{phone}!\n\nEnter the 6-digit OTP code:",
                     chat_id=message.chat.id,
                     message_id=status_msg.message_id,
                     reply_markup=kb
@@ -1393,7 +1414,7 @@ def slay_phone_handler(message):
                 slay_otp_data[user_id]["data_key"] = data_key
             else:
                 bot.edit_message_text(
-                    f"❌ Failed to send OTP. Please try again later.",
+                    f"❌ Failed to send OTP. Please try again.",
                     chat_id=message.chat.id,
                     message_id=status_msg.message_id
                 )
@@ -1403,7 +1424,7 @@ def slay_phone_handler(message):
         except ImportError as e:
             update_user_balance(user_id, SCAN_COST)
             bot.edit_message_text(
-                f"❌ Import Error: workingslay.py not found or has errors.\n\nPlease make sure workingslay.py is in the same directory.\n\nError: {str(e)}",
+                f"❌ Error: workingslay.py not found.",
                 chat_id=message.chat.id,
                 message_id=status_msg.message_id
             )
@@ -1429,11 +1450,11 @@ def slay_otp_handler(message):
         if user_id in slay_otp_data:
             update_user_balance(user_id, slay_otp_data[user_id]["cost"])
             del slay_otp_data[user_id]
-        bot.reply_to(message, "❌ Slay scan cancelled.", reply_markup=back_button())
+        bot.reply_to(message, "❌ Scan cancelled.", reply_markup=back_button())
         return
     
     if not otp.isdigit() or len(otp) != 6:
-        bot.reply_to(message, "❌ Please enter a valid 6-digit OTP.\n\nSend /cancel to abort.")
+        bot.reply_to(message, "❌ Please enter a valid 6-digit OTP.")
         return
     
     if user_id not in slay_otp_data:
@@ -1448,7 +1469,7 @@ def slay_otp_handler(message):
     user_key = data.get("user_key")
     data_key = data.get("data_key")
     
-    status_msg = bot.reply_to(message, "🔄 Verifying OTP and logging in...")
+    status_msg = bot.reply_to(message, "🔄 Verifying OTP...")
     
     def verify_thread():
         try:
@@ -1477,10 +1498,10 @@ def slay_otp_handler(message):
                 conn.close()
                 
                 bot.edit_message_text(
-                    f"✅ <b>Slay Login Successful!</b>\n\n"
-                    f"📱 Phone: +91{phone}\n"
+                    f"✅ <b>Login Successful!</b>\n\n"
+                    f"📱 Mobile: {mask_mobile(phone)}\n"
                     f"💰 Balance: <code>{get_user_balance(user_id)}</code>\n\n"
-                    f"🎮 Starting scan automatically...",
+                    f"🎮 Starting scan now...",
                     chat_id=message.chat.id,
                     message_id=status_msg.message_id,
                     parse_mode="HTML"
@@ -1494,7 +1515,7 @@ def slay_otp_handler(message):
             else:
                 update_user_balance(user_id, cost)
                 bot.edit_message_text(
-                    f"❌ OTP verification failed.\n\nPlease try again with a valid OTP.",
+                    f"❌ OTP verification failed.\n\nPlease try again.",
                     chat_id=message.chat.id,
                     message_id=status_msg.message_id
                 )
@@ -1502,14 +1523,6 @@ def slay_otp_handler(message):
                 if user_id in slay_otp_data:
                     del slay_otp_data[user_id]
                 
-        except ImportError as e:
-            update_user_balance(user_id, cost)
-            bot.edit_message_text(
-                f"❌ Import Error: {str(e)}",
-                chat_id=message.chat.id,
-                message_id=status_msg.message_id
-            )
-            user_slay_state[user_id] = None
         except Exception as e:
             update_user_balance(user_id, cost)
             bot.edit_message_text(
@@ -1527,9 +1540,9 @@ def start_slay_scan(message, user_id, phone):
     scan_msg = bot.reply_to(
         message,
         f"🔍 **SLAY SCAN STARTED**\n\n"
-        f"📱 Mobile: `+91{phone}`\n"
+        f"📱 Mobile: `{mask_mobile(phone)}`\n"
         f"⏳ Scanning for valid codes...\n"
-        f"🔄 Auto-stop on code found\n\n"
+        f"🔄 Auto-stop on valid code\n\n"
         f"_This may take several minutes._",
         parse_mode="Markdown"
     )
@@ -1542,9 +1555,9 @@ def start_slay_scan(message, user_id, phone):
         if "✅" in result:
             bot.edit_message_text(
                 f"✅ **Scan Started!**\n\n"
-                f"📱 Mobile: `+91{phone}`\n"
+                f"📱 Mobile: `{mask_mobile(phone)}`\n"
                 f"🔍 Scanning in progress...\n\n"
-                f"_Check back for results._",
+                f"_Live updates will appear here._",
                 chat_id=message.chat.id,
                 message_id=scan_msg.message_id,
                 parse_mode="Markdown"
@@ -1574,7 +1587,7 @@ if __name__ == "__main__":
     task_thread.start()
     
     logger.info("=" * 50)
-    logger.info("🎮 SLAY BOT STARTED")
+    logger.info("🎮 SLAY BOT v3.0 STARTED")
     logger.info("=" * 50)
     logger.info("💰 New Users: 0 credits")
     logger.info("🔗 Referral: +1 credit")
@@ -1582,7 +1595,7 @@ if __name__ == "__main__":
     logger.info("📢 Channel: @{}".format(CHANNEL_USERNAME))
     logger.info("👑 Admin: /addcoins, /removecoins, /setcost, /broadcast")
     logger.info(f"📁 workingslay.py: {'✅ Found' if check_workingslay() else '❌ MISSING'}")
-    logger.info("📋 My Codes: Added")
+    logger.info("📱 Mobile numbers: Masked for privacy")
     logger.info("=" * 50)
     
     try:
