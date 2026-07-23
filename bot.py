@@ -331,9 +331,9 @@ def run_scheduled_tasks():
 # ==================== MENU FUNCTIONS ====================
 def main_menu_text(user_id, first_name, balance, status, codes_found=0):
     return f"""
-╔═══════════════════════════════════════════════╗
-║           🎮 **SLAY YOUR PLAY BOT**          ║
-╚═══════════════════════════════════════════════╝
+═══════════════════════════════════════════════
+           🎮 VIEDIET SLAY BOT        
+
 
 👋 Welcome back, <b>{first_name}</b>!
 
