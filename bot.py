@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# NRTECNO SYSTEM - SLAY BOT v3.1
-# FIXED: Progress bar + Compact box design
+# NRTECNO SYSTEM - SLAY BOT v3.2
+# FIXED: Clean code found box - NO BANNER
 
 import os
 import logging
@@ -248,13 +248,16 @@ def mask_mobile(mobile):
         return mobile
     return f"{mobile[:2]}******{mobile[-2:]}"
 
-def progress_bar(current, total, length=20):
-    """Create a progress bar"""
+def progress_bar(current, total, length=15):
     if total == 0:
         return "█" * length + " 0%"
     filled = int(length * current / total)
+    if filled > length:
+        filled = length
     bar = "█" * filled + "░" * (length - filled)
     percent = int((current / total) * 100)
+    if percent > 100:
+        percent = 100
     return f"{bar} {percent}%"
 
 # ==================== CHANNEL CHECK ====================
@@ -333,7 +336,7 @@ def run_scheduled_tasks():
 def main_menu_text(user_id, first_name, balance, status, codes_found=0):
     return f"""
 ╔═══════════════════════════════════════════════╗
-║           🎮 **SLAY YOUR PLAY BOT**          ║
+║           🎮 **VIEDIET SLAY BOT**          ║
 ╚═══════════════════════════════════════════════╝
 
 👋 Welcome back, <b>{first_name}</b>!
@@ -540,9 +543,6 @@ class SlayScanEngine:
         self.tested_count = 0
         self.valid_count = 0
         self.status_msg_id = None
-        self.last_stats = ""
-        self.progress_update_interval = 10  # Update every 10 checks
-        self.last_progress_update = 0
     
     def start_scan(self, mobile: str, reward_mobile: str = None) -> str:
         if self.is_running:
@@ -560,7 +560,6 @@ class SlayScanEngine:
         self.tested_count = 0
         self.valid_count = 0
         self.status_msg_id = None
-        self.last_progress_update = 0
         
         balance = get_user_balance(self.user_id)
         if balance < SCAN_COST:
@@ -614,7 +613,7 @@ class SlayScanEngine:
         """Update status message with progress bar"""
         try:
             masked_mobile = mask_mobile(self.mobile) if self.mobile else "N/A"
-            bar = progress_bar(self.tested_count, 2000, 15)  # Target 2000 codes
+            bar = progress_bar(self.tested_count, 2000, 15)
             
             status_text = f"""
 🔍 **SCANNING...**
@@ -637,7 +636,6 @@ class SlayScanEngine:
                     )
                 except Exception as e:
                     if "message is not modified" not in str(e):
-                        # Send new message if edit fails
                         sent = self.bot.send_message(
                             self.chat_id,
                             status_text,
@@ -656,10 +654,7 @@ class SlayScanEngine:
     
     def _monitor_output(self):
         """Monitor workingslay.py output in real-time"""
-        last_stats_update = time.time()
-        stats_line = ""
         
-        # Send initial status
         self._update_status("⏳ Starting scan...")
         
         while self.is_running and self.process:
@@ -678,7 +673,7 @@ class SlayScanEngine:
                 
                 self.update_count += 1
                 
-                # Extract stats from line
+                # Extract stats
                 if "Tested:" in line or "STATS" in line:
                     tested_match = re.search(r'Tested:\s*(\d+)', line)
                     valid_match = re.search(r'Valid:\s*(\d+)', line)
@@ -686,14 +681,11 @@ class SlayScanEngine:
                         self.tested_count = int(tested_match.group(1))
                     if valid_match:
                         self.valid_count = int(valid_match.group(1))
-                    stats_line = line
                     
-                    # Update progress every 50 checks
                     if self.tested_count % 50 == 0:
                         self._update_status(f"📊 {line}")
                     continue
                 
-                # Skip invalid codes
                 if "INVALID" in line.upper():
                     continue
                 
@@ -723,10 +715,6 @@ class SlayScanEngine:
                 reward_match = re.search(r'₹\s*(\d+)', line)
                 if reward_match:
                     reward = f"₹{reward_match.group(1)}"
-                elif "Reward" in line:
-                    reward_match = re.search(r'Reward[:\s]+([^\s]+)', line)
-                    if reward_match:
-                        reward = reward_match.group(1)
                 
                 # If valid code found
                 if is_valid and code:
@@ -743,11 +731,11 @@ class SlayScanEngine:
                     masked_mobile = mask_mobile(self.mobile) if self.mobile else "N/A"
                     self.valid_count += 1
                     
-                    # Create compact box
+                    # ===== CLEAN CODE FOUND MESSAGE - NO BANNER =====
                     code_msg = f"""
-╔═══════════════════════════════════════════════╗
-║           ✅ **VALID CODE FOUND**            ║
-╚═══════════════════════════════════════════════╝
+✅ <b>VALID CODE FOUND</b>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 🎯 <b>Code:</b> <code>{code}</code>
 📱 <b>Mobile:</b> <code>{masked_mobile}</code>
@@ -756,13 +744,13 @@ class SlayScanEngine:
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📊 <b>Scan Stats:</b>
+<b>📊 Scan Stats:</b>
 ├─ Codes Tested: <code>{self.tested_count}</code>
 └─ Valid Codes: <code>{self.valid_count}</code>
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📌 <b>Next Steps:</b>
+<b>📌 Next Steps:</b>
 1️⃣ Go to https://slayyourplaypromo.in/
 2️⃣ Enter this code
 3️⃣ Claim your reward!
@@ -784,9 +772,8 @@ class SlayScanEngine:
                 
                 # Update progress every 50 checks
                 if self.tested_count % 50 == 0 and self.tested_count > 0:
-                    self._update_status(f"📊 Tested: {self.tested_count} codes")
+                    self._update_status(f"📊 Testing codes...")
                 
-                # Check for "FINAL" stats
                 if "FINAL" in line.upper() and "STATS" in line.upper():
                     if not self.codes_found:
                         self._update_status("❌ No valid codes found in this scan.")
@@ -799,7 +786,6 @@ class SlayScanEngine:
                 logger.error(f"Monitor error: {e}")
                 break
         
-        # Final check
         if self.is_running:
             self.is_running = False
         
@@ -1594,7 +1580,7 @@ if __name__ == "__main__":
     task_thread.start()
     
     logger.info("=" * 50)
-    logger.info("🎮 SLAY BOT v3.1 STARTED")
+    logger.info("🎮 SLAY BOT v3.2 STARTED")
     logger.info("=" * 50)
     logger.info("💰 New Users: 0 credits")
     logger.info("🔗 Referral: +1 credit")
