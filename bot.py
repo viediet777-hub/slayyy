@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# NRTECNO SYSTEM - SLAY BOT v4.2
-# FIXED: Proper valid code detection from workingslay.py
+# NRTECNO SYSTEM - SLAY BOT v4.3
+# FIXED: Only detects VALID codes, ignores INVALID
 
 import os
 import logging
@@ -32,7 +32,6 @@ REFERRAL_BONUS = 1
 REFERRAL_STAY_HOURS = 0
 SCAN_COST = 1
 
-# Proxy Configuration
 PROXY_FILE = "slay_proxies.txt"
 
 logging.basicConfig(
@@ -565,7 +564,6 @@ class SlayScanEngine:
         self.proxies = load_proxies()
         self.proxy_index = 0
         self.status_msg_id = None
-        self.reward_submitted = False
     
     def get_next_proxy(self):
         if not self.proxies:
@@ -591,7 +589,6 @@ class SlayScanEngine:
         self.valid_count = 0
         self.last_update_count = 0
         self.status_msg_id = None
-        self.reward_submitted = False
         
         balance = get_user_balance(self.user_id)
         if balance < SCAN_COST:
@@ -607,20 +604,12 @@ class SlayScanEngine:
             "--expiry", "30"
         ]
         
-        # Add proxy support via environment or command line
-        proxy = self.get_next_proxy()
-        if proxy:
-            # workingslay.py uses its own proxy file (data.txt)
-            # We'll let it use its own proxy system
-            pass
-        
         self.is_running = True
         self.valid_code = None
         self.found_code = None
         self.update_count = 0
         
         try:
-            # Run with unbuffered output
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
             
@@ -654,7 +643,6 @@ class SlayScanEngine:
         return f"✅ Scan started!\n📱 Mobile: {mask_mobile(mobile)}\n💰 Cost: {SCAN_COST} credit"
     
     def _update_status(self, message):
-        """Update status message"""
         try:
             masked_mobile = mask_mobile(self.mobile) if self.mobile else "N/A"
             
@@ -695,13 +683,8 @@ class SlayScanEngine:
             logger.error(f"Status update error: {e}")
     
     def _monitor_output(self):
-        """Monitor workingslay.py output"""
         self._update_status("⏳ Starting scan...")
         last_stats_update = time.time()
-        stats_line = ""
-        
-        # Track code testing results
-        valid_code_detected = False
         
         while self.is_running and self.process:
             try:
@@ -719,68 +702,84 @@ class SlayScanEngine:
                 
                 self.update_count += 1
                 
-                # ===== EXTRACT STATS FROM WORKINGSLAY =====
-                # Format: "[STATS] Tested: 40 | Valid: 0 | Invalid: 40 | Errors: 0"
+                # ===== EXTRACT STATS =====
                 if "[STATS]" in line:
                     tested_match = re.search(r'Tested:\s*(\d+)', line)
                     valid_match = re.search(r'Valid:\s*(\d+)', line)
-                    invalid_match = re.search(r'Invalid:\s*(\d+)', line)
-                    errors_match = re.search(r'Errors:\s*(\d+)', line)
                     
                     if tested_match:
                         self.tested_count = int(tested_match.group(1))
                     if valid_match:
                         self.valid_count = int(valid_match.group(1))
                     
-                    stats_line = line
-                    
-                    # Update every 30 seconds
                     current_time = time.time()
                     if (current_time - last_stats_update) > 30:
                         last_stats_update = current_time
                         self._update_status(f"📊 {line}")
                     continue
                 
-                # ===== DETECT VALID CODE =====
-                # Format: "[LIVE] 169196972082 | VALID | Success"
+                # ===== DETECT VALID CODE - ONLY VALID, NOT INVALID =====
+                code = None
+                reward = ""
+                is_valid = False
+                
+                # Pattern: [LIVE] XXXXXXXXXXXX | VALID | ...
                 if "[LIVE]" in line and "VALID" in line:
+                    # Check if it's INVALID - skip if INVALID
+                    if "INVALID" not in line:
+                        code_match = re.search(r'\b\d{12}\b', line)
+                        if code_match:
+                            code = code_match.group()
+                            is_valid = True
+                            logger.info(f"✅ VALID CODE FOUND: {code}")
+                
+                # Pattern: [LIVE] XXXXXXXXXXXX | VALID (without INVALID)
+                if not is_valid and "[LIVE]" in line:
+                    # Check if line has VALID but not INVALID
+                    if "VALID" in line and "INVALID" not in line:
+                        code_match = re.search(r'\b\d{12}\b', line)
+                        if code_match:
+                            code = code_match.group()
+                            is_valid = True
+                            logger.info(f"✅ VALID CODE FOUND: {code}")
+                
+                # Pattern: VALID CODE MILA
+                if not is_valid and "CODE MILA" in line and "INVALID" not in line:
                     code_match = re.search(r'\b\d{12}\b', line)
                     if code_match:
                         code = code_match.group()
-                        logger.info(f"✅ VALID CODE FOUND: {code} in line: {line}")
-                        valid_code_detected = True
-                        self._handle_valid_code(code, line)
-                        break
+                        is_valid = True
+                        logger.info(f"✅ VALID CODE FOUND: {code}")
                 
-                # Format: "VALID CODE MILA: 123456789012"
-                if "VALID" in line and "CODE MILA" in line:
+                # Pattern: [REWARD] Valid code
+                if not is_valid and "[REWARD]" in line and "Valid code" in line:
                     code_match = re.search(r'\b\d{12}\b', line)
                     if code_match:
                         code = code_match.group()
-                        logger.info(f"✅ VALID CODE FOUND: {code} in line: {line}")
-                        valid_code_detected = True
-                        self._handle_valid_code(code, line)
-                        break
+                        is_valid = True
+                        logger.info(f"✅ VALID CODE FOUND: {code}")
                 
-                # Format: "[REWARD] Valid code: 123456789012"
-                if "[REWARD]" in line and "Valid code" in line:
-                    code_match = re.search(r'\b\d{12}\b', line)
-                    if code_match:
-                        code = code_match.group()
-                        logger.info(f"✅ VALID CODE FOUND: {code} in line: {line}")
-                        valid_code_detected = True
-                        self._handle_valid_code(code, line)
-                        break
-                
-                # Format: "REWARD SUBMITTED! Mobile X pe reward aayega"
-                if "REWARD SUBMITTED" in line:
-                    self._send_update(f"✅ {line}")
-                    self.reward_submitted = True
-                    continue
+                # Extract reward
+                if is_valid and code:
+                    reward_match = re.search(r'₹\s*(\d+)', line)
+                    if reward_match:
+                        reward = f"₹{reward_match.group(1)}"
+                    elif "Reward" in line:
+                        reward_match = re.search(r'Reward[:\s]+([^\s,]+)', line)
+                        if reward_match:
+                            reward = reward_match.group(1)
+                    
+                    # Handle valid code
+                    self._handle_valid_code(code, reward, line)
+                    break
                 
                 # ===== SEND IMPORTANT UPDATES =====
                 if "ERROR" in line:
                     self._send_update(f"⚠️ {line}")
+                    continue
+                
+                if "REWARD SUBMITTED" in line:
+                    self._send_update(f"✅ {line}")
                     continue
                 
                 # Skip invalid codes to avoid spam
@@ -795,26 +794,15 @@ class SlayScanEngine:
                 logger.error(f"Monitor error: {e}")
                 break
         
-        # Scan ended
         if self.is_running:
             self.is_running = False
         
-        if not valid_code_detected and self.tested_count > 0:
+        if not self.codes_found and self.tested_count > 0:
             self._update_status(f"❌ Scan ended. Tested {self.tested_count} codes, no valid found.")
     
-    def _handle_valid_code(self, code, line):
+    def _handle_valid_code(self, code, reward, line):
         """Handle valid code found"""
         try:
-            # Extract reward if present
-            reward = ""
-            reward_match = re.search(r'Reward[:\s]+([^\s,]+)', line)
-            if reward_match:
-                reward = reward_match.group(1)
-            elif "₹" in line:
-                reward_match = re.search(r'₹\s*(\d+)', line)
-                if reward_match:
-                    reward = f"₹{reward_match.group(1)}"
-            
             # Save to database
             save_found_code(self.user_id, code, self.mobile or "Unknown", reward or "")
             
@@ -827,6 +815,8 @@ class SlayScanEngine:
             
             masked_mobile = mask_mobile(self.mobile) if self.mobile else "N/A"
             self.valid_count += 1
+            self.codes_found.append(code)
+            self.found_code = code
             
             # Send code to user
             code_msg = f"""
@@ -847,9 +837,6 @@ class SlayScanEngine:
                 parse_mode="HTML"
             )
             
-            self.codes_found.append(code)
-            self.found_code = code
-            
             # Stop the scan
             self.stop_scan()
             
@@ -857,7 +844,6 @@ class SlayScanEngine:
             logger.error(f"Error handling valid code: {e}")
     
     def _send_update(self, message):
-        """Send update to Telegram"""
         try:
             clean_msg = message[:500]
             self.bot.send_message(
@@ -1681,7 +1667,7 @@ if __name__ == "__main__":
     task_thread.start()
     
     logger.info("=" * 50)
-    logger.info("🎮 SLAY BOT v4.2 STARTED")
+    logger.info("🎮 SLAY BOT v4.3 STARTED")
     logger.info("=" * 50)
     logger.info("💰 New Users: 0 credits")
     logger.info("🔗 Referral: +1 credit")
@@ -1692,6 +1678,7 @@ if __name__ == "__main__":
     logger.info(f"🌐 Proxies: {'✅ Loaded' if proxies else '❌ None'}")
     logger.info("📱 Mobile numbers: Masked")
     logger.info("⏱️ Update interval: 30 seconds")
+    logger.info("🔍 Only VALID codes detected (INVALID ignored)")
     logger.info("=" * 50)
     
     try:
@@ -1708,8 +1695,7 @@ if __name__ == "__main__":
         except Exception as e:
             error_msg = str(e)
             if "409" in error_msg:
-                logger.warning("⚠️ Conflict detected (409). Another instance running.")
-                logger.warning("🔄 Waiting 20 seconds before retry...")
+                logger.warning("⚠️ Conflict detected (409). Waiting 20 seconds...")
                 time.sleep(20)
             else:
                 logger.error(f"Polling error: {e}")
