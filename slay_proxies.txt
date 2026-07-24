@@ -1,0 +1,11 @@
+# Format: host:port:username:password
+dc.decodo.com:10001:sptu9f11ur:0c_nm5z3eVm4jJEddL
+dc.decodo.com:10002:sptu9f11ur:0c_nm5z3eVm4jJEddL
+dc.decodo.com:10003:sptu9f11ur:0c_nm5z3eVm4jJEddL
+dc.decodo.com:10004:sptu9f11ur:0c_nm5z3eVm4jJEddL
+dc.decodo.com:10005:sptu9f11ur:0c_nm5z3eVm4jJEddL
+dc.decodo.com:10006:sptu9f11ur:0c_nm5z3eVm4jJEddL
+dc.decodo.com:10007:sptu9f11ur:0c_nm5z3eVm4jJEddL
+dc.decodo.com:10008:sptu9f11ur:0c_nm5z3eVm4jJEddL
+dc.decodo.com:10009:sptu9f11ur:0c_nm5z3eVm4jJEddL
+dc.decodo.com:10010:sptu9f11ur:0c_nm5z3eVm4jJEddL
