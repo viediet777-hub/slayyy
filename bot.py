@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# NRTECNO SYSTEM - SLAY BOT v3.0
-# FIXED: Valid code detection + Better UI + Mobile hiding
+# NRTECNO SYSTEM - SLAY BOT v4.0
+# PROXY SUPPORT + SPAM REDUCTION
 
 import os
 import logging
@@ -31,6 +31,9 @@ NEW_USER_BONUS = 0
 REFERRAL_BONUS = 1
 REFERRAL_STAY_HOURS = 0
 SCAN_COST = 1
+
+# Proxy Configuration - Create slay_proxies.txt file
+PROXY_FILE = "slay_proxies.txt"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -244,10 +247,40 @@ def update_channel_status(user_id, status):
     conn.close()
 
 def mask_mobile(mobile):
-    """Mask mobile number - show only first 2 and last 2 digits"""
     if not mobile or len(mobile) < 4:
         return mobile
     return f"{mobile[:2]}******{mobile[-2:]}"
+
+def load_proxies():
+    """Load proxies from slay_proxies.txt"""
+    proxies = []
+    if not os.path.exists(PROXY_FILE):
+        logger.warning(f"Proxy file '{PROXY_FILE}' not found. Running without proxies.")
+        return proxies
+    
+    try:
+        with open(PROXY_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    parts = line.split(':')
+                    if len(parts) >= 4:
+                        proxy = {
+                            'http': f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}",
+                            'https': f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+                        }
+                        proxies.append(proxy)
+                    elif len(parts) == 2:
+                        proxy = {
+                            'http': f"http://{parts[0]}:{parts[1]}",
+                            'https': f"http://{parts[0]}:{parts[1]}"
+                        }
+                        proxies.append(proxy)
+        logger.info(f"Loaded {len(proxies)} proxies from {PROXY_FILE}")
+    except Exception as e:
+        logger.error(f"Error loading proxies: {e}")
+    
+    return proxies
 
 # ==================== CHANNEL CHECK ====================
 def check_channel_membership(user_id):
@@ -324,8 +357,7 @@ def run_scheduled_tasks():
 # ==================== MENU FUNCTIONS ====================
 def main_menu_text(user_id, first_name, balance, status, codes_found=0):
     return f"""
-    
-🎮 **VIEDIET SLAY BOT**        
+🎮 **VIEDIET SLAY BOT**
 
 👋 Welcome back, <b>{first_name}</b>!
 
@@ -340,7 +372,7 @@ def main_menu_text(user_id, first_name, balance, status, codes_found=0):
 • Click <b>🎮 START SCAN</b> to find codes
 • Share <b>🔗 REFERRAL</b> to earn credits
 
-<b>💡 Want Points:</b> 
+<b>💡 Info:</b> 
 • <b>1 scan = {SCAN_COST} credit</b>
 • <b>1 referral = +{REFERRAL_BONUS} credit</b>
 • Auto-stop on valid code!
@@ -530,6 +562,16 @@ class SlayScanEngine:
         self.codes_found = []
         self.tested_count = 0
         self.valid_count = 0
+        self.last_update_count = 0
+        self.proxies = load_proxies()
+        self.proxy_index = 0
+    
+    def get_next_proxy(self):
+        if not self.proxies:
+            return None
+        proxy = self.proxies[self.proxy_index % len(self.proxies)]
+        self.proxy_index += 1
+        return proxy
     
     def start_scan(self, mobile: str, reward_mobile: str = None) -> str:
         if self.is_running:
@@ -539,13 +581,14 @@ class SlayScanEngine:
             return "❌ Invalid mobile number!"
         
         if not check_workingslay():
-            return "❌ workingslay.py not found! Please add the file."
+            return "❌ workingslay.py not found!"
         
         reward = reward_mobile or mobile
         self.mobile = mobile
         self.codes_found = []
         self.tested_count = 0
         self.valid_count = 0
+        self.last_update_count = 0
         
         balance = get_user_balance(self.user_id)
         if balance < SCAN_COST:
@@ -553,14 +596,26 @@ class SlayScanEngine:
         
         update_user_balance(self.user_id, -SCAN_COST)
         
+        # Use proxy if available
+        proxy = self.get_next_proxy()
+        proxy_args = []
+        if proxy and 'http' in proxy:
+            proxy_url = proxy['http']
+            proxy_args = ["--proxy", proxy_url]
+        
         cmd = [
             sys.executable, "workingslay.py",
             "--mobile", mobile,
             "--reward-mobile", reward,
-            "--delay", "0.5",  # Slower delay for better validation
+            "--delay", "1.0",  # Slower delay to avoid rate limiting
             "--expiry", "30",
-            "--no-proxy"
+            "--no-proxy" if not proxy else ""
         ]
+        cmd = [c for c in cmd if c]
+        
+        # Add proxy if available
+        if proxy and proxy_args:
+            cmd = cmd + proxy_args
         
         self.is_running = True
         self.valid_code = None
@@ -593,11 +648,14 @@ class SlayScanEngine:
         self.thread = threading.Thread(target=self._monitor_output, daemon=True)
         self.thread.start()
         
-        return f"✅ Scan started!\n📱 Mobile: {mask_mobile(mobile)}\n💰 Cost: {SCAN_COST} credit"
+        proxy_text = f" via proxy" if proxy else ""
+        return f"✅ Scan started!{proxy_text}\n📱 Mobile: {mask_mobile(mobile)}\n💰 Cost: {SCAN_COST} credit"
     
     def _monitor_output(self):
-        """Monitor workingslay.py output in real-time"""
+        """Monitor workingslay.py output with reduced spam"""
         last_stats_update = time.time()
+        update_interval = 30  # Update every 30 seconds instead of every line
+        min_update_count = 50  # Minimum 50 codes between updates
         
         while self.is_running and self.process:
             try:
@@ -617,21 +675,27 @@ class SlayScanEngine:
                 
                 # Extract stats from line
                 if "Tested:" in line or "STATS" in line:
-                    # Parse stats
                     tested_match = re.search(r'Tested:\s*(\d+)', line)
                     valid_match = re.search(r'Valid:\s*(\d+)', line)
                     if tested_match:
                         self.tested_count = int(tested_match.group(1))
                     if valid_match:
                         self.valid_count = int(valid_match.group(1))
-                    self._send_update(f"📊 {line}")
+                    
+                    # Only send stats update every 30 seconds or 50 codes
+                    current_time = time.time()
+                    if (current_time - last_stats_update > update_interval or 
+                        self.tested_count - self.last_update_count > min_update_count):
+                        self.last_update_count = self.tested_count
+                        last_stats_update = current_time
+                        self._send_update(f"📊 Codes Tested: {self.tested_count} | Valid: {self.valid_count}")
                     continue
                 
-                # Skip invalid codes to avoid spam
+                # Skip invalid codes
                 if "INVALID" in line.upper():
                     continue
                 
-                # Send important messages
+                # Only send important messages (not every line)
                 keywords = ["VALID", "REWARD", "FOUND", "ERROR", "FINAL", "CODE", "LIVE"]
                 if any(k in line.upper() for k in keywords):
                     self._send_update(f"📡 {line[:200]}")
@@ -641,28 +705,24 @@ class SlayScanEngine:
                 code = None
                 reward = None
                 
-                # Pattern 1: "VALID CODE MILA: 123456789012" or "VALID" in line
                 if "VALID" in line.upper() or "CODE MILA" in line:
                     is_valid = True
                     code_match = re.search(r'\b\d{12}\b', line)
                     if code_match:
                         code = code_match.group()
                 
-                # Pattern 2: "[LIVE] 123456789012 | VALID"
                 if "[LIVE]" in line and "VALID" in line.upper():
                     is_valid = True
                     code_match = re.search(r'\b\d{12}\b', line)
                     if code_match:
                         code = code_match.group()
                 
-                # Pattern 3: "[REWARD] Valid code: 123456789012"
                 if "[REWARD]" in line and "Valid code" in line:
                     is_valid = True
                     code_match = re.search(r'\b\d{12}\b', line)
                     if code_match:
                         code = code_match.group()
                 
-                # Extract reward amount if present
                 reward_match = re.search(r'₹\s*(\d+)', line)
                 if reward_match:
                     reward = f"₹{reward_match.group(1)}"
@@ -671,14 +731,11 @@ class SlayScanEngine:
                     if reward_match:
                         reward = reward_match.group(1)
                 
-                # If valid code found, handle it
                 if is_valid and code:
                     logger.info(f"✅ VALID CODE FOUND: {code}")
                     
-                    # Save to database
                     save_found_code(self.user_id, code, self.mobile or "Unknown", reward or "")
                     
-                    # Update user stats
                     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
                     c = conn.cursor()
                     c.execute('UPDATE users SET slay_codes_found = slay_codes_found + 1 WHERE user_id = ?', (self.user_id,))
@@ -686,22 +743,19 @@ class SlayScanEngine:
                     conn.close()
                     
                     masked_mobile = mask_mobile(self.mobile) if self.mobile else "N/A"
+                    self.valid_count += 1
                     
-                    # Send CLEAN code to user with masked mobile
                     code_msg = f"""
-✅ <b>VALID CODE FOUND!</b>
+⚡ <b>VIEDIET HIT</b>
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 <code>{code}</code>
+📱 <code>{masked_mobile}</code>
+{f'💰 <code>{reward}</code>' if reward else ''}
+🕒 <code>{datetime.now().strftime('%H:%M:%S')}</code>
 
-🎯 <b>Code:</b> <code>{code}</code>
-📱 <b>Mobile:</b> <code>{masked_mobile}</code>
-{f"💰 <b>Reward:</b> <code>{reward}</code>" if reward else ""}
-🕐 <b>Found at:</b> <code>{datetime.now().strftime('%H:%M:%S')}</code>
+📈 <code>{self.valid_count}</code>/<code>{self.tested_count}</code> valid
 
-<b>📊 Scan Stats:</b>
-├─ Codes Tested: <code>{self.tested_count or self.update_count}</code>
-└─ Valid Codes: <code>{self.valid_count + 1}</code>
-💾 Code saved in <b>"My Codes"</b> section
+💾 <b>Stored in My Codes</b>
 """
                     self.bot.send_message(
                         self.chat_id,
@@ -711,25 +765,14 @@ class SlayScanEngine:
                     
                     self.codes_found.append(code)
                     self.found_code = code
-                    
-                    # Stop the scan immediately
                     self.stop_scan()
                     break
                 
-                # Update stats every 5 seconds
-                if time.time() - last_stats_update > 5:
-                    last_stats_update = time.time()
-                    if self.tested_count > 0:
-                        self._send_update(f"📊 Codes Tested: {self.tested_count} | Valid: {self.valid_count}")
-                
-                # Check for "FINAL" stats - scan ending
                 if "FINAL" in line.upper() and "STATS" in line.upper():
-                    # Check if any code was found in this scan
                     if not self.codes_found:
                         self._send_update("❌ No valid codes found in this scan.")
                     else:
-                        self._send_update(f"✅ Scan completed! Found {len(self.codes_found)} valid codes.")
-                    
+                        self._send_update(f"✅ Found {len(self.codes_found)} valid codes!")
                     self.is_running = False
                     break
                     
@@ -737,22 +780,18 @@ class SlayScanEngine:
                 logger.error(f"Monitor error: {e}")
                 break
         
-        # Final check - scan ended
         if self.is_running:
             self.is_running = False
         
-        if not self.codes_found:
-            self._send_update(f"❌ Scan ended. Tested {self.tested_count or self.update_count} codes, no valid found.")
-        else:
-            self._send_update(f"✅ Scan completed! Found {len(self.codes_found)} valid codes.")
+        if not self.codes_found and self.tested_count > 0:
+            self._send_update(f"❌ Scan ended. Tested {self.tested_count} codes, no valid found.")
     
     def _send_update(self, message):
-        """Send update to Telegram"""
+        """Send update to Telegram with spam control"""
         try:
-            # Clean the message
             clean_msg = message[:500]
             
-            # Send important messages only
+            # Only send important messages
             if "📊" in message or "VALID" in message or "REWARD" in message or "FOUND" in message:
                 self.bot.send_message(
                     self.chat_id,
@@ -766,10 +805,10 @@ class SlayScanEngine:
                     parse_mode="Markdown"
                 )
         except Exception as e:
-            logger.error(f"Send update error: {e}")
+            if "429" not in str(e):
+                logger.error(f"Send update error: {e}")
     
     def stop_scan(self):
-        """Stop the running scan"""
         if self.process and self.is_running:
             try:
                 self.process.terminate()
@@ -806,7 +845,6 @@ def start_command(message):
         create_user(user_id, username, first_name, referred_by)
         user = get_user(user_id)
     
-    # Check channel membership
     if not check_channel_membership(user_id):
         bot.send_message(
             user_id,
@@ -826,10 +864,6 @@ def start_command(message):
         reply_markup=main_menu_keyboard(is_admin),
         parse_mode="HTML"
     )
-
-# ==================== MEMBERSHIP CHECK ====================
-def check_membership(user_id):
-    return check_channel_membership(user_id)
 
 # ==================== ADMIN COMMANDS ====================
 @bot.message_handler(commands=['addcoins'])
@@ -1098,7 +1132,6 @@ def callback_handler(call):
     user_id = call.from_user.id
     data = call.data
     
-    # ===== CHANNEL CHECK =====
     if data == "check_channel":
         if check_channel_membership(user_id):
             user = get_user(user_id)
@@ -1118,7 +1151,6 @@ def callback_handler(call):
             bot.answer_callback_query(call.id, "❌ Please join the channel first!", show_alert=True)
         return
     
-    # ===== BACK =====
     if data == "back_menu":
         user = get_user(user_id)
         if not user:
@@ -1142,7 +1174,6 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         return
     
-    # ===== REFRESH =====
     if data == "refresh":
         user = get_user(user_id)
         if not user:
@@ -1166,7 +1197,6 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         return
     
-    # ===== MY CODES =====
     if data == "my_codes":
         try:
             bot.edit_message_text(
@@ -1182,7 +1212,6 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         return
     
-    # ===== SLAY STATUS =====
     if data == "slay_status":
         user = get_user(user_id)
         codes_found = user.get('slay_codes_found', 0)
@@ -1196,7 +1225,6 @@ def callback_handler(call):
         )
         return
     
-    # ===== SLAY START =====
     if data == "slay_start":
         if not check_channel_membership(user_id):
             bot.answer_callback_query(call.id, "❌ Please join channel first!", show_alert=True)
@@ -1242,7 +1270,6 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         return
     
-    # ===== REFERRAL =====
     if data == "referral":
         user = get_user(user_id)
         text = referral_menu_text(user_id, user['balance'], get_referral_count(user_id), get_pending_referral_count(user_id))
@@ -1269,7 +1296,6 @@ def callback_handler(call):
         )
         return
     
-    # ===== ADMIN PANEL =====
     if data == "admin_panel":
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "❌ Unauthorized!")
@@ -1456,6 +1482,13 @@ def slay_otp_handler(message):
     user_key = data.get("user_key")
     data_key = data.get("data_key")
     
+    if not session or not user_key or not data_key:
+        bot.reply_to(message, "❌ Session data missing. Please start again.")
+        user_slay_state[user_id] = None
+        if user_id in slay_otp_data:
+            del slay_otp_data[user_id]
+        return
+    
     status_msg = bot.reply_to(message, "🔄 Verifying OTP...")
     
     def verify_thread():
@@ -1510,6 +1543,14 @@ def slay_otp_handler(message):
                 if user_id in slay_otp_data:
                     del slay_otp_data[user_id]
                 
+        except ImportError as e:
+            update_user_balance(user_id, cost)
+            bot.edit_message_text(
+                f"❌ Import Error: {str(e)}",
+                chat_id=message.chat.id,
+                message_id=status_msg.message_id
+            )
+            user_slay_state[user_id] = None
         except Exception as e:
             update_user_balance(user_id, cost)
             bot.edit_message_text(
@@ -1544,7 +1585,7 @@ def start_slay_scan(message, user_id, phone):
                 f"✅ **Scan Started!**\n\n"
                 f"📱 Mobile: `{mask_mobile(phone)}`\n"
                 f"🔍 Scanning in progress...\n\n"
-                f"_Live updates will appear here._",
+                f"_Updates will appear periodically._",
                 chat_id=message.chat.id,
                 message_id=scan_msg.message_id,
                 parse_mode="Markdown"
@@ -1559,7 +1600,6 @@ def start_slay_scan(message, user_id, phone):
     
     threading.Thread(target=scan_thread).start()
 
-# ==================== HELPER FUNCTIONS ====================
 def get_referral_link(user_id):
     bot_username = bot.get_me().username
     return f"https://t.me/{bot_username}?start=ref_{user_id}"
@@ -1570,11 +1610,18 @@ if __name__ == "__main__":
         logger.warning("⚠️ workingslay.py NOT FOUND! Scan feature will not work.")
         logger.warning("📁 Please add workingslay.py to the same directory.")
     
+    # Load proxies
+    proxies = load_proxies()
+    if proxies:
+        logger.info(f"✅ Loaded {len(proxies)} proxies")
+    else:
+        logger.info("⚠️ No proxies loaded. Running without proxy.")
+    
     task_thread = threading.Thread(target=run_scheduled_tasks, daemon=True)
     task_thread.start()
     
     logger.info("=" * 50)
-    logger.info("🎮 SLAY BOT v3.0 STARTED")
+    logger.info("🎮 SLAY BOT v4.0 STARTED")
     logger.info("=" * 50)
     logger.info("💰 New Users: 0 credits")
     logger.info("🔗 Referral: +1 credit")
@@ -1582,20 +1629,27 @@ if __name__ == "__main__":
     logger.info("📢 Channel: @{}".format(CHANNEL_USERNAME))
     logger.info("👑 Admin: /addcoins, /removecoins, /setcost, /broadcast")
     logger.info(f"📁 workingslay.py: {'✅ Found' if check_workingslay() else '❌ MISSING'}")
+    logger.info(f"🌐 Proxies: {'✅ Loaded' if proxies else '❌ None'}")
     logger.info("📱 Mobile numbers: Masked for privacy")
+    logger.info("⏱️ Update interval: 30 seconds")
     logger.info("=" * 50)
     
     try:
         bot.remove_webhook()
-        time.sleep(1)
+        time.sleep(2)
     except:
         pass
     
     while True:
         try:
             logger.info("🔄 Starting polling...")
-            bot.polling(non_stop=False, interval=1, timeout=30)
+            bot.polling(non_stop=True, interval=1, timeout=30)
         except Exception as e:
-            logger.error(f"Polling error: {e}")
-            logger.info("🔄 Restarting polling in 10 seconds...")
-            time.sleep(10)
+            if "409" in str(e):
+                logger.warning("⚠️ Conflict detected. Another instance running.")
+                logger.warning("🔄 Waiting 15 seconds before retry...")
+                time.sleep(15)
+            else:
+                logger.error(f"Polling error: {e}")
+                logger.info("🔄 Restarting polling in 5 seconds...")
+                time.sleep(5)
