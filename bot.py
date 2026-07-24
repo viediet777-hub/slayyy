@@ -324,9 +324,8 @@ def run_scheduled_tasks():
 # ==================== MENU FUNCTIONS ====================
 def main_menu_text(user_id, first_name, balance, status, codes_found=0):
     return f"""
-╔═══════════════════════════════════════════════╗
-║           🎮 **SLAY YOUR PLAY BOT**          ║
-╚═══════════════════════════════════════════════╝
+    
+🎮 **VIEDIET SLAY BOT**        
 
 👋 Welcome back, <b>{first_name}</b>!
 
@@ -341,7 +340,7 @@ def main_menu_text(user_id, first_name, balance, status, codes_found=0):
 • Click <b>🎮 START SCAN</b> to find codes
 • Share <b>🔗 REFERRAL</b> to earn credits
 
-<b>💡 Pro Tip:</b> 
+<b>💡 Want Points:</b> 
 • <b>1 scan = {SCAN_COST} credit</b>
 • <b>1 referral = +{REFERRAL_BONUS} credit</b>
 • Auto-stop on valid code!
