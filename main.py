@@ -4,7 +4,6 @@ import random
 import string
 import time
 from datetime import datetime, timedelta
-from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -858,7 +857,6 @@ async def post_shutdown(application: Application):
 
 
 def main():
-    # REMOVED nest_asyncio - FIXES THE ERROR
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
 
     application.add_handler(CommandHandler("start", start))
