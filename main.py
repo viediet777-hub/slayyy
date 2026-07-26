@@ -24,8 +24,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 firebase = FirebaseManager()
-user_timers = {}
-user_current_numbers = {}
 
 
 def generate_referral_code() -> str:
@@ -102,7 +100,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         banned = await firebase.get_banned_users()
         if str(user.id) in banned:
-            await update.message.reply_text("⛔ Your account has been banned. Contact support for more information.")
+            await update.message.reply_text("⛔ Your account has been banned. Contact support.")
             return
 
     is_admin = user.id == ADMIN_ID
@@ -245,7 +243,6 @@ async def handle_get_number(query, context, user, user_data):
         "currentNumber": number,
         "history": history,
     })
-    user_current_numbers[user.id] = number
     await firebase.add_log("number_assigned", user_id, {"number": number})
 
     await query.edit_message_text(
@@ -522,7 +519,6 @@ async def handle_admin_users(update_or_query):
     for uid, data in users.items():
         if not isinstance(data, dict):
             continue
-        name = data.get("name", "N/A")
         tl = data.get("timeLeft", 0)
         refs = data.get("referrals", 0)
         sta = "Active" if tl > 0 else "Expired"
@@ -857,7 +853,16 @@ async def post_shutdown(application: Application):
 
 
 def main():
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    # Use default Application without post_init/post_shutdown for compatibility
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Manually initialize Firebase
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(firebase.connect())
+    
+    # Start time decay loop
+    asyncio.create_task(time_decay_loop())
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("sms", handle_sms_command))
