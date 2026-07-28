@@ -26,17 +26,18 @@ from telegram.ext import (
     ConversationHandler, ContextTypes
 )
 
-# ==================== CONFIG (Environment Variables) ====================
+# ==================== CONFIG ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set.")
 
 ADMIN_IDS = [int(os.environ.get("ADMIN_ID", 1364476174))]
 
-# Channel Configuration
-CHANNEL_USERNAME = "viedietlooters"  # without @
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1003872664875))
-SUPPORT_LINK = "https://t.me/viedietlooters"
+CHANNEL_USERNAME = "viedietlooters"
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1002388556922))
+SUPPORT_LINK = "https://t.me/viedietlooterschat"
+IMAGE_URL = "https://cdn.phototourl.com/free/2026-07-28-8e8c2998-b55d-4799-81f5-3777e0548b1a.jpg"
+IMAGE_NAME = "photo_2026-07-28.jpg"
 
 BASE_URL = "https://slayyourplaypromo.in"
 
@@ -53,11 +54,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# SIGNATURE FUNCTION (EXACT – do not modify)
+# SIGNATURE FUNCTION
 # ============================================================
 def build_signed_data(payload: dict, data_key: str) -> str:
-    import base64, hashlib, hmac, random, string, json, urllib.parse
-
     ordered = {}
     for k, v in payload.items():
         if k != "t":
@@ -65,7 +64,6 @@ def build_signed_data(payload: dict, data_key: str) -> str:
     ordered["t"] = payload["t"]
 
     payload_str = json.dumps(ordered, separators=(',', ':'), ensure_ascii=False)
-
     u = base64.b64encode(str(payload["t"]).encode()).decode()
     a = base64.b64encode(payload_str.encode()).decode()
 
@@ -120,6 +118,7 @@ def get_db() -> sqlite3.Connection:
             completed_processes INTEGER DEFAULT 0,
             referred_by INTEGER DEFAULT NULL,
             joined_channel INTEGER DEFAULT 0,
+            is_admin INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -246,11 +245,9 @@ async def api_init() -> Tuple[bool, dict]:
         'referer': f'{BASE_URL}/',
         'x-requested-with': 'XMLHttpRequest',
     }
-    logger.info(f"INIT POST {url}")
     try:
         async with session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
             text = await resp.text()
-            logger.info(f"INIT response ({resp.status}): {text[:500]}")
             await save_cookies()
             if resp.status == 200:
                 data = decode_resp(text)
@@ -291,7 +288,7 @@ async def make_signed_request(
         headers['authorization'] = f'Bearer {jwt_token}'
 
     request_url = f"{url}?t={t}"
-    logger.info(f"SIGNED POST {endpoint} t={t}")
+    logger.info(f"SIGNED POST {endpoint}")
 
     try:
         if files:
@@ -302,11 +299,9 @@ async def make_signed_request(
                 form.add_field(field_name, content, filename=filename, content_type=content_type)
             async with session.post(request_url, data=form, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 text = await resp.text()
-                logger.info(f"{endpoint} response ({resp.status}): {text[:500]}")
                 try:
                     decoded = decode_resp(text)
                 except Exception:
-                    logger.warning(f"Could not decode response: {text[:200]}")
                     decoded = {"statusCode": resp.status, "message": text[:200]}
                 status_ok = decoded.get('statusCode', 400) in (200, 201, 202)
                 return status_ok, decoded
@@ -314,11 +309,9 @@ async def make_signed_request(
             headers['content-type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
             async with session.post(request_url, data=signed_data, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 text = await resp.text()
-                logger.info(f"{endpoint} response ({resp.status}): {text[:500]}")
                 try:
                     decoded = decode_resp(text)
                 except Exception:
-                    logger.warning(f"Could not decode response: {text[:200]}")
                     decoded = {"statusCode": resp.status, "message": text[:200]}
                 status_ok = decoded.get('statusCode', 400) in (200, 201, 202)
                 return status_ok, decoded
@@ -358,7 +351,7 @@ async def select_vibe(user_key, data_key, jwt_token) -> Tuple[bool, dict]:
 async def upload_image(image_bytes: bytes, filename: str, user_key, data_key, jwt_token) -> Tuple[bool, dict]:
     payload = {}
     files = {'media': (filename, image_bytes, 'image/jpeg')}
-    return await make_signed_request('/api/users/uploadImage/{userKey}', payload, data_key, user_key, referer='/dashboard', files=files, jwt_token=jwt_token)
+    return await make_signed_request('/api/users/uploadImage/{userKey}', payload, data_key, user_key, referer='/take-stick-photo', files=files, jwt_token=jwt_token)
 
 
 async def submit_upi(upi_number: str, user_key, data_key, jwt_token) -> Tuple[bool, dict]:
@@ -377,20 +370,16 @@ async def get_stick_progress(user_key, data_key, jwt_token) -> Tuple[bool, dict]
 
 
 async def download_image() -> Tuple[Optional[bytes], str]:
-    urls = [
-        "https://picsum.photos/400",
-        "https://fastly.picsum.photos/id/0/400/300.jpg",
-    ]
-    session = await get_http_session()
-    for url in urls:
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(IMAGE_URL, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status == 200:
                     data = await resp.read()
-                    return data, "image.jpg"
-        except Exception as e:
-            logger.warning(f"Image download failed {url}: {e}")
-    return None, ""
+                    return data, IMAGE_NAME
+                return None, ""
+    except Exception as e:
+        logger.error(f"Image download failed: {e}")
+        return None, ""
 
 
 # ============================================================
@@ -410,7 +399,7 @@ cancel_keyboard = ReplyKeyboardMarkup([
 # ============================================================
 # CONVERSATION STATES
 # ============================================================
-SELECTING_ACTION, ASK_MOBILE, ASK_OTP, ASK_UPI = range(4)
+ASK_MOBILE, ASK_OTP, ASK_UPI = range(3)
 
 
 # ============================================================
@@ -447,7 +436,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     existing = await db_user(tid)
     if existing is None:
-        await db_upsert(tid, name=user.full_name or "", username=user.username or "")
+        is_admin = 1 if tid in ADMIN_IDS else 0
+        await db_upsert(tid, name=user.full_name or "", username=user.username or "", is_admin=is_admin)
         if args and args[0].isdigit():
             referrer_id = int(args[0])
             if referrer_id != tid:
@@ -457,8 +447,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     member = await is_channel_member(context.bot, tid)
     if not member:
         await update.message.reply_text(
-            f"⚠️ You must join @{CHANNEL_USERNAME} to use this bot.\n"
-            f"Join and then send /start again.",
+            f"⚠️ You must join @{CHANNEL_USERNAME} to use this bot.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_USERNAME}")]
             ])
@@ -466,14 +455,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await db_upsert(tid, joined_channel=1)
-    await show_main_menu(update, f"👋 Welcome {user.first_name}! Choose an option below.")
+    await show_main_menu(update, f"👋 Welcome {user.first_name}!")
 
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"📞 Contact support: {SUPPORT_LINK}",
+        f"📞 Join our support group:",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Open Channel", url=SUPPORT_LINK)]
+            [InlineKeyboardButton("💬 Open Group", url=SUPPORT_LINK)]
         ])
     )
 
@@ -487,7 +476,7 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"📊 <b>Your Dashboard</b>\n\n"
         f"👤 Name: {u['name']}\n"
-        f"🆔 Telegram ID: <code>{u['telegram_id']}</code>\n"
+        f"🆔 ID: <code>{u['telegram_id']}</code>\n"
         f"📱 Mobile: {u['mobile'] or 'Not set'}\n"
         f"💳 UPI: {u['upi'] or 'Not set'}\n"
         f"👥 Referrals: {u['referrals']}\n"
@@ -504,7 +493,8 @@ async def refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"👥 <b>Refer & Earn</b>\n\n"
         f"Share your referral link and earn <b>+1 Credit</b> for every new user who joins!\n\n"
-        f"Your link:\n<code>{link}</code>"
+        f"Your link:\n<code>{link}</code>\n\n"
+        f"Each Credit = 1 Process = ₹20"
     )
     await update.message.reply_text(
         text, parse_mode="HTML",
@@ -520,6 +510,7 @@ async def refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 async def start_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
+    
     member = await is_channel_member(context.bot, tid)
     if not member:
         await update.message.reply_text(
@@ -531,10 +522,16 @@ async def start_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     u = await db_user(tid)
+    
+    # Check if admin - unlimited access
+    is_admin = tid in ADMIN_IDS
+    
     credits = u['credits'] if u else 1
-    if credits < 1:
+    if credits < 1 and not is_admin:
         await update.message.reply_text(
-            "❌ You have no credits left. Earn credits by referring friends!",
+            "❌ You have no credits left.\n\n"
+            "Earn credits by referring friends!\n"
+            "1 Referral = 1 Credit = 1 Process = ₹20",
             reply_markup=main_keyboard
         )
         return ConversationHandler.END
@@ -571,8 +568,6 @@ async def ask_mobile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data_key = init_data['dataKey']
     context.user_data['userKey'] = user_key
     context.user_data['dataKey'] = data_key
-
-    logger.info(f"Session OK: userKey={user_key}, dataKey={data_key}")
 
     await update.message.reply_text("⏳ Tracking...")
     await click_track(user_key, data_key)
@@ -611,7 +606,7 @@ async def ask_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     access_token = data.get('accessToken') or data.get('data', {}).get('accessToken', '')
     if not access_token:
-        await update.message.reply_text("❌ No access token received. Contact support.", reply_markup=main_keyboard)
+        await update.message.reply_text("❌ No access token received.", reply_markup=main_keyboard)
         return ConversationHandler.END
 
     context.user_data['jwt'] = access_token
@@ -620,25 +615,27 @@ async def ask_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("✅ OTP verified! Setting up your process...")
 
-    # Auto steps: selectPack, selectVibe, uploadImage
+    # Auto steps
     await update.message.reply_text("⏳ Selecting pack...")
     ok, pdata = await select_pack(user_key, data_key, access_token)
     if not ok:
-        await update.message.reply_text(f"⚠️ Pack selection: {pdata.get('message', 'failed')}")
+        await update.message.reply_text(f"⚠️ Pack: {pdata.get('message', 'failed')}")
 
     await update.message.reply_text("⏳ Selecting vibe...")
     ok, vdata = await select_vibe(user_key, data_key, access_token)
     if not ok:
-        await update.message.reply_text(f"⚠️ Vibe selection: {vdata.get('message', 'failed')}")
+        await update.message.reply_text(f"⚠️ Vibe: {vdata.get('message', 'failed')}")
 
-    await update.message.reply_text("⏳ Downloading & uploading image...")
+    await update.message.reply_text("⏳ Uploading image...")
     img_bytes, img_name = await download_image()
     if img_bytes:
         ok, img_data = await upload_image(img_bytes, img_name, user_key, data_key, access_token)
-        if not ok:
+        if ok:
+            await update.message.reply_text("✅ Image uploaded successfully!")
+        else:
             await update.message.reply_text(f"⚠️ Image upload: {img_data.get('message', 'failed')}")
     else:
-        await update.message.reply_text("⚠️ Could not download image, skipping upload.")
+        await update.message.reply_text("⚠️ Could not download image.")
 
     await update.message.reply_text(
         "💳 Enter your UPI-registered mobile number (10 digits):",
@@ -671,32 +668,31 @@ async def ask_upi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if ok:
         await db_upsert(tid, upi=upi_number)
-        await update.message.reply_text(f"✅ UPI submitted: {upi_data.get('message', 'Success')}")
+        await update.message.reply_text(f"✅ UPI submitted!")
     else:
         msg = upi_data.get('message', 'Unknown error')
-        await update.message.reply_text(f"⚠️ UPI result: {msg}")
+        await update.message.reply_text(f"⚠️ UPI: {msg}")
 
-    await update.message.reply_text("⏳ Fetching progress...")
-    pk_ok, pk_data = await get_pack_progress(user_key, data_key, jwt)
-    sk_ok, sk_data = await get_stick_progress(user_key, data_key, jwt)
-
-    result_lines = []
-    if pk_ok:
-        result_lines.append(f"📦 Pack: {json.dumps(pk_data, indent=2)}")
-    if sk_ok:
-        result_lines.append(f"🎯 Stick: {json.dumps(sk_data, indent=2)}")
-
-    if result_lines:
-        result_text = "\n\n".join(result_lines)
-        await update.message.reply_text(f"📋 <b>Process Complete</b>\n\n<pre>{result_text}</pre>", parse_mode="HTML")
+    # Deduct credit (skip for admin)
+    is_admin = tid in ADMIN_IDS
+    if not is_admin:
+        u = await db_user(tid)
+        new_credits = max(0, (u['credits'] if u else 1) - 1)
+        new_completed = (u['completed_processes'] if u else 0) + 1
+        await db_upsert(tid, credits=new_credits, completed_processes=new_completed)
     else:
-        await update.message.reply_text("📋 Process complete. Check dashboard for details.")
+        u = await db_user(tid)
+        new_completed = (u['completed_processes'] if u else 0) + 1
+        await db_upsert(tid, completed_processes=new_completed)
 
-    # Deduct credit, increment completed
-    u = await db_user(tid)
-    new_credits = max(0, (u['credits'] if u else 1) - 1)
-    new_completed = (u['completed_processes'] if u else 0) + 1
-    await db_upsert(tid, credits=new_credits, completed_processes=new_completed)
+    await update.message.reply_text(
+        f"✅ **Process Completed!**\n\n"
+        f"💸 Your payment will be credited to your UPI within 24-48 hours.\n\n"
+        f"📱 UPI: {upi_number}\n"
+        f"💰 Amount: ₹20\n"
+        f"📅 Date: {datetime.now().strftime('%d-%m-%Y %H:%M')}",
+        parse_mode="HTML"
+    )
 
     await show_main_menu(update, "✅ Process finished!")
     return ConversationHandler.END
@@ -716,14 +712,16 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with conn_lock:
         db = get_db()
         total = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        with_credits = db.execute("SELECT SUM(credits) FROM users").fetchone()[0] or 0
+        credits = db.execute("SELECT SUM(credits) FROM users").fetchone()[0] or 0
         completed = db.execute("SELECT SUM(completed_processes) FROM users").fetchone()[0] or 0
+        referrals = db.execute("SELECT SUM(referrals) FROM users").fetchone()[0] or 0
         db.close()
     await update.message.reply_text(
         f"📊 <b>Admin Stats</b>\n\n"
-        f"👥 Total users: {total}\n"
-        f"💎 Total credits: {with_credits}\n"
-        f"✅ Total completed: {completed}",
+        f"👥 Total Users: {total}\n"
+        f"💎 Total Credits: {credits}\n"
+        f"✅ Completed: {completed}\n"
+        f"🔗 Referrals: {referrals}",
         parse_mode="HTML"
     )
 
@@ -769,7 +767,7 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# MAIN MENU ROUTER
+# MENU ROUTER
 # ============================================================
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -821,14 +819,8 @@ def main():
     app.add_handler(CommandHandler("stats", admin_stats))
     app.add_handler(CommandHandler("addcredits", admin_add_credits))
     app.add_handler(CommandHandler("broadcast", admin_broadcast))
-
     app.add_handler(conv_handler)
-
-    # Non-conversation menu items
-    app.add_handler(MessageHandler(
-        filters.Text(["👥 Refer & Earn", "📊 Dashboard", "📞 Support"]),
-        menu_handler
-    ))
+    app.add_handler(MessageHandler(filters.Text(["👥 Refer & Earn", "📊 Dashboard", "📞 Support"]), menu_handler))
 
     logger.info("🤖 Bot started polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
