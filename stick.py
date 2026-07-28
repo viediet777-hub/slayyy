@@ -16,7 +16,6 @@ import logging
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 import glob
-import tempfile
 
 import aiohttp
 from aiohttp import ClientSession, FormData
@@ -27,48 +26,71 @@ from telegram.ext import (
     ConversationHandler, ContextTypes
 )
 
-# ==================== CONFIG ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", input("🤖 Enter Bot Token: ").strip())
+# ==================== CONFIG - ENV ONLY ====================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    print("❌ Bot Token required!")
+    print("❌ BOT_TOKEN environment variable required!")
     sys.exit(1)
 
-ADMIN_IDS = [int(os.getenv("ADMIN_ID", input("👑 Enter Admin Telegram ID: ").strip() or "1364476174"))]
+ADMIN_IDS = []
+admin_id = os.getenv("ADMIN_ID")
+if admin_id:
+    try:
+        ADMIN_IDS = [int(x.strip()) for x in admin_id.split(",") if x.strip()]
+    except:
+        pass
+if not ADMIN_IDS:
+    ADMIN_IDS = [1364476174]  # Default fallback
+    print(f"⚠️ Using default admin: {ADMIN_IDS[0]}")
 
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "viedietlooters")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", input("📢 Enter Channel ID (optional, press Enter to skip): ").strip() or "-1002388556922"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1002388556922"))
 SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/viedietlooterschat")
+BASE_URL = os.getenv("BASE_URL", "https://slayyourplaypromo.in")
+DB_PATH = os.getenv("DB_PATH", "slay_bot_local.db")
 
-# Railway friendly image loading
+print("=" * 60)
+print("🤖 SLAY YOUR PLAY - RAILWAY READY BOT")
+print("=" * 60)
+print(f"👑 Admin: {ADMIN_IDS}")
+print(f"📢 Channel: {CHANNEL_USERNAME}")
+print("=" * 60)
+
+# ============================================================
+# IMAGE LOADING - RAILWAY FRIENDLY
+# ============================================================
 def load_image_railway() -> Tuple[bytes, str]:
-    """Railway ke liye image load - multiple sources se try karega"""
+    """Load image from multiple sources for Railway compatibility"""
     
-    # 1. Environment variable se (Railway deploy mein use karein)
+    # 1. Environment variable (Base64 encoded)
     env_img = os.getenv("IMAGE_BASE64")
     if env_img:
         try:
             data = base64.b64decode(env_img)
             if len(data) > 5000:
-                print(f"✅ Image loaded from IMAGE_BASE64 env ({len(data)} bytes)")
+                print(f"✅ Image loaded from IMAGE_BASE64 ({len(data)} bytes)")
                 return data, "IMG.jpg"
         except:
             pass
     
-    # 2. Current directory mein IMG.jpg
-    if os.path.exists("IMG.jpg"):
-        with open("IMG.jpg", "rb") as f:
-            data = f.read()
-        if len(data) > 5000:
-            print(f"✅ Image loaded from IMG.jpg ({len(data)} bytes)")
-            return data, "IMG.jpg"
+    # 2. Current directory
+    for fname in ["IMG.jpg", "image.jpg", "photo.jpg", "stick.jpg"]:
+        if os.path.exists(fname):
+            with open(fname, "rb") as f:
+                data = f.read()
+            if len(data) > 5000:
+                print(f"✅ Image loaded from {fname} ({len(data)} bytes)")
+                return data, fname
     
-    # 3. attachments folder (Railway me attachment upload kar sakte hain)
-    if os.path.exists("/app/attachments/IMG.jpg"):
-        with open("/app/attachments/IMG.jpg", "rb") as f:
-            data = f.read()
-        if len(data) > 5000:
-            print(f"✅ Image loaded from /app/attachments/IMG.jpg ({len(data)} bytes)")
-            return data, "IMG.jpg"
+    # 3. Railway attachments folder
+    if os.path.exists("/app/attachments"):
+        for fname in os.listdir("/app/attachments"):
+            if fname.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                with open(f"/app/attachments/{fname}", "rb") as f:
+                    data = f.read()
+                if len(data) > 5000:
+                    print(f"✅ Image loaded from /app/attachments/{fname} ({len(data)} bytes)")
+                    return data, fname
     
     # 4. Downloads folder (local testing)
     downloads = os.path.expanduser("~/Downloads")
@@ -83,38 +105,15 @@ def load_image_railway() -> Tuple[bytes, str]:
                     print(f"✅ Image loaded from Downloads: {fpath} ({len(data)} bytes)")
                     return data, os.path.basename(fpath)
     
-    # 5. Temporary file - user se upload lene ke liye
-    temp_path = "/tmp/uploaded_image.jpg"
-    if os.path.exists(temp_path):
-        with open(temp_path, "rb") as f:
-            data = f.read()
-        if len(data) > 5000:
-            print(f"✅ Image loaded from temp: {temp_path} ({len(data)} bytes)")
-            return data, "IMG.jpg"
-    
-    # 6. Fallback - Minimal valid JPEG (1x1 pixel)
+    # 5. Fallback - Minimal valid JPEG
     print("⚠️ No real image found! Using fallback 1x1 pixel JPEG.")
     minimal_jpeg = base64.b64decode(
         "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAb/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAGfAP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAQUCf//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQMBAT8Bf//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQIBAT8Bf//Z"
     )
     return minimal_jpeg, "IMG.jpg"
 
-# Load image
 IMAGE_BYTES, IMAGE_NAME = load_image_railway()
-print(f"📸 Final Image: {IMAGE_NAME} | Size: {len(IMAGE_BYTES)} bytes")
-if len(IMAGE_BYTES) < 5000:
-    print("⚠️ WARNING: Image is very small! Using fallback.")
-
-BASE_URL = "https://slayyourplaypromo.in"
-
-# ==================== DATABASE ====================
-DB_PATH = "slay_bot_local.db"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+print(f"📸 Image: {IMAGE_NAME} | Size: {len(IMAGE_BYTES)} bytes")
 
 # ============================================================
 # SIGNATURE FUNCTION
@@ -148,7 +147,6 @@ def build_signed_data(payload: dict, data_key: str, for_multipart: bool = False)
     else:
         return f"userKey={payload['userKey']}&data={urllib.parse.quote_plus(raw_data)}"
 
-
 def decode_resp(text: str) -> dict:
     data = json.loads(text)
     if "resp" in data:
@@ -158,7 +156,6 @@ def decode_resp(text: str) -> dict:
             s += "=" * pad
         return json.loads(base64.b64decode(s).decode())
     return data
-
 
 # ============================================================
 # DATABASE - WITH AUTO CLEANUP
@@ -195,7 +192,6 @@ def get_db() -> sqlite3.Connection:
     return db
 
 async def cleanup_expired_sessions():
-    """Auto cleanup of expired sessions"""
     async with conn_lock:
         db = get_db()
         db.execute("DELETE FROM users WHERE session_expiry < datetime('now')")
@@ -234,7 +230,6 @@ async def db_add_referral(referrer_id: int):
         db.close()
 
 async def db_clear_user_data(telegram_id: int):
-    """Clear sensitive user data but keep stats"""
     async with conn_lock:
         db = get_db()
         db.execute("""
@@ -247,7 +242,6 @@ async def db_clear_user_data(telegram_id: int):
         db.close()
 
 async def db_set_temp_data(telegram_id: int, data: dict):
-    """Store temporary session data"""
     async with conn_lock:
         db = get_db()
         expiry = (datetime.now() + timedelta(hours=2)).isoformat()
@@ -260,7 +254,6 @@ async def db_set_temp_data(telegram_id: int, data: dict):
         db.close()
 
 async def db_get_temp_data(telegram_id: int) -> Optional[dict]:
-    """Get temporary session data"""
     async with conn_lock:
         db = get_db()
         row = db.execute("SELECT temp_data FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
@@ -289,7 +282,6 @@ async def get_http_session() -> ClientSession:
 
 def _now_ms() -> int:
     return int(datetime.now().timestamp() * 1000)
-
 
 # ============================================================
 # API HELPER
@@ -440,7 +432,7 @@ async def submit_upi(upi_number: str, user_key, data_key, jwt_token) -> Tuple[bo
     return await make_signed_request('/api/users/getUpiNo/{userKey}', payload, data_key, user_key, referer='/dashboard', jwt_token=jwt_token)
 
 # ============================================================
-# KEYBOARDS - Improved UI
+# KEYBOARDS
 # ============================================================
 main_keyboard = ReplyKeyboardMarkup([
     [KeyboardButton("🚀 Start Process")],
@@ -485,7 +477,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = user.id
     args = context.args
 
-    # Auto cleanup
     await cleanup_expired_sessions()
     await db_clear_user_data(tid)
 
@@ -558,7 +549,6 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update, "No data found. Use /start first.")
         return
     
-    # Auto cleanup
     await db_clear_user_data(tid)
     
     text = f"""
@@ -610,7 +600,6 @@ Share your referral link and earn **+1 Credit** for every new user!
 async def start_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
     
-    # Clean previous session
     await db_clear_user_data(tid)
     
     member = await is_channel_member(context.bot, tid)
@@ -671,7 +660,6 @@ async def ask_mobile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['userKey'] = user_key
     context.user_data['dataKey'] = data_key
 
-    # Store temp data in DB for recovery
     await db_set_temp_data(update.effective_user.id, {
         'phone': phone,
         'userKey': user_key,
@@ -722,7 +710,6 @@ async def ask_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['jwt'] = access_token
     tid = update.effective_user.id
     
-    # Update DB with mobile and tokens
     await db_upsert(tid, mobile=context.user_data['phone'], user_key=str(user_key), data_key=data_key, access_token=access_token)
     await db_set_temp_data(tid, {
         'phone': context.user_data['phone'],
@@ -733,7 +720,6 @@ async def ask_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("✅ **OTP Verified!** Setting up your process...", parse_mode="Markdown")
 
-    # Auto steps
     await update.message.reply_text("⏳ **Selecting pack...**", parse_mode="Markdown")
     ok, pdata = await select_pack(user_key, data_key, access_token)
     if not ok:
@@ -746,7 +732,6 @@ async def ask_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏳ **Uploading image...**", parse_mode="Markdown")
     
-    # Upload image
     if IMAGE_BYTES:
         ok, img_data = await upload_image(IMAGE_BYTES, IMAGE_NAME, user_key, data_key, access_token)
         if ok:
@@ -793,7 +778,6 @@ async def ask_upi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = upi_data.get('message', 'Unknown error')
         await update.message.reply_text(f"⚠️ UPI: {msg}")
 
-    # Deduct credit
     is_admin = tid in ADMIN_IDS
     u = await db_user(tid)
     if not is_admin:
@@ -815,7 +799,6 @@ async def ask_upi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    # Clear all sensitive data
     await db_clear_user_data(tid)
     await show_main_menu(update, "✅ Process finished successfully!")
     return ConversationHandler.END
@@ -959,16 +942,8 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ============================================================
 def main():
-    print("=" * 60)
-    print("🤖 SLAY YOUR PLAY - RAILWAY READY BOT")
-    print("=" * 60)
-    print(f"📸 Image: {IMAGE_NAME}")
-    print(f"📦 Size : {len(IMAGE_BYTES)} bytes")
-    print(f"👑 Admin: {ADMIN_IDS}")
-    print(f"📢 Channel: {CHANNEL_USERNAME}")
-    print("=" * 60)
-    print("✅ Bot is running...")
-    print("=" * 60)
+    print(f"✅ Bot starting...")
+    print(f"📸 Image: {IMAGE_NAME} ({len(IMAGE_BYTES)} bytes)")
     
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -995,7 +970,6 @@ def main():
         per_message=False,
     )
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("support", support))
     app.add_handler(CommandHandler("dashboard", dashboard))
@@ -1006,17 +980,9 @@ def main():
     app.add_handler(CommandHandler("broadcast", admin_broadcast))
     app.add_handler(CommandHandler("users", admin_users_list))
     app.add_handler(CommandHandler("admin", admin_panel))
-    
-    # Conversation
     app.add_handler(conv_handler)
-    
-    # Menu handlers
     app.add_handler(MessageHandler(filters.Text(["👥 Refer & Earn", "📊 Dashboard", "📞 Support", "ℹ️ About"]), menu_handler))
-    
-    # Admin menu handler
     app.add_handler(MessageHandler(filters.Text(["📊 Admin Stats", "📢 Broadcast", "💎 Add Credits", "👥 Users List", "🏠 Back to Main"]), admin_menu_handler))
-    
-    # Main menu handler
     app.add_handler(MessageHandler(filters.Text(["🚀 Start Process", "👑 Admin Panel"]), menu_handler))
 
     logger.info("🤖 Bot started polling...")
