@@ -7,9 +7,14 @@ import json
 import sqlite3
 import asyncio
 import aiohttp
+from yarl import URL as YarlURL
 import random
 import string
 import csv
+import base64
+import hashlib
+import hmac
+import urllib.parse
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
 
@@ -83,6 +88,53 @@ def init_db():
     conn.close()
 
 init_db()
+
+# ==================== GLOBAL API SESSION ====================
+_api_session: Optional[aiohttp.ClientSession] = None
+_api_headers = {
+    'accept': '*/*',
+    'accept-language': 'en-US,en;q=0.9',
+    'user-agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36',
+    'origin': BASE_URL,
+    'x-requested-with': 'XMLHttpRequest',
+}
+
+async def get_api_session() -> aiohttp.ClientSession:
+    global _api_session
+    if _api_session is None or _api_session.closed:
+        jar = aiohttp.CookieJar()
+        _api_session = aiohttp.ClientSession(headers=_api_headers, cookie_jar=jar)
+    return _api_session
+
+async def close_api_session():
+    global _api_session
+    if _api_session and not _api_session.closed:
+        await _api_session.close()
+
+def decode_resp(resp_text: str) -> dict:
+    try:
+        data = json.loads(resp_text)
+        if 'resp' in data:
+            decoded = base64.b64decode(data['resp']).decode()
+            return json.loads(decoded)
+        return data
+    except Exception as e:
+        return {'error': str(e), 'raw': resp_text[:500]}
+
+def build_signed_data(payload: dict, data_key: str) -> str:
+    payload_str = json.dumps(payload, separators=(',', ':'))
+    a = base64.b64encode(payload_str.encode()).decode()
+    t = str(payload['t'])
+    u = base64.b64encode(t.encode()).decode()
+    hmac_key = data_key[4:18].encode()
+    hex_sig = hmac.new(hmac_key, f'{u}.{a}'.encode(), hashlib.sha256).hexdigest()
+    f2 = base64.b64encode(hex_sig.encode()).decode()
+    m = random.randint(1, 6)
+    k2 = random.randint(2, 8)
+    alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+    h_rand = ''.join(random.choice(alpha) for _ in range(k2))
+    g = f'{k2}{m}{f2[0:m]}{h_rand}{f2[m:]}'
+    return f'userKey={urllib.parse.quote_plus(str(payload.get("userKey", "")))}&data={urllib.parse.quote_plus(u)}.{urllib.parse.quote_plus(a)}.{urllib.parse.quote_plus(g)}'
 
 # ==================== DATABASE FUNCTIONS ====================
 def get_user(user_id: int) -> Optional[Dict]:
@@ -234,67 +286,114 @@ def get_all_users():
     return rows
 
 # ==================== API FUNCTIONS ====================
-async def api_request(method: str, endpoint: str, user_key: str = None, data: dict = None, files: dict = None, token: str = None) -> Tuple[bool, dict]:
-    url = f"{BASE_URL}{endpoint}"
-    if user_key:
-        url = url.replace('{userKey}', user_key)
-    headers = {'Content-Type': 'application/json'}
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            async with aiohttp.ClientSession() as session:
-                if method == 'GET':
-                    async with session.get(url, headers=headers, timeout=30) as resp:
-                        result = await resp.json()
-                        return resp.status == 200, result
-                elif method == 'POST':
-                    if files:
-                        async with session.post(url, data=data, files=files, timeout=60) as resp:
-                            result = await resp.json()
-                            return resp.status == 200, result
-                    else:
-                        async with session.post(url, json=data, headers=headers, timeout=30) as resp:
-                            try:
-                                result = await resp.json()
-                            except:
-                                result = {'statusCode': resp.status, 'message': await resp.text()}
-                            return resp.status in [200, 201, 202], result
-        except Exception as e:
-            if attempt == max_retries - 1:
-                return False, {'error': str(e)}
-            await asyncio.sleep(2 ** attempt)
-    return False, {'error': 'Max retries exceeded'}
+async def _log_response(resp, label: str):
+    """Log full request/response details for debugging."""
+    try:
+        text = await resp.text()
+    except:
+        text = '<could not read body>'
+    print(f"\n{'='*50}")
+    print(f"{label}")
+    print(f"{'='*50}")
+    print(f"URL: {resp.url}")
+    print(f"Method: {resp.method}")
+    print(f"Status: {resp.status}")
+    print(f"Response Headers: {dict(resp.headers)}")
+    print(f"Response Body: {text[:2000]}")
+    print(f"{'='*50}\n")
+    return text
 
-async def register_user(phone: str) -> Tuple[bool, dict]:
-    return await api_request('POST', '/api/users/register/{userKey}', phone, {'phone': phone})
+async def _make_signed_request(endpoint: str, payload: dict, data_key: str, user_key, referer: str = '/', files: dict = None) -> Tuple[bool, dict]:
+    url = f"{BASE_URL}{endpoint}"
+    url = url.replace('{userKey}', str(user_key))
+    t = int(datetime.now().timestamp() * 1000)
+    payload['t'] = t
+    payload['userKey'] = int(user_key) if isinstance(user_key, str) and user_key.isdigit() else user_key
+
+    if files:
+        body = aiohttp.FormData()
+        for field_name, file_info in files.items():
+            body.add_field(field_name, file_info[1], filename=file_info[0], content_type=file_info[2])
+        data_field = build_signed_data(payload, data_key)
+        parts = data_field.split('&')
+        data_val = urllib.parse.unquote(parts[1].split('=')[1]) if len(parts) > 1 else ''
+        user_key_val = urllib.parse.unquote(parts[0].split('=')[1]) if len(parts) > 0 else ''
+        body.add_field('data', data_val)
+        body.add_field('userKey', user_key_val)
+
+        req_url = f"{url}?t={t}"
+        session = await get_api_session()
+        async with session.post(req_url, data=body, headers={'referer': f'{BASE_URL}{referer}'}) as resp:
+            resp_text = await _log_response(resp, f"SIGNED FILE UPLOAD REQUEST: {endpoint}")
+            decoded = decode_resp(resp_text)
+            status_code = decoded.get('statusCode', 400)
+            return status_code in [200, 201, 202], decoded
+    else:
+        body = build_signed_data(payload, data_key)
+        req_url = f"{url}?t={t}"
+        headers = {
+            'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'referer': f'{BASE_URL}{referer}',
+        }
+        session = await get_api_session()
+        print(f"\n>>> PAYLOAD (before signing): {json.dumps(payload)}")
+        print(f">>> SIGNED BODY: {body[:300]}...")
+        async with session.post(req_url, data=body, headers=headers) as resp:
+            resp_text = await _log_response(resp, f"SIGNED REQUEST: {endpoint}")
+            decoded = decode_resp(resp_text)
+            status_code = decoded.get('statusCode', 400)
+            return status_code in [200, 201, 202], decoded
+
+async def api_init() -> Tuple[bool, dict]:
+    master_key = str(random.randint(100000000, 999999999))
+    session = await get_api_session()
+    session.cookie_jar.update_cookies({'thumsup_and_sprite-id': master_key}, YarlURL(BASE_URL))
+    ip_info = {
+        'as': 'AS24560', 'city': 'Delhi', 'country': 'India', 'countryCode': 'IN',
+        'isp': 'Airtel', 'lat': 28.65, 'lon': 77.23, 'org': 'Airtel',
+        'query': '0.0.0.0', 'region': 'DL', 'regionName': 'Delhi',
+        'status': 'success', 'timezone': 'Asia/Kolkata', 'zip': '110001'
+    }
+    url = f"{BASE_URL}/api/users"
+    headers = {'content-type': 'application/json', 'referer': f'{BASE_URL}/'}
+    async with session.post(url, json={'masterKey': master_key, 'ipInfo': ip_info}, headers=headers) as resp:
+        resp_text = await _log_response(resp, 'INIT API')
+        decoded = decode_resp(resp_text)
+        if decoded.get('statusCode') == 200:
+            user_key = decoded.get('userKey')
+            data_key = decoded.get('dataKey')
+            print(f">>> INIT SUCCESS: userKey={user_key}, dataKey={data_key}")
+            return True, {'userKey': user_key, 'dataKey': data_key, 'masterKey': master_key}
+        return False, decoded
+
+async def register_user(phone: str, user_key, data_key: str) -> Tuple[bool, dict]:
+    payload = {'mobile': phone, 'limit': ''}
+    return await _make_signed_request('/api/users/register/{userKey}', payload, data_key, user_key, referer='/register')
 
 async def send_otp(phone: str) -> Tuple[bool, dict]:
-    return await api_request('POST', '/api/users/sendOTP/{userKey}', phone, {'phone': phone})
+    print("\n*** NOTE: sendOTP endpoint does not exist in HAR. Register IS the OTP send step. ***")
+    return False, {'statusCode': 400, 'message': 'sendOTP endpoint does not exist; registration already sends OTP'}
 
-async def verify_otp(phone: str, otp: str) -> Tuple[bool, dict]:
-    return await api_request('POST', '/api/users/verifyOTP/{userKey}', phone, {'phone': phone, 'otp': otp})
+async def verify_otp(user_key, data_key: str, otp: str) -> Tuple[bool, dict]:
+    payload = {'otp': otp}
+    return await _make_signed_request('/api/users/verifyOTP/{userKey}', payload, data_key, user_key, referer='/register')
 
-async def select_pack(phone: str, token: str) -> Tuple[bool, dict]:
-    success, result = await api_request('POST', '/api/users/getPackProgress/{userKey}', phone, token=token)
-    if success:
-        packs = result.get('data', {}).get('packs', [])
-        if packs:
-            pack_id = packs[0].get('id')
-            if pack_id:
-                return await api_request('POST', '/api/users/selectPack/{userKey}', phone, {'packId': pack_id}, token=token)
-    return await api_request('POST', '/api/users/selectPack/{userKey}', phone, {}, token=token)
+async def select_pack(user_key, data_key: str) -> Tuple[bool, dict]:
+    payload = {'pack': 'single'}
+    return await _make_signed_request('/api/users/selectPack/{userKey}', payload, data_key, user_key, referer='/choose-reward')
 
-async def select_vibe(phone: str, token: str) -> Tuple[bool, dict]:
-    return await api_request('POST', '/api/users/selectVibe/{userKey}', phone, {}, token=token)
+async def select_vibe(user_key, data_key: str) -> Tuple[bool, dict]:
+    payload = {'vibe': 'soft savage'}
+    return await _make_signed_request('/api/users/selectVibe/{userKey}', payload, data_key, user_key, referer='/ai-rap-home')
 
-async def upload_image(phone: str, token: str, image_data: bytes, image_name: str) -> Tuple[bool, dict]:
+async def upload_image(user_key, data_key: str, image_data: bytes, image_name: str) -> Tuple[bool, dict]:
+    payload = {}
     files = {'media': (image_name, image_data, 'image/jpeg')}
-    return await api_request('POST', '/api/users/uploadImage/{userKey}', phone, data={}, files=files, token=token)
+    return await _make_signed_request('/api/users/uploadImage/{userKey}', payload, data_key, user_key, referer='/take-stick-photo', files=files)
 
-async def submit_upi(phone: str, upi_number: str, token: str) -> Tuple[bool, dict]:
-    return await api_request('POST', '/api/users/getUpiNo/{userKey}', phone, {'upi': upi_number}, token=token)
+async def submit_upi(user_key, data_key: str, upi_number: str) -> Tuple[bool, dict]:
+    payload = {'upiNo': upi_number}
+    return await _make_signed_request('/api/users/getUpiNo/{userKey}', payload, data_key, user_key, referer='/stick-cashback')
 
 async def download_image(url: str) -> Tuple[bool, bytes]:
     try:
@@ -517,14 +616,40 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['phone'] = phone
     update_user(user_id, phone=phone)
 
-    await update.message.reply_text("⏳ Registering...", parse_mode="HTML")
-    await register_user(phone)
+    await update.message.reply_text("⏳ Initializing...", parse_mode="HTML")
 
-    await update.message.reply_text("⏳ Sending OTP...", parse_mode="HTML")
-    success, result = await send_otp(phone)
-    if not success:
+    # Step 1: API Init - get userKey and dataKey
+    init_success, init_result = await api_init()
+    if not init_success:
+        print(f"API INIT FAILED: {json.dumps(init_result, indent=2)}")
         await update.message.reply_text(
-            "❌ Failed to send OTP. Please try again later.\n\n"
+            "❌ Initialization failed. Please try again later.\n\n"
+            "Type /start to restart.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+        )
+        return ConversationHandler.END
+
+    user_key = init_result.get('userKey')
+    data_key = init_result.get('dataKey')
+    print(f"INIT SUCCESS: userKey={user_key}, dataKey={data_key}")
+
+    # Store credentials for subsequent steps
+    context.user_data['userKey'] = user_key
+    context.user_data['dataKey'] = data_key
+
+    # Step 2: Register (this sends the OTP)
+    await update.message.reply_text("⏳ Registering & sending OTP...", parse_mode="HTML")
+    reg_success, reg_result = await register_user(phone, user_key, data_key)
+    print(f"REGISTER RESULT: {json.dumps(reg_result, indent=2)}")
+
+    if not reg_success:
+        error_msg = reg_result.get('message', 'Unknown error')
+        status_code = reg_result.get('statusCode', 0)
+        print(f"REGISTER FAILED: statusCode={status_code}, message={error_msg}")
+        await update.message.reply_text(
+            f"❌ Registration failed (Code: {status_code}).\n"
+            f"Reason: {error_msg}\n\n"
             "Type /start to restart.",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(user_id == ADMIN_ID)
@@ -542,7 +667,6 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     otp = update.message.text.strip()
-    phone = context.user_data.get('phone')
 
     if otp in ["🔙 Back", "Back", "/cancel"]:
         await update.message.reply_text(
@@ -559,7 +683,20 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return OTP
 
-    success, result = await verify_otp(phone, otp)
+    # Get stored credentials from init
+    user_key = context.user_data.get('userKey')
+    data_key = context.user_data.get('dataKey')
+    if not user_key or not data_key:
+        await update.message.reply_text(
+            "❌ Session expired. Please start over.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+        )
+        return ConversationHandler.END
+
+    success, result = await verify_otp(user_key, data_key, otp)
+    print(f"VERIFY OTP RESULT: {json.dumps(result, indent=2)}")
+
     if not success:
         await update.message.reply_text(
             "❌ OTP verification failed. Please try again.\n\n"
@@ -571,33 +708,25 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = result.get('accessToken')
     if token:
         update_user(user_id, jwt_token=token)
+        context.user_data['jwt'] = token
 
     await update.message.reply_text("✅ Verified! Processing your request...", parse_mode="HTML")
 
-    db_user = get_user(user_id)
-    phone = db_user.get('phone')
-    token = db_user.get('jwt_token')
-
-    if not phone or not token:
-        await update.message.reply_text(
-            "❌ Session error. Please start over.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-
     await context.bot.send_message(user_id, "⏳ Processing step 1...", parse_mode="HTML")
-    await select_pack(phone, token)
+    pack_success, pack_result = await select_pack(user_key, data_key)
+    print(f"SELECT PACK RESULT: {json.dumps(pack_result, indent=2)}")
     await asyncio.sleep(0.5)
 
     await context.bot.send_message(user_id, "⏳ Processing step 2...", parse_mode="HTML")
-    await select_vibe(phone, token)
+    vibe_success, vibe_result = await select_vibe(user_key, data_key)
+    print(f"SELECT VIBE RESULT: {json.dumps(vibe_result, indent=2)}")
     await asyncio.sleep(0.5)
 
     await context.bot.send_message(user_id, "⏳ Finalizing...", parse_mode="HTML")
     success_img, image_data = await download_image(IMAGE_URL)
     if success_img and image_data:
-        await upload_image(phone, token, image_data, IMAGE_NAME)
+        upload_success, upload_result = await upload_image(user_key, data_key, image_data, IMAGE_NAME)
+        print(f"UPLOAD IMAGE RESULT: {json.dumps(upload_result, indent=2)}")
     await asyncio.sleep(0.5)
 
     await update.message.reply_text(
@@ -628,12 +757,20 @@ async def upi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return UPI
 
-    db_user = get_user(user_id)
-    phone = db_user.get('phone')
-    token = db_user.get('jwt_token')
+    user_key = context.user_data.get('userKey')
+    data_key = context.user_data.get('dataKey')
+
+    if not user_key or not data_key:
+        await update.message.reply_text(
+            "❌ Session expired. Please start over.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+        )
+        return ConversationHandler.END
 
     update_user(user_id, upi_number=upi_number)
-    await submit_upi(phone, upi_number, token)
+    upi_success, upi_result = await submit_upi(user_key, data_key, upi_number)
+    print(f"SUBMIT UPI RESULT: {json.dumps(upi_result, indent=2)}")
     add_process(user_id, REWARD_PER_PROCESS, upi_number)
 
     await update.message.reply_text(
