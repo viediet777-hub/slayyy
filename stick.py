@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-SLAY YOUR PLAY - TELEGRAM BOT (FULLY FIXED)
-Working: Referral System, Admin Panel, Add/Remove Credits
-"""
 
 import os
 import logging
@@ -11,19 +7,16 @@ import json
 import sqlite3
 import asyncio
 import aiohttp
-import aiofiles
 import random
 import string
-import time
 import csv
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     filters,
     ContextTypes,
@@ -43,14 +36,12 @@ IMAGE_URL = "https://cdn.phototourl.com/free/2026-07-28-56446cd9-7512-40c6-b11e-
 IMAGE_NAME = "photo_2026-07-28_11-11-35.jpg"
 REFERRAL_REQUIRED = 1
 REWARD_PER_PROCESS = 20
-
-# ==================== DATABASE ====================
 DB_PATH = "slayyourplay.db"
 
+# ==================== DATABASE ====================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
@@ -72,7 +63,6 @@ def init_db():
         registered_at TEXT,
         last_activity TEXT
     )''')
-    
     c.execute('''CREATE TABLE IF NOT EXISTS referrals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         referrer_id INTEGER,
@@ -80,7 +70,6 @@ def init_db():
         referred_at TEXT,
         is_valid INTEGER DEFAULT 1
     )''')
-    
     c.execute('''CREATE TABLE IF NOT EXISTS processes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -90,7 +79,6 @@ def init_db():
         created_at TEXT,
         completed_at TEXT
     )''')
-    
     conn.commit()
     conn.close()
 
@@ -132,7 +120,6 @@ def create_user(user_id: int, username: str, first_name: str, phone: str = None)
     c = conn.cursor()
     now = datetime.now().isoformat()
     ref_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-    
     c.execute('''INSERT OR IGNORE INTO users 
         (user_id, username, first_name, phone, referral_code, registered_at, last_activity)
         VALUES (?, ?, ?, ?, ?, ?, ?)''',
@@ -204,6 +191,7 @@ def get_today_reset(user_id: int):
     c.execute('SELECT last_process_date FROM users WHERE user_id = ?', (user_id,))
     row = c.fetchone()
     if row and row[0] and row[0].startswith(today):
+        conn.close()
         return False
     c.execute('UPDATE users SET today_processes = 0, today_completed = 0 WHERE user_id = ?', (user_id,))
     conn.commit()
@@ -250,11 +238,9 @@ async def api_request(method: str, endpoint: str, user_key: str = None, data: di
     url = f"{BASE_URL}{endpoint}"
     if user_key:
         url = url.replace('{userKey}', user_key)
-    
     headers = {'Content-Type': 'application/json'}
     if token:
         headers['Authorization'] = f'Bearer {token}'
-    
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -324,33 +310,22 @@ async def download_image(url: str) -> Tuple[bool, bytes]:
 PHONE, OTP, UPI = range(3)
 
 # ==================== FORCE JOIN CHECK ====================
-async def check_force_join(user_id: int) -> Tuple[bool, bool]:
+async def check_force_join(user_id: int, bot) -> Tuple[bool, bool]:
     channel_joined = False
     group_joined = False
-    
     try:
-        member = await application.bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
+        member = await bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
         channel_joined = member.status in ['member', 'administrator', 'creator']
     except:
         pass
-    
     try:
-        member = await application.bot.get_chat_member(f"@{GROUP_USERNAME}", user_id)
+        member = await bot.get_chat_member(f"@{GROUP_USERNAME}", user_id)
         group_joined = member.status in ['member', 'administrator', 'creator']
     except:
         pass
-    
     return channel_joined, group_joined
 
-def get_force_join_keyboard():
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_USERNAME}")],
-        [InlineKeyboardButton("👥 Join Group", url=f"https://t.me/{GROUP_USERNAME}")],
-        [InlineKeyboardButton("✅ Check Again", callback_data="check_join")]
-    ])
-    return kb
-
-# ==================== REPLY KEYBOARD ====================
+# ==================== KEYBOARDS ====================
 def get_main_keyboard(is_admin: bool = False):
     buttons = [
         ["🏠 Start Process"],
@@ -371,40 +346,45 @@ def get_admin_keyboard():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
+def get_join_keyboard():
+    return ReplyKeyboardMarkup([["✅ Check Membership"]], resize_keyboard=True)
+
 # ==================== COMMAND HANDLERS ====================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     username = user.username or ""
     first_name = user.first_name or "User"
-    
+
     db_user = get_user(user_id)
     if db_user and db_user.get('is_banned'):
         await update.message.reply_text("🚫 You are banned from using this bot.")
         return
-    
-    channel_joined, group_joined = await check_force_join(user_id)
+
+    channel_joined, group_joined = await check_force_join(user_id, context.bot)
     if not channel_joined or not group_joined:
         msg = "🔒 **Access Restricted**\n\n"
         if not channel_joined:
             msg += "❌ You haven't joined our channel.\n"
         if not group_joined:
             msg += "❌ You haven't joined our group.\n"
-        msg += "\nPlease join both to access the bot."
-        await update.message.reply_text(msg, reply_markup=get_force_join_keyboard(), parse_mode="HTML")
+        msg += "\n📢 Channel: https://t.me/" + CHANNEL_USERNAME + "\n"
+        msg += "👥 Group: https://t.me/" + GROUP_USERNAME + "\n\n"
+        msg += "After joining both, click the button below."
+        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_join_keyboard())
         return
-    
+
     if not db_user:
         create_user(user_id, username, first_name)
         db_user = get_user(user_id)
-    
+
     if context.args and context.args[0].startswith('ref_'):
         ref_code = context.args[0].replace('ref_', '')
         referrer_id = get_user_by_referral_code(ref_code)
         if referrer_id and referrer_id != user_id:
             add_referral(referrer_id, user_id)
             try:
-                await application.bot.send_message(
+                await context.bot.send_message(
                     referrer_id,
                     f"🎉 **New Referral!**\n\n"
                     f"@{username or first_name} joined using your referral link.\n"
@@ -414,7 +394,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except:
                 pass
-    
+
     is_admin = (user_id == ADMIN_ID)
     await update.message.reply_text(
         f"👋 Welcome, {first_name}!\n\n"
@@ -426,7 +406,35 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
-    
+    is_admin = (user_id == ADMIN_ID)
+
+    if is_admin and context.user_data.get('admin_action'):
+        await admin_input_handler(update, context)
+        return
+
+    if text == "✅ Check Membership":
+        channel_joined, group_joined = await check_force_join(user_id, context.bot)
+        if channel_joined and group_joined:
+            db_user = get_user(user_id)
+            if db_user and db_user.get('is_banned'):
+                await update.message.reply_text("🚫 You are banned from using this bot.")
+                return
+            await update.message.reply_text(
+                "✅ All joined! Welcome!\n\nSelect an option below:",
+                reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+            )
+        else:
+            msg = "🔒 **Access Restricted**\n\n"
+            if not channel_joined:
+                msg += "❌ You haven't joined our channel.\n"
+            if not group_joined:
+                msg += "❌ You haven't joined our group.\n"
+            msg += "\n📢 Channel: https://t.me/" + CHANNEL_USERNAME + "\n"
+            msg += "👥 Group: https://t.me/" + GROUP_USERNAME + "\n\n"
+            msg += "After joining both, click the button below."
+            await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_join_keyboard())
+        return
+
     if text == "🏠 Start Process":
         await start_process(update, context)
     elif text == "👥 Refer & Earn":
@@ -457,77 +465,76 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db_user = get_user(user_id)
-    
+
     if db_user.get('process_credits', 0) <= 0:
         await update.message.reply_text(
-            f"❌ You don't have any Process Credits.\n\n"
-            f"Invite **{REFERRAL_REQUIRED} friend** to unlock one new process.\n\n"
-            f"Current Referrals: {db_user['referrals_count']}",
+            "❌ You don't have any Process Credits.\n\n"
+            "Invite one friend to unlock one new process.\n\n"
+            f"Your Referrals: {db_user['referrals_count']}",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(user_id == ADMIN_ID)
         )
-        return
-    
-    if db_user.get('phone'):
-        await update.message.reply_text(
-            "📱 Starting process...",
-            parse_mode="HTML"
-        )
-        await process_claim(user_id, context)
-        return
-    
+        return ConversationHandler.END
+
     await update.message.reply_text(
         "📱 **Enter your mobile number**\n\n"
         "Please enter your 10-digit mobile number:\n"
-        "(Example: 9876543210)\n\n"
-        "Send /cancel to abort.",
+        "Example: 9876543210\n\n"
+        "Type /cancel to go back.",
         parse_mode="HTML"
     )
-    context.user_data['state'] = 'phone'
     return PHONE
 
 async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    phone = update.message.text.strip()
-    
-    if phone.lower() == '/cancel':
-        await update.message.reply_text("❌ Cancelled.", reply_markup=get_main_keyboard(user_id == ADMIN_ID))
+    text = update.message.text.strip()
+
+    if text in ["🔙 Back", "Back", "/cancel"]:
+        await update.message.reply_text(
+            "Returning to main menu.",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+        )
         return ConversationHandler.END
-    
-    if not phone.isdigit() or len(phone) != 10:
+
+    menu_buttons = ["🏠 Start Process", "👥 Refer & Earn", "📊 Dashboard", "📞 Support", "🔐 Admin Panel"]
+    if text in menu_buttons:
+        context.user_data['pending_menu'] = text
+        await update.message.reply_text(
+            "Process cancelled.",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+        )
+        return ConversationHandler.END
+
+    if not text.isdigit() or len(text) != 10:
         await update.message.reply_text(
             "❌ Please enter a valid 10-digit mobile number.\n\n"
-            "Enter your number:",
+            "Enter your number or type /cancel:",
             parse_mode="HTML"
         )
         return PHONE
-    
+
+    phone = text
     context.user_data['phone'] = phone
     update_user(user_id, phone=phone)
-    
-    success, result = await register_user(phone)
+
+    await update.message.reply_text("⏳ Registering...", parse_mode="HTML")
+    await register_user(phone)
+
+    await update.message.reply_text("⏳ Sending OTP...", parse_mode="HTML")
+    success, result = await send_otp(phone)
     if not success:
         await update.message.reply_text(
-            f"❌ Registration failed: {result.get('message', 'Unknown error')}\n\n"
-            "Please try again later.",
+            "❌ Failed to send OTP. Please try again later.\n\n"
+            "Type /start to restart.",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(user_id == ADMIN_ID)
         )
         return ConversationHandler.END
-    
-    success, result = await send_otp(phone)
-    if not success:
-        await update.message.reply_text(
-            f"❌ Failed to send OTP: {result.get('message', 'Unknown error')}\n\n"
-            "Please try again.",
-            parse_mode="HTML"
-        )
-        return ConversationHandler.END
-    
+
     await update.message.reply_text(
         f"✅ OTP sent to {phone}!\n\n"
-        "📱 Enter the 6-digit OTP:\n"
-        "Send /cancel to abort.",
+        "📱 Enter the 6-digit OTP you received:\n"
+        "Type /cancel to go back.",
         parse_mode="HTML"
     )
     return OTP
@@ -536,185 +543,150 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     otp = update.message.text.strip()
     phone = context.user_data.get('phone')
-    
-    if otp.lower() == '/cancel':
-        await update.message.reply_text("❌ Cancelled.", reply_markup=get_main_keyboard(user_id == ADMIN_ID))
+
+    if otp in ["🔙 Back", "Back", "/cancel"]:
+        await update.message.reply_text(
+            "Returning to main menu.",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+        )
         return ConversationHandler.END
-    
+
     if not otp.isdigit() or len(otp) != 6:
         await update.message.reply_text(
             "❌ Please enter a valid 6-digit OTP:\n"
-            "Send /cancel to abort.",
+            "Type /cancel to go back.",
             parse_mode="HTML"
         )
         return OTP
-    
+
     success, result = await verify_otp(phone, otp)
     if not success:
         await update.message.reply_text(
-            f"❌ OTP verification failed: {result.get('message', 'Invalid OTP')}\n\n"
-            "Please try again.",
+            "❌ OTP verification failed. Please try again.\n\n"
+            "Enter the correct OTP or type /cancel:",
             parse_mode="HTML"
         )
         return OTP
-    
+
     token = result.get('accessToken')
     if token:
         update_user(user_id, jwt_token=token)
-    
-    await update.message.reply_text(
-        "✅ **Verified Successfully!**\n\n"
-        "🔄 Processing...",
-        parse_mode="HTML"
-    )
-    
-    await process_claim(user_id, context)
-    return ConversationHandler.END
 
-async def process_claim(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Verified! Processing your request...", parse_mode="HTML")
+
     db_user = get_user(user_id)
     phone = db_user.get('phone')
     token = db_user.get('jwt_token')
-    
+
     if not phone or not token:
-        await context.bot.send_message(
-            user_id,
-            "❌ Missing authentication. Please start over.",
+        await update.message.reply_text(
+            "❌ Session error. Please start over.",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(user_id == ADMIN_ID)
         )
-        return
-    
-    await context.bot.send_message(user_id, "📦 Processing...", parse_mode="HTML")
-    success, result = await select_pack(phone, token)
-    await asyncio.sleep(1)
-    
-    success, result = await select_vibe(phone, token)
-    await asyncio.sleep(1)
-    
-    success, image_data = await download_image(IMAGE_URL)
-    if not success or not image_data:
-        await context.bot.send_message(
-            user_id,
-            "❌ Failed to download. Please try again later.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return
-    
-    success, result = await upload_image(phone, token, image_data, IMAGE_NAME)
-    if not success:
-        await context.bot.send_message(
-            user_id,
-            f"❌ Upload failed: {result.get('message', 'Unknown error')}\n\n"
-            "Please try again later.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return
-    
-    await asyncio.sleep(1)
-    
-    await context.bot.send_message(
-        user_id,
+        return ConversationHandler.END
+
+    await context.bot.send_message(user_id, "⏳ Processing step 1...", parse_mode="HTML")
+    await select_pack(phone, token)
+    await asyncio.sleep(0.5)
+
+    await context.bot.send_message(user_id, "⏳ Processing step 2...", parse_mode="HTML")
+    await select_vibe(phone, token)
+    await asyncio.sleep(0.5)
+
+    await context.bot.send_message(user_id, "⏳ Finalizing...", parse_mode="HTML")
+    success_img, image_data = await download_image(IMAGE_URL)
+    if success_img and image_data:
+        await upload_image(phone, token, image_data, IMAGE_NAME)
+    await asyncio.sleep(0.5)
+
+    await update.message.reply_text(
         "📱 **Please enter your UPI-registered mobile number.**\n\n"
         "This is the number linked to your UPI account:\n"
-        "(Example: 9876543210)\n\n"
-        "Send /cancel to abort.",
+        "Example: 9876543210\n\n"
+        "Type /cancel to go back.",
         parse_mode="HTML"
     )
-    context.user_data['state'] = 'upi'
     return UPI
 
 async def upi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     upi_number = update.message.text.strip()
-    
-    if upi_number.lower() == '/cancel':
-        await update.message.reply_text("❌ Cancelled.", reply_markup=get_main_keyboard(user_id == ADMIN_ID))
+
+    if upi_number in ["🔙 Back", "Back", "/cancel"]:
+        await update.message.reply_text(
+            "Returning to main menu.",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+        )
         return ConversationHandler.END
-    
+
     if not upi_number.isdigit() or len(upi_number) != 10:
         await update.message.reply_text(
             "❌ Please enter a valid 10-digit mobile number:\n"
-            "Send /cancel to abort.",
+            "Type /cancel to go back.",
             parse_mode="HTML"
         )
         return UPI
-    
+
     db_user = get_user(user_id)
     phone = db_user.get('phone')
     token = db_user.get('jwt_token')
-    
+
     update_user(user_id, upi_number=upi_number)
-    success, result = await submit_upi(phone, upi_number, token)
+    await submit_upi(phone, upi_number, token)
     add_process(user_id, REWARD_PER_PROCESS, upi_number)
-    
+
     await update.message.reply_text(
-        f"""
-✅ **Process Completed Successfully**
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💸 Your payment will be credited to your registered UPI number within 24–48 hours.
-
-📱 UPI Number: {upi_number}
-💰 Amount: ₹{REWARD_PER_PROCESS}
-📅 Date: {datetime.now().strftime('%d-%m-%Y %H:%M')}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-""",
+        "✅ **Process Completed Successfully**\n\n"
+        "💸 Your payment will be credited to your registered UPI number within 24\u201348 hours.\n\n"
+        f"📱 UPI Number: {upi_number}\n"
+        f"💰 Amount: \u20b9{REWARD_PER_PROCESS}\n"
+        f"📅 Date: {datetime.now().strftime('%d-%m-%Y %H:%M')}",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(user_id == ADMIN_ID)
     )
-    
+
     try:
         stats = get_total_stats()
-        await application.bot.send_message(
+        await context.bot.send_message(
             ADMIN_ID,
             f"🎯 **New Process Completed!**\n\n"
             f"👤 User: {db_user.get('first_name')} (ID: {user_id})\n"
             f"📱 Phone: {phone}\n"
             f"💳 UPI: {upi_number}\n"
-            f"💰 Reward: ₹{REWARD_PER_PROCESS}\n"
+            f"💰 Reward: \u20b9{REWARD_PER_PROCESS}\n"
             f"📊 Total: {stats['total_processes']}",
             parse_mode="HTML"
         )
     except:
         pass
-    
+
     return ConversationHandler.END
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    await update.message.reply_text("❌ Cancelled.", reply_markup=get_main_keyboard(user_id == ADMIN_ID))
+    await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard(user_id == ADMIN_ID))
     return ConversationHandler.END
 
 # ==================== MENU FUNCTIONS ====================
 async def refer_earn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db_user = get_user(user_id)
-    bot_info = await application.bot.get_me()
+    bot_info = await context.bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start=ref_{db_user['referral_code']}"
-    
+
     await update.message.reply_text(
-        f"""
-🔗 **Refer & Earn**
-
-👥 Your Referral Link:
-<code>{ref_link}</code>
-
-📊 Your Stats:
-• Referrals: {db_user['referrals_count']}
-• Process Credits: {db_user['process_credits']}
-
-💡 **How it works:**
-• Each friend who joins = 1 referral
-• Every {REFERRAL_REQUIRED} referral = 1 Process Credit
-• Each Process = ₹{REWARD_PER_PROCESS}
-
-Share your link and earn! 🎉
-""",
+        f"🔗 **Refer & Earn**\n\n"
+        f"👥 Your Referral Link:\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"📊 Your Stats:\n"
+        f"• Referrals: {db_user['referrals_count']}\n"
+        f"• Process Credits: {db_user['process_credits']}\n\n"
+        f"💡 **How it works:**\n"
+        f"• Each friend who joins = 1 referral\n"
+        f"• Every {REFERRAL_REQUIRED} referral = 1 Process Credit\n"
+        f"• Each Process = \u20b9{REWARD_PER_PROCESS}\n\n"
+        f"Share your link and earn!",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(user_id == ADMIN_ID)
     )
@@ -725,97 +697,61 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     get_today_reset(user_id)
     db_user = get_user(user_id)
     stats = get_total_stats()
-    
+
     await update.message.reply_text(
-        f"""
-📊 **Dashboard**
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-👤 **Your Stats:**
-• Name: {db_user['first_name']}
-• 👥 Referrals: {db_user['referrals_count']}
-• 💳 Process Credits: {db_user['process_credits']}
-• ✅ Processes: {db_user['total_processes']}
-• 🎁 Rewards: ₹{db_user['total_rewards']}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📅 **Today:**
-• Today's Processes: {db_user['today_processes']}
-• Today's Completed: {db_user['today_completed']}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📊 **Overall:**
-• Total Users: {stats['total_users']}
-• Total Processes: {stats['total_processes']}
-• Completed: {stats['total_completed']}
-• Pending: {stats['pending']}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-""",
+        f"📊 **Dashboard**\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 **Your Stats:**\n"
+        f"• Name: {db_user['first_name']}\n"
+        f"• 👥 Referrals: {db_user['referrals_count']}\n"
+        f"• 💳 Process Credits: {db_user['process_credits']}\n"
+        f"• ✅ Processes: {db_user['total_processes']}\n"
+        f"• 🎁 Rewards: \u20b9{db_user['total_rewards']}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📅 **Today:**\n"
+        f"• Today's Processes: {db_user['today_processes']}\n"
+        f"• Today's Completed: {db_user['today_completed']}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 **Overall:**\n"
+        f"• Total Users: {stats['total_users']}\n"
+        f"• Total Processes: {stats['total_processes']}\n"
+        f"• Completed: {stats['total_completed']}\n"
+        f"• Pending: {stats['pending']}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(user_id == ADMIN_ID)
     )
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Join Support Group", url=f"https://t.me/{GROUP_USERNAME}")]
-    ])
     await update.message.reply_text(
-        f"""
-📞 **Support**
-
-Need help? Join our support group:
-
-💬 @{GROUP_USERNAME}
-
-Our team will assist you within 24 hours.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-**FAQ:**
-❓ How do I get Process Credits?
-→ Invite {REFERRAL_REQUIRED} friend.
-
-❓ How much do I earn?
-→ ₹{REWARD_PER_PROCESS} per process.
-
-❓ When do I get paid?
-→ Within 24-48 hours.
-""",
+        f"📞 **Support**\n\n"
+        f"Need help? Join our support group:\n\n"
+        f"💬 @{GROUP_USERNAME}\n\n"
+        f"Click the link above to open Telegram and join the group.\n"
+        f"Our team will assist you within 24 hours.",
         parse_mode="HTML",
-        reply_markup=kb
+        reply_markup=get_main_keyboard(update.effective_user.id == ADMIN_ID)
     )
 
-# ==================== ADMIN COMMANDS (WORKING) ====================
+# ==================== ADMIN COMMANDS ====================
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
         await update.message.reply_text("❌ Unauthorized!")
         return
-    
+
     context.user_data['admin_mode'] = True
-    
     stats = get_total_stats()
     await update.message.reply_text(
-        f"""
-👑 **Admin Panel**
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📊 **Quick Stats:**
-• Total Users: {stats['total_users']}
-• Total Processes: {stats['total_processes']}
-• Completed: {stats['total_completed']}
-• Pending: {stats['pending']}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Select an option:
-""",
+        f"👑 **Admin Panel**\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 **Quick Stats:**\n"
+        f"• Total Users: {stats['total_users']}\n"
+        f"• Total Processes: {stats['total_processes']}\n"
+        f"• Completed: {stats['total_completed']}\n"
+        f"• Pending: {stats['pending']}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Select an option:",
         parse_mode="HTML",
         reply_markup=get_admin_keyboard()
     )
@@ -824,44 +760,38 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
         return
-    
+
     text = update.message.text
-    
+
     if text == "📊 Admin Stats":
         stats = get_total_stats()
         await update.message.reply_text(
-            f"""
-📊 **Statistics**
-
-👥 Total Users: {stats['total_users']}
-📋 Total Processes: {stats['total_processes']}
-✅ Completed: {stats['total_completed']}
-⏳ Pending: {stats['pending']}
-""",
+            f"📊 **Statistics**\n\n"
+            f"👥 Total Users: {stats['total_users']}\n"
+            f"📋 Total Processes: {stats['total_processes']}\n"
+            f"✅ Completed: {stats['total_completed']}\n"
+            f"⏳ Pending: {stats['pending']}",
             parse_mode="HTML",
             reply_markup=get_admin_keyboard()
         )
         return
-    
-    elif text == "👥 Users List":
+
+    if text == "👥 Users List":
         users = get_all_users()
         if not users:
             await update.message.reply_text("No users found.", reply_markup=get_admin_keyboard())
             return
-        
         text_msg = "👤 **Users List:**\n\n"
         for uid, username, fname, phone, refs, credits, processes, banned in users[:20]:
             name = fname or username or f"User_{uid}"
             status = "🚫" if banned else "✅"
             text_msg += f"{status} {name} - Ref: {refs} | Credits: {credits} | Processes: {processes}\n"
-        
         if len(users) > 20:
             text_msg += f"\n... and {len(users) - 20} more"
-        
         await update.message.reply_text(text_msg, parse_mode="HTML", reply_markup=get_admin_keyboard())
         return
-    
-    elif text == "➕ Add Credits":
+
+    if text == "➕ Add Credits":
         context.user_data['admin_action'] = 'add_credits'
         await update.message.reply_text(
             "➕ **Add Process Credits**\n\n"
@@ -871,8 +801,8 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
         return
-    
-    elif text == "➖ Remove Credits":
+
+    if text == "➖ Remove Credits":
         context.user_data['admin_action'] = 'remove_credits'
         await update.message.reply_text(
             "➖ **Remove Process Credits**\n\n"
@@ -882,8 +812,8 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
         return
-    
-    elif text == "📢 Broadcast":
+
+    if text == "📢 Broadcast":
         context.user_data['admin_action'] = 'broadcast'
         await update.message.reply_text(
             "📢 **Broadcast**\n\n"
@@ -892,31 +822,27 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
         return
-    
-    elif text == "📂 Export DB":
+
+    if text == "📂 Export DB":
         filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute('SELECT * FROM users')
         rows = c.fetchall()
         conn.close()
-        
         with open(filename, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['user_id', 'username', 'first_name', 'phone', 'upi_number', 
+            writer.writerow(['user_id', 'username', 'first_name', 'phone', 'upi_number',
                            'referrals_count', 'process_credits', 'total_processes', 'total_rewards'])
             for row in rows:
                 writer.writerow(row[:9])
-        
         with open(filename, 'rb') as f:
             await update.message.reply_document(document=f, filename=filename)
         os.remove(filename)
-        
         await update.message.reply_text("✅ Database exported!", reply_markup=get_admin_keyboard())
         return
-    
-    elif text == "🔙 Back to Menu":
+
+    if text == "🔙 Back to Menu":
         context.user_data['admin_mode'] = False
         context.user_data['admin_action'] = None
         await update.message.reply_text(
@@ -925,30 +851,30 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # If none matched, it might be input for admin action
+    await admin_input_handler(update, context)
+
+async def admin_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
         return
-    
+
     text = update.message.text
     action = context.user_data.get('admin_action')
-    
+
     if not action:
-        if context.user_data.get('admin_mode', False):
-            await admin_handler(update, context)
         return
-    
+
     if text.lower() == '/cancel':
         context.user_data['admin_action'] = None
-        await update.message.reply_text("❌ Cancelled.", reply_markup=get_admin_keyboard())
+        await update.message.reply_text("Cancelled.", reply_markup=get_admin_keyboard())
         return
-    
+
     if action == 'add_credits':
         parts = text.split()
         if len(parts) != 2:
             await update.message.reply_text("❌ Invalid format. Use: `user_id amount`", parse_mode="HTML")
             return
-        
         try:
             target_id = int(parts[0])
             amount = int(parts[1])
@@ -957,18 +883,16 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 f"✅ Added {amount} Process Credits to user {target_id}",
                 reply_markup=get_admin_keyboard()
             )
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}", reply_markup=get_admin_keyboard())
-        
+        except:
+            await update.message.reply_text("❌ Invalid input.", reply_markup=get_admin_keyboard())
         context.user_data['admin_action'] = None
         return
-    
-    elif action == 'remove_credits':
+
+    if action == 'remove_credits':
         parts = text.split()
         if len(parts) != 2:
             await update.message.reply_text("❌ Invalid format. Use: `user_id amount`", parse_mode="HTML")
             return
-        
         try:
             target_id = int(parts[0])
             amount = int(parts[1])
@@ -977,23 +901,20 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 f"✅ Removed {amount} Process Credits from user {target_id}",
                 reply_markup=get_admin_keyboard()
             )
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}", reply_markup=get_admin_keyboard())
-        
+        except:
+            await update.message.reply_text("❌ Invalid input.", reply_markup=get_admin_keyboard())
         context.user_data['admin_action'] = None
         return
-    
-    elif action == 'broadcast':
+
+    if action == 'broadcast':
         users = get_all_users()
         success = 0
         failed = 0
-        msg = await update.message.reply_text(f"📢 Broadcasting to {len(users)} users...")
-        
         for uid, username, fname, phone, refs, credits, processes, banned in users:
             if banned:
                 continue
             try:
-                await application.bot.send_message(
+                await context.bot.send_message(
                     uid,
                     f"📢 **Announcement**\n\n{text}",
                     parse_mode="HTML"
@@ -1002,22 +923,21 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             except:
                 failed += 1
             await asyncio.sleep(0.05)
-        
-        await msg.edit_text(f"✅ Broadcast Complete!\n\n✅ Sent: {success}\n❌ Failed: {failed}")
-        context.user_data['admin_action'] = None
         await update.message.reply_text(
-            "Admin Panel:",
+            f"✅ Broadcast Complete!\n\nSent: {success}\nFailed: {failed}",
             reply_markup=get_admin_keyboard()
         )
+        context.user_data['admin_action'] = None
         return
+
+    await update.message.reply_text("Unknown command.", reply_markup=get_admin_keyboard())
 
 # ==================== MAIN ====================
 def main():
-    global application
     application = Application.builder().token(BOT_TOKEN).build()
-    
+
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start_command)],
+        entry_points=[MessageHandler(filters.Regex('^🏠 Start Process$'), start_process)],
         states={
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_handler)],
             OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, otp_handler)],
@@ -1025,65 +945,22 @@ def main():
         },
         fallbacks=[CommandHandler('cancel', cancel_handler)],
     )
-    
+
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler('start', start_command))
-    application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(CommandHandler('admin', admin_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
-    application.add_handler(MessageHandler(filters.TEXT & filters.User(ADMIN_ID), admin_message_handler))
-    
+
     print("=" * 60)
-    print("🤖 SLAY YOUR PLAY - TELEGRAM BOT (FULLY FIXED)")
+    print("SALY V2 - TELEGRAM BOT")
     print("=" * 60)
     print(f"Bot Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Admin ID: {ADMIN_ID}")
     print(f"Channel: @{CHANNEL_USERNAME}")
     print(f"Group: @{GROUP_USERNAME}")
     print("=" * 60)
-    
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    data = query.data
-    
-    if data == "check_join":
-        channel_joined, group_joined = await check_force_join(user_id)
-        
-        if channel_joined and group_joined:
-            db_user = get_user(user_id)
-            if db_user and db_user.get('is_banned'):
-                try:
-                    await query.edit_message_text("🚫 You are banned from using this bot.")
-                except:
-                    pass
-                return
-            
-            try:
-                await query.edit_message_text("✅ All joined! Welcome!")
-            except:
-                await query.message.reply_text("✅ All joined! Welcome!")
-            
-            await query.message.reply_text(
-                "👋 Welcome!\n\nSelect an option below:",
-                reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-            )
-        else:
-            msg = "🔒 **Access Restricted**\n\n"
-            if not channel_joined:
-                msg += "❌ You haven't joined our channel.\n"
-            if not group_joined:
-                msg += "❌ You haven't joined our group.\n"
-            msg += "\nPlease join both to access the bot."
-            
-            try:
-                await query.edit_message_text(msg, reply_markup=get_force_join_keyboard(), parse_mode="HTML")
-            except:
-                pass
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
