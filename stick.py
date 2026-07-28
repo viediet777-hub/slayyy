@@ -15,6 +15,7 @@ import aiofiles
 import random
 import string
 import time
+import csv
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple, List
 
@@ -40,7 +41,7 @@ CHANNEL_USERNAME = "viedietlooters"
 GROUP_USERNAME = "viedietlooterschat"
 IMAGE_URL = "https://cdn.phototourl.com/free/2026-07-28-56446cd9-7512-40c6-b11e-e66ceb923351.jpg"
 IMAGE_NAME = "photo_2026-07-28_11-11-35.jpg"
-REFERRAL_REQUIRED = 1  # 1 referral = 1 process credit
+REFERRAL_REQUIRED = 1
 REWARD_PER_PROCESS = 20
 
 # ==================== DATABASE ====================
@@ -50,7 +51,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # Users table
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
@@ -73,7 +73,6 @@ def init_db():
         last_activity TEXT
     )''')
     
-    # Referrals table
     c.execute('''CREATE TABLE IF NOT EXISTS referrals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         referrer_id INTEGER,
@@ -82,7 +81,6 @@ def init_db():
         is_valid INTEGER DEFAULT 1
     )''')
     
-    # Processes table
     c.execute('''CREATE TABLE IF NOT EXISTS processes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -170,7 +168,6 @@ def add_referral(referrer_id: int, referred_id: int):
         c.execute('INSERT INTO referrals (referrer_id, referred_id, referred_at) VALUES (?, ?, ?)',
                   (referrer_id, referred_id, now))
         c.execute('UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id = ?', (referrer_id,))
-        # Check if referral milestone reached (every 1 referral = 1 credit)
         c.execute('SELECT referrals_count FROM users WHERE user_id = ?', (referrer_id,))
         count = c.fetchone()[0]
         if count % REFERRAL_REQUIRED == 0:
@@ -365,6 +362,15 @@ def get_main_keyboard(is_admin: bool = False):
         buttons.append(["🔐 Admin Panel"])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
+def get_admin_keyboard():
+    buttons = [
+        ["📊 Admin Stats", "👥 Users List"],
+        ["➕ Add Credits", "➖ Remove Credits"],
+        ["📢 Broadcast", "📂 Export DB"],
+        ["🔙 Back to Menu"]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
 # ==================== COMMAND HANDLERS ====================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -392,7 +398,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         create_user(user_id, username, first_name)
         db_user = get_user(user_id)
     
-    # Check referral from start param
     if context.args and context.args[0].startswith('ref_'):
         ref_code = context.args[0].replace('ref_', '')
         referrer_id = get_user_by_referral_code(ref_code)
@@ -432,8 +437,21 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await support(update, context)
     elif text == "🔐 Admin Panel":
         await admin_command(update, context)
+    elif text == "🔙 Back to Menu":
+        context.user_data['admin_mode'] = False
+        await update.message.reply_text(
+            "👋 Welcome back!",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+        )
     else:
-        await update.message.reply_text("Please use the buttons below.", reply_markup=get_main_keyboard())
+        # Check if in admin mode
+        if context.user_data.get('admin_mode', False):
+            await admin_handler(update, context)
+        else:
+            await update.message.reply_text(
+                "Please use the buttons below.",
+                reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+            )
 
 # ==================== START PROCESS ====================
 async def start_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -487,7 +505,6 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['phone'] = phone
     update_user(user_id, phone=phone)
     
-    # Register with API
     success, result = await register_user(phone)
     if not success:
         await update.message.reply_text(
@@ -498,7 +515,6 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
     
-    # Send OTP
     success, result = await send_otp(phone)
     if not success:
         await update.message.reply_text(
@@ -569,23 +585,13 @@ async def process_claim(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Step 1: Select Pack
     await context.bot.send_message(user_id, "📦 Processing...", parse_mode="HTML")
     success, result = await select_pack(phone, token)
-    if not success:
-        await context.bot.send_message(
-            user_id,
-            f"⚠️ Processing issue, continuing...",
-            parse_mode="HTML"
-        )
-    
     await asyncio.sleep(1)
     
-    # Step 2: Select Vibe
     success, result = await select_vibe(phone, token)
     await asyncio.sleep(1)
     
-    # Step 3: Download image
     success, image_data = await download_image(IMAGE_URL)
     if not success or not image_data:
         await context.bot.send_message(
@@ -596,7 +602,6 @@ async def process_claim(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Step 4: Upload image
     success, result = await upload_image(phone, token, image_data, IMAGE_NAME)
     if not success:
         await context.bot.send_message(
@@ -610,7 +615,6 @@ async def process_claim(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     
     await asyncio.sleep(1)
     
-    # Step 5: Ask UPI number
     await context.bot.send_message(
         user_id,
         "📱 **Please enter your UPI-registered mobile number.**\n\n"
@@ -793,12 +797,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Unauthorized!")
         return
     
-    kb = ReplyKeyboardMarkup([
-        ["📊 Admin Stats", "👥 Users List"],
-        ["➕ Add Credits", "➖ Remove Credits"],
-        ["📢 Broadcast", "📂 Export DB"],
-        ["🔙 Back"]
-    ], resize_keyboard=True)
+    context.user_data['admin_mode'] = True
     
     stats = get_total_stats()
     await update.message.reply_text(
@@ -818,9 +817,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Select an option:
 """,
         parse_mode="HTML",
-        reply_markup=kb
+        reply_markup=get_admin_keyboard()
     )
-    context.user_data['admin_mode'] = True
 
 async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -829,14 +827,7 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = update.message.text
     
-    if text == "🔙 Back":
-        context.user_data['admin_mode'] = False
-        await update.message.reply_text(
-            "👋 Welcome back!",
-            reply_markup=get_main_keyboard(True)
-        )
-        return
-    
+    # Handle admin menu buttons
     if text == "📊 Admin Stats":
         stats = get_total_stats()
         await update.message.reply_text(
@@ -848,29 +839,31 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ✅ Completed: {stats['total_completed']}
 ⏳ Pending: {stats['pending']}
 """,
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=get_admin_keyboard()
         )
         return
     
-    if text == "👥 Users List":
+    elif text == "👥 Users List":
         users = get_all_users()
         if not users:
-            await update.message.reply_text("No users found.")
+            await update.message.reply_text("No users found.", reply_markup=get_admin_keyboard())
             return
         
-        text = "👤 **Users List:**\n\n"
+        text_msg = "👤 **Users List:**\n\n"
         for uid, username, fname, phone, refs, credits, processes, banned in users[:20]:
             name = fname or username or f"User_{uid}"
             status = "🚫" if banned else "✅"
-            text += f"{status} {name} - Ref: {refs} | Credits: {credits} | Processes: {processes}\n"
+            text_msg += f"{status} {name} - Ref: {refs} | Credits: {credits} | Processes: {processes}\n"
         
         if len(users) > 20:
-            text += f"\n... and {len(users) - 20} more"
+            text_msg += f"\n... and {len(users) - 20} more"
         
-        await update.message.reply_text(text, parse_mode="HTML")
+        await update.message.reply_text(text_msg, parse_mode="HTML", reply_markup=get_admin_keyboard())
         return
     
-    if text == "➕ Add Credits":
+    elif text == "➕ Add Credits":
+        context.user_data['admin_action'] = 'add_credits'
         await update.message.reply_text(
             "➕ **Add Process Credits**\n\n"
             "Enter: `user_id amount`\n"
@@ -878,10 +871,10 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Send /cancel to abort.",
             parse_mode="HTML"
         )
-        context.user_data['admin_action'] = 'add_credits'
         return
     
-    if text == "➖ Remove Credits":
+    elif text == "➖ Remove Credits":
+        context.user_data['admin_action'] = 'remove_credits'
         await update.message.reply_text(
             "➖ **Remove Process Credits**\n\n"
             "Enter: `user_id amount`\n"
@@ -889,21 +882,19 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Send /cancel to abort.",
             parse_mode="HTML"
         )
-        context.user_data['admin_action'] = 'remove_credits'
         return
     
-    if text == "📢 Broadcast":
+    elif text == "📢 Broadcast":
+        context.user_data['admin_action'] = 'broadcast'
         await update.message.reply_text(
             "📢 **Broadcast**\n\n"
             "Send the message to broadcast to all users.\n"
             "Send /cancel to abort.",
             parse_mode="HTML"
         )
-        context.user_data['admin_action'] = 'broadcast'
         return
     
-    if text == "📂 Export DB":
-        import csv
+    elif text == "📂 Export DB":
         filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         
         conn = sqlite3.connect(DB_PATH)
@@ -923,7 +914,16 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(document=f, filename=filename)
         os.remove(filename)
         
-        await update.message.reply_text("✅ Database exported!")
+        await update.message.reply_text("✅ Database exported!", reply_markup=get_admin_keyboard())
+        return
+    
+    elif text == "🔙 Back to Menu":
+        context.user_data['admin_mode'] = False
+        context.user_data['admin_action'] = None
+        await update.message.reply_text(
+            "👋 Welcome back!",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+        )
         return
 
 async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -939,7 +939,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     
     if text.lower() == '/cancel':
         context.user_data['admin_action'] = None
-        await update.message.reply_text("❌ Cancelled.")
+        await update.message.reply_text("❌ Cancelled.", reply_markup=get_admin_keyboard())
         return
     
     if action == 'add_credits':
@@ -951,11 +951,14 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             target_id = int(parts[0])
             amount = int(parts[1])
             add_process_credits(target_id, amount)
-            await update.message.reply_text(f"✅ Added {amount} Process Credits to user {target_id}")
+            await update.message.reply_text(
+                f"✅ Added {amount} Process Credits to user {target_id}",
+                reply_markup=get_admin_keyboard()
+            )
         except:
-            await update.message.reply_text("❌ Invalid input.")
+            await update.message.reply_text("❌ Invalid input.", reply_markup=get_admin_keyboard())
         context.user_data['admin_action'] = None
-        await admin_command(update, context)
+        return
     
     elif action == 'remove_credits':
         parts = text.split()
@@ -966,11 +969,14 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             target_id = int(parts[0])
             amount = int(parts[1])
             add_process_credits(target_id, -amount)
-            await update.message.reply_text(f"✅ Removed {amount} Process Credits from user {target_id}")
+            await update.message.reply_text(
+                f"✅ Removed {amount} Process Credits from user {target_id}",
+                reply_markup=get_admin_keyboard()
+            )
         except:
-            await update.message.reply_text("❌ Invalid input.")
+            await update.message.reply_text("❌ Invalid input.", reply_markup=get_admin_keyboard())
         context.user_data['admin_action'] = None
-        await admin_command(update, context)
+        return
     
     elif action == 'broadcast':
         users = get_all_users()
@@ -994,7 +1000,11 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         
         await msg.edit_text(f"✅ Broadcast Complete!\n\n✅ Sent: {success}\n❌ Failed: {failed}")
         context.user_data['admin_action'] = None
-        await admin_command(update, context)
+        await update.message.reply_text(
+            "Admin Panel:",
+            reply_markup=get_admin_keyboard()
+        )
+        return
 
 # ==================== MAIN ====================
 def main():
@@ -1017,7 +1027,6 @@ def main():
     application.add_handler(CommandHandler('admin', admin_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
     application.add_handler(MessageHandler(filters.TEXT & filters.User(ADMIN_ID), admin_message_handler))
-    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^🔐 Admin Panel$'), admin_command))
     
     print("=" * 60)
     print("🤖 SLAY YOUR PLAY - TELEGRAM BOT")
