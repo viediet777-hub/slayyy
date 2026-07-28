@@ -26,7 +26,7 @@ from telegram.ext import (
     ConversationHandler, ContextTypes
 )
 
-# ==================== CONFIG ====================
+# ==================== CONFIG (Railway Environment Variables) ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set.")
@@ -36,12 +36,14 @@ ADMIN_IDS = [int(os.environ.get("ADMIN_ID", 1364476174))]
 CHANNEL_USERNAME = "viedietlooters"
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1003872664875))
 SUPPORT_LINK = "https://t.me/viedietlooterschat"
-IMAGE_URL = "https://cdn.phototourl.com/free/2026-07-28-8e8c2998-b55d-4799-81f5-3777e0548b1a.jpg"
-IMAGE_NAME = "photo_2026-07-28.jpg"
+
+# ✅ FIXED: Using Kommodo image URL
+IMAGE_URL = "https://kommodo.ai/i/oUdlNotAwhZLSfsANSkx"
+IMAGE_NAME = "photo_2026-07-28_11-11-35.jpg"
 
 BASE_URL = "https://slayyourplaypromo.in"
 
-# ==================== DATABASE ====================
+# ==================== DATABASE (Persistent Storage) ====================
 DB_PATH = os.environ.get("DB_PATH", "/app/data/slay_bot_v3.db")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
