@@ -20,11 +20,14 @@ import glob
 import aiohttp
 from aiohttp import ClientSession, FormData
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters,
-    ConversationHandler, ContextTypes
-)
+# Fix for Python 3.14 compatibility
+try:
+    from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+    from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes
+except AttributeError:
+    # Fallback for older versions
+    from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+    from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, ConversationHandler
 
 # ==================== CONFIG - ENV ONLY ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -40,7 +43,7 @@ if admin_id:
     except:
         pass
 if not ADMIN_IDS:
-    ADMIN_IDS = [1364476174]  # Default fallback
+    ADMIN_IDS = [1364476174]
     print(f"⚠️ Using default admin: {ADMIN_IDS[0]}")
 
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "viedietlooters")
@@ -82,15 +85,16 @@ def load_image_railway() -> Tuple[bytes, str]:
                 print(f"✅ Image loaded from {fname} ({len(data)} bytes)")
                 return data, fname
     
-    # 3. Railway attachments folder
-    if os.path.exists("/app/attachments"):
-        for fname in os.listdir("/app/attachments"):
-            if fname.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                with open(f"/app/attachments/{fname}", "rb") as f:
-                    data = f.read()
-                if len(data) > 5000:
-                    print(f"✅ Image loaded from /app/attachments/{fname} ({len(data)} bytes)")
-                    return data, fname
+    # 3. Render attachments folder
+    for path in ["/app/attachments", "/opt/render/project/src/attachments"]:
+        if os.path.exists(path):
+            for fname in os.listdir(path):
+                if fname.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                    with open(f"{path}/{fname}", "rb") as f:
+                        data = f.read()
+                    if len(data) > 5000:
+                        print(f"✅ Image loaded from {path}/{fname} ({len(data)} bytes)")
+                        return data, fname
     
     # 4. Downloads folder (local testing)
     downloads = os.path.expanduser("~/Downloads")
@@ -253,15 +257,6 @@ async def db_set_temp_data(telegram_id: int, data: dict):
         db.commit()
         db.close()
 
-async def db_get_temp_data(telegram_id: int) -> Optional[dict]:
-    async with conn_lock:
-        db = get_db()
-        row = db.execute("SELECT temp_data FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
-        db.close()
-        if row and row['temp_data']:
-            return json.loads(row['temp_data'])
-        return None
-
 # ============================================================
 # AIOHTTP SESSION
 # ============================================================
@@ -323,7 +318,7 @@ async def api_init() -> Tuple[bool, dict]:
                 return True, data
             return False, {"message": f"HTTP {resp.status}", "detail": text}
     except Exception as e:
-        logger.error(f"INIT failed: {e}")
+        logging.error(f"INIT failed: {e}")
         return False, {"message": str(e)}
 
 async def make_signed_request(
@@ -355,7 +350,6 @@ async def make_signed_request(
         headers['authorization'] = f'Bearer {jwt_token}'
 
     request_url = f"{url}?t={t}"
-    logger.info(f"SIGNED POST {endpoint}")
 
     try:
         if files:
@@ -369,19 +363,13 @@ async def make_signed_request(
             form.add_field('data', data_part)
             form.add_field('userKey', str(user_key))
 
-            files_info = {k: (v[0], len(v[1])) for k, v in files.items()}
-            logger.info(f"Upload files: {files_info}")
-
             async with session.post(request_url, data=form, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 text = await resp.text()
-                logger.info(f"Upload response ({resp.status}): {text[:500]}")
                 try:
                     decoded = decode_resp(text)
                 except Exception:
                     decoded = {"statusCode": resp.status, "message": text[:200]}
                 status_ok = decoded.get('statusCode', 400) in (200, 201, 202)
-                if not status_ok:
-                    logger.error(f"Upload failed: {text}")
                 return status_ok, decoded
         else:
             signed_data = build_signed_data(payload, data_key, for_multipart=False)
@@ -395,7 +383,7 @@ async def make_signed_request(
                 status_ok = decoded.get('statusCode', 400) in (200, 201, 202)
                 return status_ok, decoded
     except Exception as e:
-        logger.error(f"{endpoint} error: {e}")
+        logging.error(f"{endpoint} error: {e}")
         return False, {"message": str(e)}
 
 # ============================================================
@@ -432,25 +420,52 @@ async def submit_upi(upi_number: str, user_key, data_key, jwt_token) -> Tuple[bo
     return await make_signed_request('/api/users/getUpiNo/{userKey}', payload, data_key, user_key, referer='/dashboard', jwt_token=jwt_token)
 
 # ============================================================
+# BOT SETUP - COMPATIBLE WITH BOTH VERSIONS
+# ============================================================
+def setup_bot():
+    """Setup bot with compatibility for different python-telegram-bot versions"""
+    try:
+        # Try new version
+        from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes
+        app = Application.builder().token(BOT_TOKEN).build()
+        return app, True
+    except (AttributeError, ImportError):
+        # Fallback to old version
+        from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, ConversationHandler
+        updater = Updater(BOT_TOKEN, use_context=True)
+        app = updater.dispatcher
+        return app, False
+
+# Use global for app and is_new_api
+APP, IS_NEW_API = setup_bot()
+
+# ============================================================
 # KEYBOARDS
 # ============================================================
 main_keyboard = ReplyKeyboardMarkup([
-    [KeyboardButton("🚀 Start Process")],
-    [KeyboardButton("👥 Refer & Earn"), KeyboardButton("📊 Dashboard")],
-    [KeyboardButton("📞 Support"), KeyboardButton("ℹ️ About")],
+    ["🚀 Start Process"],
+    ["👥 Refer & Earn", "📊 Dashboard"],
+    ["📞 Support", "ℹ️ About"],
 ], resize_keyboard=True)
 
 cancel_keyboard = ReplyKeyboardMarkup([
-    [KeyboardButton("❌ Cancel")]
+    ["❌ Cancel"]
 ], resize_keyboard=True)
 
 admin_keyboard = ReplyKeyboardMarkup([
-    [KeyboardButton("📊 Admin Stats"), KeyboardButton("📢 Broadcast")],
-    [KeyboardButton("💎 Add Credits"), KeyboardButton("👥 Users List")],
-    [KeyboardButton("🏠 Back to Main")],
+    ["📊 Admin Stats", "📢 Broadcast"],
+    ["💎 Add Credits", "👥 Users List"],
+    ["🏠 Back to Main"],
 ], resize_keyboard=True)
 
 ASK_MOBILE, ASK_OTP, ASK_UPI = range(3)
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 async def is_channel_member(bot, user_id: int) -> bool:
     try:
@@ -472,10 +487,10 @@ async def show_main_menu(update: Update, text: str = "Choose an option:"):
 # ============================================================
 # HANDLERS
 # ============================================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context):
     user = update.effective_user
     tid = user.id
-    args = context.args
+    args = context.args if hasattr(context, 'args') else []
 
     await cleanup_expired_sessions()
     await db_clear_user_data(tid)
@@ -519,7 +534,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
     await show_main_menu(update, welcome_text)
 
-async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def about(update: Update, context):
     text = """
 ℹ️ **About SLAY YOUR PLAY Bot**
 
@@ -534,7 +549,7 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
     await update.message.reply_text(text, parse_mode="Markdown")
 
-async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def support(update: Update, context):
     await update.message.reply_text(
         "📞 Join our support group:",
         reply_markup=InlineKeyboardMarkup([
@@ -542,7 +557,7 @@ async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     )
 
-async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def dashboard(update: Update, context):
     tid = update.effective_user.id
     u = await db_user(tid)
     if not u:
@@ -567,7 +582,7 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard)
 
-async def refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def refer(update: Update, context):
     tid = update.effective_user.id
     bot_user = await context.bot.get_me()
     link = f"https://t.me/{bot_user.username}?start={tid}"
@@ -597,7 +612,7 @@ Share your referral link and earn **+1 Credit** for every new user!
 # ============================================================
 # PROCESS HANDLERS
 # ============================================================
-async def start_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_process(update: Update, context):
     tid = update.effective_user.id
     
     await db_clear_user_data(tid)
@@ -635,7 +650,7 @@ async def start_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ASK_MOBILE
 
-async def ask_mobile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ask_mobile(update: Update, context):
     text = update.message.text.strip()
     if text == "❌ Cancel" or text == "/cancel":
         await show_main_menu(update, "❌ Process Cancelled.")
@@ -682,7 +697,7 @@ async def ask_mobile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ASK_OTP
 
-async def ask_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ask_otp(update: Update, context):
     text = update.message.text.strip()
     if text == "❌ Cancel" or text == "/cancel":
         await show_main_menu(update, "❌ Process Cancelled.")
@@ -749,7 +764,7 @@ async def ask_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ASK_UPI
 
-async def ask_upi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ask_upi(update: Update, context):
     text = update.message.text.strip()
     if text == "❌ Cancel" or text == "/cancel":
         await show_main_menu(update, "❌ Process Cancelled.")
@@ -803,7 +818,7 @@ async def ask_upi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_main_menu(update, "✅ Process finished successfully!")
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel(update: Update, context):
     tid = update.effective_user.id
     await db_clear_user_data(tid)
     await show_main_menu(update, "❌ Cancelled. Your data has been deleted.")
@@ -812,7 +827,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # ADMIN COMMANDS
 # ============================================================
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_panel(update: Update, context):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ Unauthorized.")
         return
@@ -827,7 +842,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=admin_keyboard
     )
 
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_stats(update: Update, context):
     if update.effective_user.id not in ADMIN_IDS:
         return
     async with conn_lock:
@@ -850,7 +865,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=admin_keyboard
     )
 
-async def admin_add_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_add_credits(update: Update, context):
     if update.effective_user.id not in ADMIN_IDS:
         return
     try:
@@ -871,7 +886,7 @@ async def admin_add_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ User not found.")
 
-async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_broadcast(update: Update, context):
     if update.effective_user.id not in ADMIN_IDS:
         return
     msg = update.message.text.replace("/broadcast", "").strip()
@@ -891,7 +906,7 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed += 1
     await update.message.reply_text(f"📢 Broadcast: {sent} sent, {failed} failed.")
 
-async def admin_users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_users_list(update: Update, context):
     if update.effective_user.id not in ADMIN_IDS:
         return
     async with conn_lock:
@@ -906,7 +921,7 @@ async def admin_users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"🆔 {row['telegram_id']} | {row['name'][:15]} | Credits: {row['credits']} | Done: {row['completed_processes']}\n"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=admin_keyboard)
 
-async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_menu_handler(update: Update, context):
     text = update.message.text
     if text == "📊 Admin Stats":
         await admin_stats(update, context)
@@ -921,7 +936,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text("Use admin buttons.", reply_markup=admin_keyboard)
 
-async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def menu_handler(update: Update, context):
     text = update.message.text
     if text == "🚀 Start Process":
         return await start_process(update, context)
@@ -945,8 +960,7 @@ def main():
     print(f"✅ Bot starting...")
     print(f"📸 Image: {IMAGE_NAME} ({len(IMAGE_BYTES)} bytes)")
     
-    app = Application.builder().token(BOT_TOKEN).build()
-
+    # Setup conversation handler
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Text("🚀 Start Process"), start_process),
@@ -970,23 +984,48 @@ def main():
         per_message=False,
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("support", support))
-    app.add_handler(CommandHandler("dashboard", dashboard))
-    app.add_handler(CommandHandler("refer", refer))
-    app.add_handler(CommandHandler("about", about))
-    app.add_handler(CommandHandler("stats", admin_stats))
-    app.add_handler(CommandHandler("addcredits", admin_add_credits))
-    app.add_handler(CommandHandler("broadcast", admin_broadcast))
-    app.add_handler(CommandHandler("users", admin_users_list))
-    app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(conv_handler)
-    app.add_handler(MessageHandler(filters.Text(["👥 Refer & Earn", "📊 Dashboard", "📞 Support", "ℹ️ About"]), menu_handler))
-    app.add_handler(MessageHandler(filters.Text(["📊 Admin Stats", "📢 Broadcast", "💎 Add Credits", "👥 Users List", "🏠 Back to Main"]), admin_menu_handler))
-    app.add_handler(MessageHandler(filters.Text(["🚀 Start Process", "👑 Admin Panel"]), menu_handler))
-
-    logger.info("🤖 Bot started polling...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    if IS_NEW_API:
+        # New API - Application
+        app = Application.builder().token(BOT_TOKEN).build()
+        
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("support", support))
+        app.add_handler(CommandHandler("dashboard", dashboard))
+        app.add_handler(CommandHandler("refer", refer))
+        app.add_handler(CommandHandler("about", about))
+        app.add_handler(CommandHandler("stats", admin_stats))
+        app.add_handler(CommandHandler("addcredits", admin_add_credits))
+        app.add_handler(CommandHandler("broadcast", admin_broadcast))
+        app.add_handler(CommandHandler("users", admin_users_list))
+        app.add_handler(CommandHandler("admin", admin_panel))
+        app.add_handler(conv_handler)
+        app.add_handler(MessageHandler(filters.Text(["👥 Refer & Earn", "📊 Dashboard", "📞 Support", "ℹ️ About"]), menu_handler))
+        app.add_handler(MessageHandler(filters.Text(["📊 Admin Stats", "📢 Broadcast", "💎 Add Credits", "👥 Users List", "🏠 Back to Main"]), admin_menu_handler))
+        app.add_handler(MessageHandler(filters.Text(["🚀 Start Process", "👑 Admin Panel"]), menu_handler))
+        
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    else:
+        # Old API - Updater
+        updater = Updater(BOT_TOKEN, use_context=True)
+        dp = updater.dispatcher
+        
+        dp.add_handler(CommandHandler("start", start))
+        dp.add_handler(CommandHandler("support", support))
+        dp.add_handler(CommandHandler("dashboard", dashboard))
+        dp.add_handler(CommandHandler("refer", refer))
+        dp.add_handler(CommandHandler("about", about))
+        dp.add_handler(CommandHandler("stats", admin_stats))
+        dp.add_handler(CommandHandler("addcredits", admin_add_credits))
+        dp.add_handler(CommandHandler("broadcast", admin_broadcast))
+        dp.add_handler(CommandHandler("users", admin_users_list))
+        dp.add_handler(CommandHandler("admin", admin_panel))
+        dp.add_handler(conv_handler)
+        dp.add_handler(MessageHandler(filters.Text(["👥 Refer & Earn", "📊 Dashboard", "📞 Support", "ℹ️ About"]), menu_handler))
+        dp.add_handler(MessageHandler(filters.Text(["📊 Admin Stats", "📢 Broadcast", "💎 Add Credits", "👥 Users List", "🏠 Back to Main"]), admin_menu_handler))
+        dp.add_handler(MessageHandler(filters.Text(["🚀 Start Process", "👑 Admin Panel"]), menu_handler))
+        
+        updater.start_polling()
+        updater.idle()
 
 if __name__ == "__main__":
     main()
