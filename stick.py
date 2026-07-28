@@ -122,19 +122,28 @@ def decode_resp(resp_text: str) -> dict:
         return {'error': str(e), 'raw': resp_text[:500]}
 
 def build_signed_data(payload: dict, data_key: str) -> str:
-    payload_str = json.dumps(payload, separators=(',', ':'))
+    ordered = {}
+    for k, v in payload.items():
+        if k != "t":
+            ordered[k] = v
+    ordered["t"] = payload["t"]
+
+    payload_str = json.dumps(ordered, separators=(',', ':'), ensure_ascii=False)
+
+    u = base64.b64encode(str(payload["t"]).encode()).decode()
     a = base64.b64encode(payload_str.encode()).decode()
-    t = str(payload['t'])
-    u = base64.b64encode(t.encode()).decode()
+
     hmac_key = data_key[4:18].encode()
-    hex_sig = hmac.new(hmac_key, f'{u}.{a}'.encode(), hashlib.sha256).hexdigest()
+    hex_sig = hmac.new(hmac_key, f"{u}.{a}".encode(), hashlib.sha256).hexdigest()
     f2 = base64.b64encode(hex_sig.encode()).decode()
+
     m = random.randint(1, 6)
     k2 = random.randint(2, 8)
-    alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+    alpha = string.ascii_letters + string.digits
     h_rand = ''.join(random.choice(alpha) for _ in range(k2))
-    g = f'{k2}{m}{f2[0:m]}{h_rand}{f2[m:]}'
-    return f'userKey={urllib.parse.quote_plus(str(payload.get("userKey", "")))}&data={urllib.parse.quote_plus(u)}.{urllib.parse.quote_plus(a)}.{urllib.parse.quote_plus(g)}'
+    g = f"{k2}{m}{f2[0:m]}{h_rand}{f2[m:]}"
+
+    return f"userKey={urllib.parse.quote_plus(str(payload.get('userKey', '')))}&data={urllib.parse.quote_plus(u)}.{urllib.parse.quote_plus(a)}.{urllib.parse.quote_plus(g)}"
 
 # ==================== DATABASE FUNCTIONS ====================
 def get_user(user_id: int) -> Optional[Dict]:
@@ -316,8 +325,8 @@ async def _make_signed_request(endpoint: str, payload: dict, data_key: str, user
     url = f"{BASE_URL}{endpoint}"
     url = url.replace('{userKey}', str(user_key))
     t = int(datetime.now().timestamp() * 1000)
-    payload['t'] = t
     payload['userKey'] = int(user_key) if isinstance(user_key, str) and user_key.isdigit() else user_key
+    payload['t'] = t
 
     start_time = datetime.now()
     
