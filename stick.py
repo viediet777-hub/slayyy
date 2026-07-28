@@ -312,7 +312,7 @@ async def _log_response(resp, label: str):
     print(f"{'='*60}\n")
     return text
 
-async def _make_signed_request(endpoint: str, payload: dict, data_key: str, user_key, referer: str = '/', files: dict = None) -> Tuple[bool, dict]:
+async def _make_signed_request(endpoint: str, payload: dict, data_key: str, user_key, referer: str = '/', files: dict = None, jwt_token: str = None) -> Tuple[bool, dict]:
     url = f"{BASE_URL}{endpoint}"
     url = url.replace('{userKey}', str(user_key))
     t = int(datetime.now().timestamp() * 1000)
@@ -327,9 +327,25 @@ async def _make_signed_request(endpoint: str, payload: dict, data_key: str, user
     print(f"Method: POST")
     print(f"URL: {url}")
     print(f"Timestamp (t): {t}")
+    print(f"JWT Token: {'Bearer ' + jwt_token[:30] + '...' if jwt_token else 'None'}")
     print(f"Payload before signing: {json.dumps(payload, indent=2)}")
     print(f"dataKey (HMAC source): {data_key}")
     print(f"HMAC key (data_key[4:18]): {data_key[4:18]}")
+    
+    session = await get_api_session()
+    cookies = dict(session.cookie_jar.filter_cookies(YarlURL(BASE_URL)))
+    print(f"Cookies: {cookies}")
+    
+    req_headers = {
+        'referer': f'{BASE_URL}{referer}',
+        'accept': '*/*',
+        'accept-language': 'en-US,en;q=0.9',
+        'user-agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36',
+        'origin': BASE_URL,
+        'x-requested-with': 'XMLHttpRequest',
+    }
+    if jwt_token:
+        req_headers['authorization'] = f'Bearer {jwt_token}'
     
     if files:
         body = aiohttp.FormData()
@@ -346,14 +362,7 @@ async def _make_signed_request(endpoint: str, payload: dict, data_key: str, user
         print(f"userKey field: {user_key_val}")
 
         req_url = f"{url}?t={t}"
-        session = await get_api_session()
-        
-        # Print cookies
-        cookies = dict(session.cookie_jar.filter_cookies(YarlURL(BASE_URL)))
-        print(f"Cookies: {dict(cookies)}")
-        
-        req_headers = {'referer': f'{BASE_URL}{referer}'}
-        print(f"Request headers: {req_headers}")
+        print(f"Request headers: {dict(req_headers)}")
         print(f"Request URL: {req_url}")
         
         async with session.post(req_url, data=body, headers=req_headers) as resp:
@@ -369,10 +378,6 @@ async def _make_signed_request(endpoint: str, payload: dict, data_key: str, user
     else:
         signed_body_str = build_signed_data(payload, data_key)
         req_url = f"{url}?t={t}"
-        headers = {
-            'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
-            'referer': f'{BASE_URL}{referer}',
-        }
         
         # Parse signed body components
         parsed_qs = urllib.parse.parse_qs(signed_body_str)
@@ -390,14 +395,11 @@ async def _make_signed_request(endpoint: str, payload: dict, data_key: str, user
                 print(f"  data.a (payload): {data_parts[1][:30]}... -> decoding failed")
         print(f"  data.g (signature): {data_parts[2][:30]}... ({len(data_parts[2])} chars)" if len(data_parts) >= 3 else "  data.g: N/A")
         
-        session = await get_api_session()
-        cookies = dict(session.cookie_jar.filter_cookies(YarlURL(BASE_URL)))
-        print(f"Cookies: {cookies}")
+        print(f"Request headers: {dict(req_headers)}")
         print(f"Request URL: {req_url}")
-        print(f"Request headers: {headers}")
         print(f"Request body: {signed_body_str[:400]}")
         
-        async with session.post(req_url, data=signed_body_str, headers=headers) as resp:
+        async with session.post(req_url, data=signed_body_str, headers=req_headers) as resp:
             elapsed = (datetime.now() - start_time).total_seconds()
             resp_text = await _log_response(resp, f"SIGNED REQUEST: {endpoint}")
             print(f"Time taken: {elapsed:.2f}s")
@@ -455,22 +457,23 @@ async def register_user(phone: str, user_key, data_key: str) -> Tuple[bool, dict
     payload = {'mobile': phone, 'limit': ''}
     return await _make_signed_request('/api/users/register/{userKey}', payload, data_key, user_key, referer='/register')
 
-async def verify_otp(user_key, data_key: str, otp: str) -> Tuple[bool, dict]:
+async def verify_otp(user_key, data_key: str, otp: str, jwt_token: str = None) -> Tuple[bool, dict]:
     payload = {'otp': otp}
-    return await _make_signed_request('/api/users/verifyOTP/{userKey}', payload, data_key, user_key, referer='/register')
+    return await _make_signed_request('/api/users/verifyOTP/{userKey}', payload, data_key, user_key, referer='/register', jwt_token=jwt_token)
 
-async def select_pack(user_key, data_key: str) -> Tuple[bool, dict]:
-    payload = {'pack': 'single'}
-    return await _make_signed_request('/api/users/selectPack/{userKey}', payload, data_key, user_key, referer='/choose-reward')
-
-async def select_vibe(user_key, data_key: str) -> Tuple[bool, dict]:
+async def select_vibe(user_key, data_key: str, jwt_token: str = None) -> Tuple[bool, dict]:
     payload = {'vibe': 'soft savage'}
-    return await _make_signed_request('/api/users/selectVibe/{userKey}', payload, data_key, user_key, referer='/ai-rap-home')
+    return await _make_signed_request('/api/users/selectVibe/{userKey}', payload, data_key, user_key, referer='/ai-rap-home', jwt_token=jwt_token)
 
-async def upload_image(user_key, data_key: str, image_data: bytes, image_name: str) -> Tuple[bool, dict]:
+async def select_pack(user_key, data_key: str, jwt_token: str = None) -> Tuple[bool, dict]:
+    payload = {'pack': 'single'}
+    return await _make_signed_request('/api/users/selectPack/{userKey}', payload, data_key, user_key, referer='/choose-reward', jwt_token=jwt_token)
+
+async def upload_image(user_key, data_key: str, image_data: bytes, image_name: str, jwt_token: str = None) -> Tuple[bool, dict]:
     """
     Upload image using multipart/form-data with ONLY the media field.
     Matches HAR exactly: no data or userKey fields in the form.
+    Includes Authorization Bearer token.
     """
     start = datetime.now()
     t = int(datetime.now().timestamp() * 1000)
@@ -481,12 +484,11 @@ async def upload_image(user_key, data_key: str, image_data: bytes, image_name: s
     print(f"{'='*60}")
     print(f"Method: POST")
     print(f"URL: {url}")
-    print(f"Content-Type: multipart/form-data")
-    print(f"Form fields: media={image_name} ({len(image_data)} bytes, image/jpeg)")
-    print(f"NOTE: No data/userKey form fields per HAR spec")
+    print(f"JWT Token: {'Bearer ' + jwt_token[:30] + '...' if jwt_token else 'None'}")
 
     form = aiohttp.FormData()
     form.add_field('media', image_data, filename=image_name, content_type='image/jpeg')
+    print(f"Form: media={image_name} ({len(image_data)} bytes, image/jpeg) [ONLY media field per HAR]")
 
     session = await get_api_session()
     cookies = dict(session.cookie_jar.filter_cookies(YarlURL(BASE_URL)))
@@ -500,6 +502,9 @@ async def upload_image(user_key, data_key: str, image_data: bytes, image_name: s
         'origin': BASE_URL,
         'x-requested-with': 'XMLHttpRequest',
     }
+    if jwt_token:
+        headers['authorization'] = f'Bearer {jwt_token}'
+    print(f"Request headers: {dict(headers)}")
 
     async with session.post(url, data=form, headers=headers) as resp:
         elapsed = (datetime.now() - start).total_seconds()
@@ -512,21 +517,21 @@ async def upload_image(user_key, data_key: str, image_data: bytes, image_name: s
         print(f"{'='*60}\n")
         return status_code in [200, 201, 202], decoded
 
-async def submit_upi(user_key, data_key: str, upi_number: str) -> Tuple[bool, dict]:
+async def submit_upi(user_key, data_key: str, upi_number: str, jwt_token: str = None) -> Tuple[bool, dict]:
     payload = {'upiNo': upi_number}
-    return await _make_signed_request('/api/users/getUpiNo/{userKey}', payload, data_key, user_key, referer='/stick-cashback')
+    return await _make_signed_request('/api/users/getUpiNo/{userKey}', payload, data_key, user_key, referer='/stick-cashback', jwt_token=jwt_token)
 
-async def get_pack_progress(user_key, data_key: str) -> Tuple[bool, dict]:
+async def get_pack_progress(user_key, data_key: str, jwt_token: str = None) -> Tuple[bool, dict]:
     payload = {}
-    return await _make_signed_request('/api/users/getPackProgress/{userKey}', payload, data_key, user_key, referer='/stick-cashback')
+    return await _make_signed_request('/api/users/getPackProgress/{userKey}', payload, data_key, user_key, referer='/stick-cashback', jwt_token=jwt_token)
 
-async def get_stick_progress(user_key, data_key: str) -> Tuple[bool, dict]:
+async def get_stick_progress(user_key, data_key: str, jwt_token: str = None) -> Tuple[bool, dict]:
     payload = {}
-    return await _make_signed_request('/api/users/getStickProgress/{userKey}', payload, data_key, user_key, referer='/stick-cashback')
+    return await _make_signed_request('/api/users/getStickProgress/{userKey}', payload, data_key, user_key, referer='/stick-cashback', jwt_token=jwt_token)
 
-async def click_track(user_key, data_key: str) -> Tuple[bool, dict]:
+async def click_track(user_key, data_key: str, jwt_token: str = None) -> Tuple[bool, dict]:
     payload = {}
-    return await _make_signed_request('/api/users/clickTrack/{userKey}', payload, data_key, user_key, referer='/stick-cashback')
+    return await _make_signed_request('/api/users/clickTrack/{userKey}', payload, data_key, user_key, referer='/stick-cashback', jwt_token=jwt_token)
 
 async def download_image(url: str) -> Tuple[bool, bytes]:
     try:
@@ -835,26 +840,11 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user(user_id, jwt_token=token)
     context.user_data['jwt'] = token
     print(f"JWT TOKEN SAVED: {token[:50]}...")
+    print(f"JWT TOKEN FULL: {token}")
 
-    # ===== STEP 1: SELECT PACK =====
-    await context.bot.send_message(user_id, "⏳ Selecting pack...", parse_mode="HTML")
-    pack_success, pack_result = await select_pack(user_key, data_key)
-    print(f"SELECT PACK RESULT: {json.dumps(pack_result, indent=2)}")
-    if not pack_success:
-        err = pack_result.get('message', 'Pack selection failed')
-        print(f"PACK SELECTION FAILED: {err}")
-        await update.message.reply_text(
-            f"❌ Pack selection failed.\nServer: {err}",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-    print("PACK SELECTION SUCCESS")
-
-    # ===== STEP 2: SELECT VIBE =====
-    await asyncio.sleep(0.5)
-    await context.bot.send_message(user_id, "⏳ Selecting vibe...", parse_mode="HTML")
-    vibe_success, vibe_result = await select_vibe(user_key, data_key)
+    # ===== STEP 1: SELECT VIBE (Stick) =====
+    await context.bot.send_message(user_id, "⏳ Selecting stick/vibe...", parse_mode="HTML")
+    vibe_success, vibe_result = await select_vibe(user_key, data_key, jwt_token=token)
     print(f"SELECT VIBE RESULT: {json.dumps(vibe_result, indent=2)}")
     if not vibe_success:
         err = vibe_result.get('message', 'Vibe selection failed')
@@ -866,6 +856,22 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
     print("VIBE SELECTION SUCCESS")
+
+    # ===== STEP 2: SELECT PACK =====
+    await asyncio.sleep(0.5)
+    await context.bot.send_message(user_id, "⏳ Selecting pack...", parse_mode="HTML")
+    pack_success, pack_result = await select_pack(user_key, data_key, jwt_token=token)
+    print(f"SELECT PACK RESULT: {json.dumps(pack_result, indent=2)}")
+    if not pack_success:
+        err = pack_result.get('message', 'Pack selection failed')
+        print(f"PACK SELECTION FAILED: {err}")
+        await update.message.reply_text(
+            f"❌ Pack selection failed.\nServer: {err}",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+        )
+        return ConversationHandler.END
+    print("PACK SELECTION SUCCESS")
 
     # ===== STEP 3: DOWNLOAD IMAGE =====
     await asyncio.sleep(0.5)
@@ -883,7 +889,7 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== STEP 4: UPLOAD IMAGE =====
     await context.bot.send_message(user_id, "⏳ Uploading image...", parse_mode="HTML")
-    upload_success, upload_result = await upload_image(user_key, data_key, image_data, IMAGE_NAME)
+    upload_success, upload_result = await upload_image(user_key, data_key, image_data, IMAGE_NAME, jwt_token=token)
     print(f"UPLOAD IMAGE RESULT: {json.dumps(upload_result, indent=2)}")
     if not upload_success:
         err = upload_result.get('message', 'Image upload failed')
@@ -926,8 +932,9 @@ async def upi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_key = context.user_data.get('userKey')
     data_key = context.user_data.get('dataKey')
+    jwt_token = context.user_data.get('jwt')
 
-    if not user_key or not data_key:
+    if not user_key or not data_key or not jwt_token:
         await update.message.reply_text(
             "❌ Session expired. Please start over.",
             parse_mode="HTML",
@@ -938,13 +945,13 @@ async def upi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===== STEP 1: SUBMIT UPI =====
     # HAR note: First attempt may return 400, later attempts return 200
     await context.bot.send_message(user_id, "⏳ Submitting UPI...", parse_mode="HTML")
-    upi_success, upi_result = await submit_upi(user_key, data_key, upi_number)
+    upi_success, upi_result = await submit_upi(user_key, data_key, upi_number, jwt_token=jwt_token)
     print(f"SUBMIT UPI RESULT: {json.dumps(upi_result, indent=2)}")
     if not upi_success:
         # First attempt may return 400 per HAR spec - retry once
         print("UPI first attempt returned non-200. Retrying once (per HAR pattern)...")
         await asyncio.sleep(1)
-        upi_success, upi_result = await submit_upi(user_key, data_key, upi_number)
+        upi_success, upi_result = await submit_upi(user_key, data_key, upi_number, jwt_token=jwt_token)
         print(f"SUBMIT UPI RETRY RESULT: {json.dumps(upi_result, indent=2)}")
     if not upi_success:
         err = upi_result.get('message', 'UPI submission failed')
@@ -960,7 +967,7 @@ async def upi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===== STEP 2: GET PACK PROGRESS =====
     await asyncio.sleep(0.5)
     await context.bot.send_message(user_id, "⏳ Checking pack progress...", parse_mode="HTML")
-    pack_prog_success, pack_prog_result = await get_pack_progress(user_key, data_key)
+    pack_prog_success, pack_prog_result = await get_pack_progress(user_key, data_key, jwt_token=jwt_token)
     print(f"GET PACK PROGRESS RESULT: {json.dumps(pack_prog_result, indent=2)}")
     if not pack_prog_success:
         err = pack_prog_result.get('message', 'Pack progress check failed')
@@ -976,7 +983,7 @@ async def upi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===== STEP 3: GET STICK PROGRESS =====
     await asyncio.sleep(0.5)
     await context.bot.send_message(user_id, "⏳ Checking stick progress...", parse_mode="HTML")
-    stick_prog_success, stick_prog_result = await get_stick_progress(user_key, data_key)
+    stick_prog_success, stick_prog_result = await get_stick_progress(user_key, data_key, jwt_token=jwt_token)
     print(f"GET STICK PROGRESS RESULT: {json.dumps(stick_prog_result, indent=2)}")
     if not stick_prog_success:
         err = stick_prog_result.get('message', 'Stick progress check failed')
@@ -992,7 +999,7 @@ async def upi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===== STEP 4: CLICK TRACK =====
     await asyncio.sleep(0.5)
     await context.bot.send_message(user_id, "⏳ Finalizing...", parse_mode="HTML")
-    track_success, track_result = await click_track(user_key, data_key)
+    track_success, track_result = await click_track(user_key, data_key, jwt_token=jwt_token)
     print(f"CLICK TRACK RESULT: {json.dumps(track_result, indent=2)}")
     if not track_success:
         err = track_result.get('message', 'Track click failed')
