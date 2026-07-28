@@ -407,21 +407,14 @@ async def download_image(url: str) -> Tuple[bool, bytes]:
 # ==================== CONVERSATION STATES ====================
 PHONE, OTP, UPI = range(3)
 
-# ==================== FORCE JOIN CHECK ====================
-async def check_force_join(user_id: int, bot) -> Tuple[bool, bool]:
-    channel_joined = False
-    group_joined = False
+# ==================== FORCE JOIN CHECK (ONLY CHANNEL) ====================
+async def check_channel_join(user_id: int, bot) -> bool:
+    """Check if user joined the channel only"""
     try:
         member = await bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
-        channel_joined = member.status in ['member', 'administrator', 'creator']
+        return member.status in ['member', 'administrator', 'creator']
     except:
-        pass
-    try:
-        member = await bot.get_chat_member(f"@{GROUP_USERNAME}", user_id)
-        group_joined = member.status in ['member', 'administrator', 'creator']
-    except:
-        pass
-    return channel_joined, group_joined
+        return False
 
 # ==================== KEYBOARDS ====================
 def get_main_keyboard(is_admin: bool = False):
@@ -459,16 +452,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 You are banned from using this bot.")
         return
 
-    channel_joined, group_joined = await check_force_join(user_id, context.bot)
-    if not channel_joined or not group_joined:
+    # Check only channel membership
+    channel_joined = await check_channel_join(user_id, context.bot)
+    if not channel_joined:
         msg = "🔒 **Access Restricted**\n\n"
-        if not channel_joined:
-            msg += "❌ You haven't joined our channel.\n"
-        if not group_joined:
-            msg += "❌ You haven't joined our group.\n"
-        msg += "\n📢 Channel: https://t.me/" + CHANNEL_USERNAME + "\n"
-        msg += "👥 Group: https://t.me/" + GROUP_USERNAME + "\n\n"
-        msg += "After joining both, click the button below."
+        msg += "❌ You haven't joined our channel.\n\n"
+        msg += "📢 **Channel:** https://t.me/" + CHANNEL_USERNAME + "\n\n"
+        msg += "After joining, click the button below."
         await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_join_keyboard())
         return
 
@@ -511,25 +501,21 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "✅ Check Membership":
-        channel_joined, group_joined = await check_force_join(user_id, context.bot)
-        if channel_joined and group_joined:
+        channel_joined = await check_channel_join(user_id, context.bot)
+        if channel_joined:
             db_user = get_user(user_id)
             if db_user and db_user.get('is_banned'):
                 await update.message.reply_text("🚫 You are banned from using this bot.")
                 return
             await update.message.reply_text(
-                "✅ All joined! Welcome!\n\nSelect an option below:",
+                "✅ Channel joined! Welcome!\n\nSelect an option below:",
                 reply_markup=get_main_keyboard(user_id == ADMIN_ID)
             )
         else:
             msg = "🔒 **Access Restricted**\n\n"
-            if not channel_joined:
-                msg += "❌ You haven't joined our channel.\n"
-            if not group_joined:
-                msg += "❌ You haven't joined our group.\n"
-            msg += "\n📢 Channel: https://t.me/" + CHANNEL_USERNAME + "\n"
-            msg += "👥 Group: https://t.me/" + GROUP_USERNAME + "\n\n"
-            msg += "After joining both, click the button below."
+            msg += "❌ You haven't joined our channel.\n\n"
+            msg += "📢 **Channel:** https://t.me/" + CHANNEL_USERNAME + "\n\n"
+            msg += "After joining, click the button below."
             await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_join_keyboard())
         return
 
@@ -784,6 +770,8 @@ async def upi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         stats = get_total_stats()
+        db_user = get_user(user_id)
+        phone = db_user.get('phone')
         await context.bot.send_message(
             ADMIN_ID,
             f"🎯 **New Process Completed!**\n\n"
@@ -859,14 +847,15 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     await update.message.reply_text(
         f"📞 **Support**\n\n"
-        f"Need help? Join our support group:\n\n"
-        f"💬 @{GROUP_USERNAME}\n\n"
-        f"Click the link above to open Telegram and join the group.\n"
+        f"Need help? Contact us:\n\n"
+        f"👑 Admin: Contact the bot owner\n"
+        f"📢 Channel: @{CHANNEL_USERNAME}\n\n"
         f"Our team will assist you within 24 hours.",
         parse_mode="HTML",
-        reply_markup=get_main_keyboard(update.effective_user.id == ADMIN_ID)
+        reply_markup=get_main_keyboard(user_id == ADMIN_ID)
     )
 
 # ==================== ADMIN COMMANDS ====================
@@ -1093,7 +1082,6 @@ def main():
     print(f"Bot Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Admin ID: {ADMIN_ID}")
     print(f"Channel: @{CHANNEL_USERNAME}")
-    print(f"Group: @{GROUP_USERNAME}")
     print("=" * 60)
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
