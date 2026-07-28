@@ -36,7 +36,6 @@ if not BOT_TOKEN:
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 1364476174))
 BASE_URL = "https://slayyourplaypromo.in"
 CHANNEL_USERNAME = "viedietlooters"
-GROUP_USERNAME = "viedietlooterschat"
 IMAGE_URL = "https://cdn.phototourl.com/free/2026-07-28-56446cd9-7512-40c6-b11e-e66ceb923351.jpg"
 IMAGE_NAME = "photo_2026-07-28_11-11-35.jpg"
 REFERRAL_REQUIRED = 1
