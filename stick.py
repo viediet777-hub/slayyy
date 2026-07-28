@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 SLAY YOUR PLAY - TELEGRAM BOT (FULLY FIXED)
-Working: Referral System, Admin Panel, Points Add/Remove
+Working: Referral System, Admin Panel, Add/Remove Credits
 """
 
 import os
@@ -159,36 +159,23 @@ def add_process_credits(user_id: int, amount: int):
     c.execute('UPDATE users SET process_credits = process_credits + ? WHERE user_id = ?', (amount, user_id))
     conn.commit()
     conn.close()
-    return True
 
 def add_referral(referrer_id: int, referred_id: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     now = datetime.now().isoformat()
-    
     try:
-        # Check if already referred
-        c.execute('SELECT * FROM referrals WHERE referrer_id = ? AND referred_id = ?', (referrer_id, referred_id))
-        if c.fetchone():
-            conn.close()
-            return False
-        
         c.execute('INSERT INTO referrals (referrer_id, referred_id, referred_at) VALUES (?, ?, ?)',
                   (referrer_id, referred_id, now))
-        
-        # Update referrer's referral count
         c.execute('UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id = ?', (referrer_id,))
-        
-        # Add 1 process credit for each referral
-        add_process_credits(referrer_id, 1)
-        
+        c.execute('SELECT referrals_count FROM users WHERE user_id = ?', (referrer_id,))
+        count = c.fetchone()[0]
+        if count % REFERRAL_REQUIRED == 0:
+            add_process_credits(referrer_id, 1)
         conn.commit()
-        conn.close()
-        return True
-        
     except sqlite3.IntegrityError:
-        conn.close()
-        return False
+        pass
+    conn.close()
 
 def add_process(user_id: int, reward: int, upi_number: str):
     conn = sqlite3.connect(DB_PATH)
@@ -416,7 +403,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         referrer_id = get_user_by_referral_code(ref_code)
         if referrer_id and referrer_id != user_id:
             add_referral(referrer_id, user_id)
-            # Notify referrer
             try:
                 await application.bot.send_message(
                     referrer_id,
@@ -804,7 +790,7 @@ Our team will assist you within 24 hours.
         reply_markup=kb
     )
 
-# ==================== ADMIN COMMANDS (FULLY FIXED) ====================
+# ==================== ADMIN COMMANDS (WORKING) ====================
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -812,7 +798,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     context.user_data['admin_mode'] = True
-    context.user_data['admin_action'] = None
     
     stats = get_total_stats()
     await update.message.reply_text(
@@ -959,7 +944,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     if action == 'add_credits':
-        parts = text.strip().split()
+        parts = text.split()
         if len(parts) != 2:
             await update.message.reply_text("❌ Invalid format. Use: `user_id amount`", parse_mode="HTML")
             return
@@ -969,8 +954,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             amount = int(parts[1])
             add_process_credits(target_id, amount)
             await update.message.reply_text(
-                f"✅ Added {amount} Process Credits to user {target_id}\n\n"
-                f"Current Credits: {get_user(target_id)['process_credits']}",
+                f"✅ Added {amount} Process Credits to user {target_id}",
                 reply_markup=get_admin_keyboard()
             )
         except Exception as e:
@@ -980,7 +964,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     elif action == 'remove_credits':
-        parts = text.strip().split()
+        parts = text.split()
         if len(parts) != 2:
             await update.message.reply_text("❌ Invalid format. Use: `user_id amount`", parse_mode="HTML")
             return
@@ -990,8 +974,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             amount = int(parts[1])
             add_process_credits(target_id, -amount)
             await update.message.reply_text(
-                f"✅ Removed {amount} Process Credits from user {target_id}\n\n"
-                f"Current Credits: {get_user(target_id)['process_credits']}",
+                f"✅ Removed {amount} Process Credits from user {target_id}",
                 reply_markup=get_admin_keyboard()
             )
         except Exception as e:
