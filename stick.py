@@ -412,25 +412,31 @@ async def _make_signed_request(endpoint: str, payload: dict, data_key: str, user
 
 async def api_init() -> Tuple[bool, dict]:
     start = datetime.now()
-    master_key = str(random.randint(100000000, 999999999))
     session = await get_api_session()
-    session.cookie_jar.update_cookies({'thumsup_and_sprite-id': master_key}, YarlURL(BASE_URL))
     
     print(f"\n{'='*60}")
     print(f"API CALL: INIT")
     print(f"{'='*60}")
     print(f"Method: POST")
     print(f"URL: {BASE_URL}/api/users")
-    print(f"masterKey: {master_key}")
-    print(f"Cookie set: thumsup_and_sprite-id={master_key}")
     
     ip_info = {
-        'as': 'AS24560', 'city': 'Delhi', 'country': 'India', 'countryCode': 'IN',
-        'isp': 'Airtel', 'lat': 28.65, 'lon': 77.23, 'org': 'Airtel',
-        'query': '0.0.0.0', 'region': 'DL', 'regionName': 'Delhi',
-        'status': 'success', 'timezone': 'Asia/Kolkata', 'zip': '110001'
+        'as': 'AS45916 Gujarat Telelink Pvt Ltd',
+        'city': 'Indore',
+        'country': 'India',
+        'countryCode': 'IN',
+        'isp': 'Gujarat Telelink Pvt Ltd',
+        'lat': 22.717,
+        'lon': 75.8337,
+        'org': 'Gtpl Broadband Pvt. Ltd.',
+        'query': '43.243.36.233',
+        'region': 'MP',
+        'regionName': 'Madhya Pradesh',
+        'status': 'success',
+        'timezone': 'Asia/Kolkata',
+        'zip': '452009',
     }
-    body = {'masterKey': master_key, 'ipInfo': ip_info}
+    body = {'ipInfo': ip_info}
     print(f"Request body: {json.dumps(body, indent=2)}")
     
     url = f"{BASE_URL}/api/users"
@@ -448,7 +454,7 @@ async def api_init() -> Tuple[bool, dict]:
             data_key = decoded.get('dataKey')
             print(f">>> INIT SUCCESS: userKey={user_key}, dataKey={data_key}")
             print(f"{'='*60}\n")
-            return True, {'userKey': user_key, 'dataKey': data_key, 'masterKey': master_key}
+            return True, {'userKey': user_key, 'dataKey': data_key}
         print(f">>> INIT FAILED: {json.dumps(decoded, indent=2)}")
         print(f"{'='*60}\n")
         return False, decoded
@@ -471,13 +477,18 @@ async def select_pack(user_key, data_key: str, jwt_token: str = None) -> Tuple[b
 
 async def upload_image(user_key, data_key: str, image_data: bytes, image_name: str, jwt_token: str = None) -> Tuple[bool, dict]:
     """
-    Upload image using multipart/form-data with ONLY the media field.
-    Matches HAR exactly: no data or userKey fields in the form.
-    Includes Authorization Bearer token.
+    Upload image using multipart/form-data.
+    Matches HAR exactly: fields are media, data (signed), and userKey.
     """
     start = datetime.now()
     t = int(datetime.now().timestamp() * 1000)
     url = f"{BASE_URL}/api/users/uploadImage/{user_key}?t={t}"
+
+    # Build signed payload (only userKey + t per HAR)
+    signed_payload = {'userKey': int(user_key), 't': t}
+    signed_body = build_signed_data(signed_payload, data_key)
+    parsed = urllib.parse.parse_qs(signed_body)
+    data_val = urllib.parse.unquote(parsed.get('data', [''])[0])
 
     print(f"\n{'='*60}")
     print(f"API CALL: UPLOAD IMAGE")
@@ -488,7 +499,9 @@ async def upload_image(user_key, data_key: str, image_data: bytes, image_name: s
 
     form = aiohttp.FormData()
     form.add_field('media', image_data, filename=image_name, content_type='image/jpeg')
-    print(f"Form: media={image_name} ({len(image_data)} bytes, image/jpeg) [ONLY media field per HAR]")
+    form.add_field('data', data_val)
+    form.add_field('userKey', str(user_key))
+    print(f"Form fields: media={image_name} ({len(image_data)} bytes), data={data_val[:80]}..., userKey={user_key}")
 
     session = await get_api_session()
     cookies = dict(session.cookie_jar.filter_cookies(YarlURL(BASE_URL)))
@@ -530,8 +543,8 @@ async def get_stick_progress(user_key, data_key: str, jwt_token: str = None) -> 
     return await _make_signed_request('/api/users/getStickProgress/{userKey}', payload, data_key, user_key, referer='/stick-cashback', jwt_token=jwt_token)
 
 async def click_track(user_key, data_key: str, jwt_token: str = None) -> Tuple[bool, dict]:
-    payload = {}
-    return await _make_signed_request('/api/users/clickTrack/{userKey}', payload, data_key, user_key, referer='/stick-cashback', jwt_token=jwt_token)
+    payload = {'smoker': 'yes'}
+    return await _make_signed_request('/api/users/clickTrack/{userKey}', payload, data_key, user_key, referer='/', jwt_token=jwt_token)
 
 async def download_image(url: str) -> Tuple[bool, bytes]:
     try:
@@ -760,7 +773,14 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['userKey'] = user_key
     context.user_data['dataKey'] = data_key
 
-    # Step 2: Register (this sends the OTP)
+    # Step 2: Click Track (present in HAR flow before register)
+    await update.message.reply_text("⏳ Tracking...", parse_mode="HTML")
+    track_ok, track_result = await click_track(user_key, data_key)
+    print(f"CLICK TRACK RESULT: {json.dumps(track_result, indent=2)}")
+    if not track_ok:
+        print("Click track returned non-200, but continuing per HAR (optional step)")
+
+    # Step 3: Register (this sends the OTP)
     await update.message.reply_text("⏳ Registering & sending OTP...", parse_mode="HTML")
     reg_success, reg_result = await register_user(phone, user_key, data_key)
     print(f"REGISTER RESULT: {json.dumps(reg_result, indent=2)}")
@@ -842,23 +862,7 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"JWT TOKEN SAVED: {token[:50]}...")
     print(f"JWT TOKEN FULL: {token}")
 
-    # ===== STEP 1: SELECT VIBE (Stick) =====
-    await context.bot.send_message(user_id, "⏳ Selecting stick/vibe...", parse_mode="HTML")
-    vibe_success, vibe_result = await select_vibe(user_key, data_key, jwt_token=token)
-    print(f"SELECT VIBE RESULT: {json.dumps(vibe_result, indent=2)}")
-    if not vibe_success:
-        err = vibe_result.get('message', 'Vibe selection failed')
-        print(f"VIBE SELECTION FAILED: {err}")
-        await update.message.reply_text(
-            f"❌ Vibe selection failed.\nServer: {err}",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-    print("VIBE SELECTION SUCCESS")
-
-    # ===== STEP 2: SELECT PACK =====
-    await asyncio.sleep(0.5)
+    # ===== STEP 1: SELECT PACK =====
     await context.bot.send_message(user_id, "⏳ Selecting pack...", parse_mode="HTML")
     pack_success, pack_result = await select_pack(user_key, data_key, jwt_token=token)
     print(f"SELECT PACK RESULT: {json.dumps(pack_result, indent=2)}")
@@ -872,6 +876,22 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
     print("PACK SELECTION SUCCESS")
+
+    # ===== STEP 2: SELECT VIBE =====
+    await asyncio.sleep(0.5)
+    await context.bot.send_message(user_id, "⏳ Selecting stick/vibe...", parse_mode="HTML")
+    vibe_success, vibe_result = await select_vibe(user_key, data_key, jwt_token=token)
+    print(f"SELECT VIBE RESULT: {json.dumps(vibe_result, indent=2)}")
+    if not vibe_success:
+        err = vibe_result.get('message', 'Vibe selection failed')
+        print(f"VIBE SELECTION FAILED: {err}")
+        await update.message.reply_text(
+            f"❌ Vibe selection failed.\nServer: {err}",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+        )
+        return ConversationHandler.END
+    print("VIBE SELECTION SUCCESS")
 
     # ===== STEP 3: DOWNLOAD IMAGE =====
     await asyncio.sleep(0.5)
