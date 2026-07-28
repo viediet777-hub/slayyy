@@ -2,126 +2,62 @@
 # -*- coding: utf-8 -*-
 
 import os
-import logging
+import sys
 import json
-import sqlite3
-import asyncio
-import aiohttp
-from yarl import URL as YarlURL
-import random
-import string
-import csv
 import base64
 import hashlib
 import hmac
+import random
+import string
 import urllib.parse
-from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
+import asyncio
+import sqlite3
+import logging
+from datetime import datetime
+from typing import Tuple, Optional
+from pathlib import Path
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+import aiohttp
+from aiohttp import ClientSession, FormData
+
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    ConversationHandler,
+    Application, CommandHandler, MessageHandler, filters,
+    ConversationHandler, ContextTypes
 )
 
-# ==================== CONFIG ====================
+# ==================== CONFIG (Environment Variables) ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set.")
 
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 1364476174))
+ADMIN_IDS = [int(os.environ.get("ADMIN_ID", 1364476174))]
+
+# Channel Configuration
+CHANNEL_USERNAME = "viedietlooters"  # without @
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1002388556922))
+SUPPORT_LINK = "https://t.me/viedietlooters"
+
 BASE_URL = "https://slayyourplaypromo.in"
-CHANNEL_USERNAME = "viedietlooters"
-GROUP_USERNAME = "viedietlooterschat"
-IMAGE_URL = "https://cdn.phototourl.com/free/2026-07-28-56446cd9-7512-40c6-b11e-e66ceb923351.jpg"
-IMAGE_NAME = "photo_2026-07-28_11-11-35.jpg"
-REFERRAL_REQUIRED = 1
-REWARD_PER_PROCESS = 20
-DB_PATH = "slayyourplay.db"
 
 # ==================== DATABASE ====================
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        phone TEXT,
-        upi_number TEXT,
-        jwt_token TEXT,
-        referral_code TEXT UNIQUE,
-        referred_by INTEGER DEFAULT NULL,
-        referrals_count INTEGER DEFAULT 0,
-        process_credits INTEGER DEFAULT 0,
-        total_processes INTEGER DEFAULT 0,
-        successful_processes INTEGER DEFAULT 0,
-        total_rewards INTEGER DEFAULT 0,
-        today_processes INTEGER DEFAULT 0,
-        today_completed INTEGER DEFAULT 0,
-        last_process_date TEXT,
-        is_banned INTEGER DEFAULT 0,
-        registered_at TEXT,
-        last_activity TEXT
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS referrals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        referrer_id INTEGER,
-        referred_id INTEGER UNIQUE,
-        referred_at TEXT,
-        is_valid INTEGER DEFAULT 1
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS processes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        status TEXT DEFAULT 'pending',
-        reward INTEGER DEFAULT 0,
-        upi_number TEXT,
-        created_at TEXT,
-        completed_at TEXT
-    )''')
-    conn.commit()
-    conn.close()
+DB_PATH = os.environ.get("DB_PATH", "/app/data/slay_bot_v3.db")
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-init_db()
+SESSION_FILE = os.path.join(os.path.dirname(DB_PATH), "aiohttp_session_cookies.json")
 
-# ==================== GLOBAL API SESSION ====================
-_api_session: Optional[aiohttp.ClientSession] = None
-_api_headers = {
-    'accept': '*/*',
-    'accept-language': 'en-US,en;q=0.9',
-    'user-agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36',
-    'origin': BASE_URL,
-    'x-requested-with': 'XMLHttpRequest',
-}
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-async def get_api_session() -> aiohttp.ClientSession:
-    global _api_session
-    if _api_session is None or _api_session.closed:
-        jar = aiohttp.CookieJar()
-        _api_session = aiohttp.ClientSession(headers=_api_headers, cookie_jar=jar)
-    return _api_session
-
-async def close_api_session():
-    global _api_session
-    if _api_session and not _api_session.closed:
-        await _api_session.close()
-
-def decode_resp(resp_text: str) -> dict:
-    try:
-        data = json.loads(resp_text)
-        if 'resp' in data:
-            decoded = base64.b64decode(data['resp']).decode()
-            return json.loads(decoded)
-        return data
-    except Exception as e:
-        return {'error': str(e), 'raw': resp_text[:500]}
-
+# ============================================================
+# SIGNATURE FUNCTION (EXACT – do not modify)
+# ============================================================
 def build_signed_data(payload: dict, data_key: str) -> str:
+    import base64, hashlib, hmac, random, string, json, urllib.parse
+
     ordered = {}
     for k, v in payload.items():
         if k != "t":
@@ -135,6 +71,7 @@ def build_signed_data(payload: dict, data_key: str) -> str:
 
     hmac_key = data_key[4:18].encode()
     hex_sig = hmac.new(hmac_key, f"{u}.{a}".encode(), hashlib.sha256).hexdigest()
+
     f2 = base64.b64encode(hex_sig.encode()).decode()
 
     m = random.randint(1, 6)
@@ -143,1234 +80,759 @@ def build_signed_data(payload: dict, data_key: str) -> str:
     h_rand = ''.join(random.choice(alpha) for _ in range(k2))
     g = f"{k2}{m}{f2[0:m]}{h_rand}{f2[m:]}"
 
-    return f"userKey={urllib.parse.quote_plus(str(payload.get('userKey', '')))}&data={urllib.parse.quote_plus(u)}.{urllib.parse.quote_plus(a)}.{urllib.parse.quote_plus(g)}"
+    return f"userKey={payload['userKey']}&data={urllib.parse.quote_plus(u)}.{urllib.parse.quote_plus(a)}.{urllib.parse.quote_plus(g)}"
 
-# ==================== DATABASE FUNCTIONS ====================
-def get_user(user_id: int) -> Optional[Dict]:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {
-            'user_id': row[0],
-            'username': row[1],
-            'first_name': row[2],
-            'phone': row[3],
-            'upi_number': row[4],
-            'jwt_token': row[5],
-            'referral_code': row[6],
-            'referred_by': row[7],
-            'referrals_count': row[8],
-            'process_credits': row[9],
-            'total_processes': row[10],
-            'successful_processes': row[11],
-            'total_rewards': row[12],
-            'today_processes': row[13],
-            'today_completed': row[14],
-            'last_process_date': row[15],
-            'is_banned': row[16],
-            'registered_at': row[17],
-            'last_activity': row[18]
+
+def decode_resp(text: str) -> dict:
+    data = json.loads(text)
+    if "resp" in data:
+        s = data["resp"]
+        pad = 4 - len(s) % 4
+        if pad != 4:
+            s += "=" * pad
+        return json.loads(base64.b64decode(s).decode())
+    return data
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+conn_lock = asyncio.Lock()
+
+
+def get_db() -> sqlite3.Connection:
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER UNIQUE,
+            name TEXT DEFAULT '',
+            username TEXT DEFAULT '',
+            mobile TEXT DEFAULT '',
+            upi TEXT DEFAULT '',
+            user_key TEXT DEFAULT '',
+            data_key TEXT DEFAULT '',
+            access_token TEXT DEFAULT '',
+            referrals INTEGER DEFAULT 0,
+            credits INTEGER DEFAULT 1,
+            completed_processes INTEGER DEFAULT 0,
+            referred_by INTEGER DEFAULT NULL,
+            joined_channel INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    db.commit()
+    return db
+
+
+async def db_user(telegram_id: int) -> Optional[dict]:
+    async with conn_lock:
+        db = get_db()
+        row = db.execute("SELECT * FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        db.close()
+        return dict(row) if row else None
+
+
+async def db_upsert(telegram_id: int, **kwargs):
+    async with conn_lock:
+        db = get_db()
+        existing = db.execute("SELECT id FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        if existing:
+            sets = ", ".join(f"{k}=?" for k in kwargs)
+            vals = list(kwargs.values()) + [telegram_id]
+            db.execute(f"UPDATE users SET {sets} WHERE telegram_id=?", vals)
+        else:
+            keys = ["telegram_id"] + list(kwargs.keys())
+            placeholders = ", ".join("?" for _ in keys)
+            vals = [telegram_id] + list(kwargs.values())
+            db.execute(f"INSERT INTO users ({', '.join(keys)}) VALUES ({placeholders})", vals)
+        db.commit()
+        db.close()
+
+
+async def db_add_referral(referrer_id: int):
+    async with conn_lock:
+        db = get_db()
+        db.execute("UPDATE users SET referrals=referrals+1, credits=credits+1 WHERE telegram_id=?", (referrer_id,))
+        db.commit()
+        db.close()
+
+
+# ============================================================
+# AIOHTTP SESSION MANAGEMENT
+# ============================================================
+_http_session: Optional[ClientSession] = None
+
+
+async def get_http_session() -> ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        jar = aiohttp.CookieJar(unsafe=True)
+        _http_session = aiohttp.ClientSession(
+            cookie_jar=jar,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+            }
+        )
+        if os.path.exists(SESSION_FILE):
+            try:
+                with open(SESSION_FILE) as f:
+                    cookies = json.load(f)
+                for domain, cdata in cookies.items():
+                    for name, attrs in cdata.items():
+                        jar._cookies[domain][name] = aiohttp.Cookie(
+                            name=name, value=attrs.get('value', ''),
+                            domain=domain, path=attrs.get('path', '/')
+                        )
+            except Exception as e:
+                logger.warning(f"Could not load cookies: {e}")
+    return _http_session
+
+
+async def save_cookies():
+    global _http_session
+    if _http_session and not _http_session.closed:
+        try:
+            cookies = {}
+            for domain, domain_cookies in _http_session.cookie_jar._cookies.items():
+                cookies[str(domain)] = {}
+                for name, cookie in domain_cookies.items():
+                    cookies[str(domain)][name] = {
+                        'value': cookie.value,
+                        'path': cookie['path']
+                    }
+            with open(SESSION_FILE, 'w') as f:
+                json.dump(cookies, f)
+        except Exception as e:
+            logger.warning(f"Could not save cookies: {e}")
+
+
+def _now_ms() -> int:
+    return int(datetime.now().timestamp() * 1000)
+
+
+# ============================================================
+# API HELPER
+# ============================================================
+async def api_init() -> Tuple[bool, dict]:
+    session = await get_http_session()
+    url = f"{BASE_URL}/api/users"
+    body = {
+        "ipInfo": {
+            "as": "AS45916 Gujarat Telelink Pvt Ltd",
+            "city": "Indore",
+            "country": "India",
+            "countryCode": "IN",
+            "isp": "Gujarat Telelink Pvt Ltd",
+            "lat": 22.717,
+            "lon": 75.8337,
+            "org": "Gtpl Broadband Pvt. Ltd.",
+            "query": "43.243.36.233",
+            "region": "MP",
+            "regionName": "Madhya Pradesh",
+            "status": "success",
+            "timezone": "Asia/Kolkata",
+            "zip": "452009"
         }
-    return None
-
-def create_user(user_id: int, username: str, first_name: str, phone: str = None):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    ref_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-    c.execute('''INSERT OR IGNORE INTO users 
-        (user_id, username, first_name, phone, referral_code, registered_at, last_activity)
-        VALUES (?, ?, ?, ?, ?, ?, ?)''',
-        (user_id, username, first_name, phone, ref_code, now, now))
-    conn.commit()
-    conn.close()
-
-def update_user(user_id: int, **kwargs):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    updates = []
-    values = []
-    for key, value in kwargs.items():
-        updates.append(f"{key} = ?")
-        values.append(value)
-    values.append(user_id)
-    c.execute(f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?", values)
-    conn.commit()
-    conn.close()
-
-def add_process_credits(user_id: int, amount: int):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('UPDATE users SET process_credits = process_credits + ? WHERE user_id = ?', (amount, user_id))
-    conn.commit()
-    conn.close()
-
-def add_referral(referrer_id: int, referred_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    try:
-        c.execute('INSERT INTO referrals (referrer_id, referred_id, referred_at) VALUES (?, ?, ?)',
-                  (referrer_id, referred_id, now))
-        c.execute('UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id = ?', (referrer_id,))
-        c.execute('SELECT referrals_count FROM users WHERE user_id = ?', (referrer_id,))
-        count = c.fetchone()[0]
-        if count % REFERRAL_REQUIRED == 0:
-            add_process_credits(referrer_id, 1)
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
-    conn.close()
-
-def add_process(user_id: int, reward: int, upi_number: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    c.execute('''INSERT INTO processes (user_id, status, reward, upi_number, created_at)
-                 VALUES (?, ?, ?, ?, ?)''',
-              (user_id, 'completed', reward, upi_number, now))
-    c.execute('''UPDATE users SET 
-                 total_processes = total_processes + 1,
-                 successful_processes = successful_processes + 1,
-                 total_rewards = total_rewards + ?,
-                 today_processes = today_processes + 1,
-                 today_completed = today_completed + 1,
-                 last_process_date = ?,
-                 process_credits = process_credits - 1
-                 WHERE user_id = ?''',
-              (reward, now, user_id))
-    conn.commit()
-    conn.close()
-
-def get_today_reset(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    today = datetime.now().date().isoformat()
-    c.execute('SELECT last_process_date FROM users WHERE user_id = ?', (user_id,))
-    row = c.fetchone()
-    if row and row[0] and row[0].startswith(today):
-        conn.close()
-        return False
-    c.execute('UPDATE users SET today_processes = 0, today_completed = 0 WHERE user_id = ?', (user_id,))
-    conn.commit()
-    conn.close()
-    return True
-
-def get_user_by_referral_code(code: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT user_id FROM users WHERE referral_code = ?', (code,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def get_total_stats():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM users')
-    total_users = c.fetchone()[0]
-    c.execute('SELECT SUM(total_processes) FROM users')
-    total_processes = c.fetchone()[0] or 0
-    c.execute('SELECT SUM(successful_processes) FROM users')
-    total_completed = c.fetchone()[0] or 0
-    c.execute('SELECT COUNT(*) FROM processes WHERE status = "pending"')
-    pending = c.fetchone()[0]
-    conn.close()
-    return {
-        'total_users': total_users,
-        'total_processes': total_processes,
-        'total_completed': total_completed,
-        'pending': pending
     }
-
-def get_all_users():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT user_id, username, first_name, phone, referrals_count, process_credits, total_processes, is_banned FROM users ORDER BY registered_at DESC')
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-# ==================== API FUNCTIONS ====================
-async def _log_response(resp, label: str):
-    """Log full request/response details for debugging."""
-    try:
-        text = await resp.text()
-    except:
-        text = '<could not read body>'
-    print(f"\n{'='*60}")
-    print(f"RESPONSE: {label}")
-    print(f"{'='*60}")
-    print(f"Status: {resp.status} {resp.reason}")
-    print(f"URL: {resp.url}")
-    print(f"Response Headers:")
-    for k, v in sorted(dict(resp.headers).items()):
-        print(f"  {k}: {v}")
-    # Try to decode and pretty-print the response body
-    try:
-        decoded = decode_resp(text)
-        print(f"Response Body (decoded):")
-        print(json.dumps(decoded, indent=2))
-        print(f"Raw body length: {len(text)} chars")
-    except:
-        print(f"Response Body (raw, {len(text)} chars):")
-        print(text[:2000])
-    print(f"{'='*60}\n")
-    return text
-
-async def _make_signed_request(endpoint: str, payload: dict, data_key: str, user_key, referer: str = '/', files: dict = None, jwt_token: str = None) -> Tuple[bool, dict]:
-    url = f"{BASE_URL}{endpoint}"
-    url = url.replace('{userKey}', str(user_key))
-    t = int(datetime.now().timestamp() * 1000)
-    payload['userKey'] = int(user_key) if isinstance(user_key, str) and user_key.isdigit() else user_key
-    payload['t'] = t
-
-    start_time = datetime.now()
-    
-    print(f"\n{'='*60}")
-    print(f"API CALL: {endpoint}")
-    print(f"{'='*60}")
-    print(f"Method: POST")
-    print(f"URL: {url}")
-    print(f"Timestamp (t): {t}")
-    print(f"JWT Token: {'Bearer ' + jwt_token[:30] + '...' if jwt_token else 'None'}")
-    print(f"Payload before signing: {json.dumps(payload, indent=2)}")
-    print(f"dataKey (HMAC source): {data_key}")
-    print(f"HMAC key (data_key[4:18]): {data_key[4:18]}")
-    
-    session = await get_api_session()
-    cookies = dict(session.cookie_jar.filter_cookies(YarlURL(BASE_URL)))
-    print(f"Cookies: {cookies}")
-    
-    req_headers = {
-        'referer': f'{BASE_URL}{referer}',
+    headers = {
         'accept': '*/*',
         'accept-language': 'en-US,en;q=0.9',
-        'user-agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36',
+        'content-type': 'application/json',
         'origin': BASE_URL,
+        'referer': f'{BASE_URL}/',
         'x-requested-with': 'XMLHttpRequest',
     }
-    if jwt_token:
-        req_headers['authorization'] = f'Bearer {jwt_token}'
-    
-    if files:
-        body = aiohttp.FormData()
-        for field_name, file_info in files.items():
-            print(f"Form field: {field_name} = {file_info[0]} ({file_info[2]}, {len(file_info[1])} bytes)")
-            body.add_field(field_name, file_info[1], filename=file_info[0], content_type=file_info[2])
-        data_field = build_signed_data(payload, data_key)
-        parts = data_field.split('&')
-        data_val = urllib.parse.unquote(parts[1].split('=')[1]) if len(parts) > 1 else ''
-        user_key_val = urllib.parse.unquote(parts[0].split('=')[1]) if len(parts) > 0 else ''
-        body.add_field('data', data_val)
-        body.add_field('userKey', user_key_val)
-        print(f"Signed data field: {data_val[:100]}...")
-        print(f"userKey field: {user_key_val}")
+    logger.info(f"INIT POST {url}")
+    try:
+        async with session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            text = await resp.text()
+            logger.info(f"INIT response ({resp.status}): {text[:500]}")
+            await save_cookies()
+            if resp.status == 200:
+                data = decode_resp(text)
+                return True, data
+            return False, {"message": f"HTTP {resp.status}", "detail": text}
+    except Exception as e:
+        logger.error(f"INIT failed: {e}")
+        return False, {"message": str(e)}
 
-        req_url = f"{url}?t={t}"
-        print(f"Request headers: {dict(req_headers)}")
-        print(f"Request URL: {req_url}")
-        
-        async with session.post(req_url, data=body, headers=req_headers) as resp:
-            elapsed = (datetime.now() - start_time).total_seconds()
-            resp_text = await _log_response(resp, f"SIGNED FILE UPLOAD REQUEST: {endpoint}")
-            print(f"Time taken: {elapsed:.2f}s")
-            decoded = decode_resp(resp_text)
-            status_code = decoded.get('statusCode', 400)
-            print(f"Decoded statusCode: {status_code}")
-            print(f"Decoded message: {decoded.get('message', 'N/A')}")
-            print(f"{'='*60}\n")
-            return status_code in [200, 201, 202], decoded
-    else:
-        signed_body_str = build_signed_data(payload, data_key)
-        req_url = f"{url}?t={t}"
-        
-        # Parse signed body components
-        parsed_qs = urllib.parse.parse_qs(signed_body_str)
-        data_parts = parsed_qs.get('data', [''])[0].split('.')
-        print(f"\nSigned body components:")
-        print(f"  userKey: {parsed_qs.get('userKey', [''])[0]}")
-        if len(data_parts) >= 1:
-            decoded_t = base64.b64decode(data_parts[0] + '==').decode() if data_parts[0] else 'N/A'
-            print(f"  data.t (timestamp): {data_parts[0][:30]}... -> decoded: {decoded_t}")
-        if len(data_parts) >= 2:
-            try:
-                decoded_payload = base64.b64decode(data_parts[1] + '==').decode()
-                print(f"  data.a (payload): {data_parts[1][:30]}... -> decoded: {decoded_payload}")
-            except:
-                print(f"  data.a (payload): {data_parts[1][:30]}... -> decoding failed")
-        print(f"  data.g (signature): {data_parts[2][:30]}... ({len(data_parts[2])} chars)" if len(data_parts) >= 3 else "  data.g: N/A")
-        
-        print(f"Request headers: {dict(req_headers)}")
-        print(f"Request URL: {req_url}")
-        print(f"Request body: {signed_body_str[:400]}")
-        
-        async with session.post(req_url, data=signed_body_str, headers=req_headers) as resp:
-            elapsed = (datetime.now() - start_time).total_seconds()
-            resp_text = await _log_response(resp, f"SIGNED REQUEST: {endpoint}")
-            print(f"Time taken: {elapsed:.2f}s")
-            decoded = decode_resp(resp_text)
-            status_code = decoded.get('statusCode', 400)
-            print(f"Decoded statusCode: {status_code}")
-            print(f"Decoded message: {decoded.get('message', 'N/A')}")
-            print(f"{'='*60}\n")
-            return status_code in [200, 201, 202], decoded
 
-async def api_init() -> Tuple[bool, dict]:
-    start = datetime.now()
-    session = await get_api_session()
-    
-    print(f"\n{'='*60}")
-    print(f"API CALL: INIT")
-    print(f"{'='*60}")
-    print(f"Method: POST")
-    print(f"URL: {BASE_URL}/api/users")
-    
-    ip_info = {
-        'as': 'AS45916 Gujarat Telelink Pvt Ltd',
-        'city': 'Indore',
-        'country': 'India',
-        'countryCode': 'IN',
-        'isp': 'Gujarat Telelink Pvt Ltd',
-        'lat': 22.717,
-        'lon': 75.8337,
-        'org': 'Gtpl Broadband Pvt. Ltd.',
-        'query': '43.243.36.233',
-        'region': 'MP',
-        'regionName': 'Madhya Pradesh',
-        'status': 'success',
-        'timezone': 'Asia/Kolkata',
-        'zip': '452009',
-    }
-    body = {'ipInfo': ip_info}
-    print(f"Request body: {json.dumps(body, indent=2)}")
-    
-    url = f"{BASE_URL}/api/users"
-    headers = {'content-type': 'application/json', 'referer': f'{BASE_URL}/'}
-    print(f"Request headers: {headers}")
-    
-    async with session.post(url, json=body, headers=headers) as resp:
-        resp_text = await _log_response(resp, 'INIT API')
-        elapsed = (datetime.now() - start).total_seconds()
-        print(f"Time taken: {elapsed:.2f}s")
-        
-        decoded = decode_resp(resp_text)
-        if decoded.get('statusCode') == 200:
-            user_key = decoded.get('userKey')
-            data_key = decoded.get('dataKey')
-            print(f">>> INIT SUCCESS: userKey={user_key}, dataKey={data_key}")
-            print(f"{'='*60}\n")
-            return True, {'userKey': user_key, 'dataKey': data_key}
-        print(f">>> INIT FAILED: {json.dumps(decoded, indent=2)}")
-        print(f"{'='*60}\n")
-        return False, decoded
+async def make_signed_request(
+    endpoint: str,
+    payload: dict,
+    data_key: str,
+    user_key,
+    referer: str = '/',
+    files: dict = None,
+    jwt_token: str = None
+) -> Tuple[bool, dict]:
+    session = await get_http_session()
+    url = f"{BASE_URL}{endpoint}".replace('{userKey}', str(user_key))
+    t = _now_ms()
 
-async def register_user(phone: str, user_key, data_key: str) -> Tuple[bool, dict]:
-    payload = {'mobile': phone, 'limit': ''}
-    return await _make_signed_request('/api/users/register/{userKey}', payload, data_key, user_key, referer='/register')
+    payload['userKey'] = int(user_key)
+    payload['t'] = t
 
-async def verify_otp(user_key, data_key: str, otp: str, jwt_token: str = None) -> Tuple[bool, dict]:
-    payload = {'otp': otp}
-    return await _make_signed_request('/api/users/verifyOTP/{userKey}', payload, data_key, user_key, referer='/register', jwt_token=jwt_token)
-
-async def select_vibe(user_key, data_key: str, jwt_token: str = None) -> Tuple[bool, dict]:
-    payload = {'vibe': 'soft savage'}
-    return await _make_signed_request('/api/users/selectVibe/{userKey}', payload, data_key, user_key, referer='/ai-rap-home', jwt_token=jwt_token)
-
-async def select_pack(user_key, data_key: str, jwt_token: str = None) -> Tuple[bool, dict]:
-    payload = {'pack': 'single'}
-    return await _make_signed_request('/api/users/selectPack/{userKey}', payload, data_key, user_key, referer='/choose-reward', jwt_token=jwt_token)
-
-async def upload_image(user_key, data_key: str, image_data: bytes, image_name: str, jwt_token: str = None) -> Tuple[bool, dict]:
-    """
-    Upload image using multipart/form-data.
-    Matches HAR exactly: fields are media, data (signed), and userKey.
-    """
-    start = datetime.now()
-    t = int(datetime.now().timestamp() * 1000)
-    url = f"{BASE_URL}/api/users/uploadImage/{user_key}?t={t}"
-
-    # Build signed payload (only userKey + t per HAR)
-    signed_payload = {'userKey': int(user_key), 't': t}
-    signed_body = build_signed_data(signed_payload, data_key)
-    parsed = urllib.parse.parse_qs(signed_body)
-    data_val = urllib.parse.unquote(parsed.get('data', [''])[0])
-
-    print(f"\n{'='*60}")
-    print(f"API CALL: UPLOAD IMAGE")
-    print(f"{'='*60}")
-    print(f"Method: POST")
-    print(f"URL: {url}")
-    print(f"JWT Token: {'Bearer ' + jwt_token[:30] + '...' if jwt_token else 'None'}")
-
-    form = aiohttp.FormData()
-    form.add_field('media', image_data, filename=image_name, content_type='image/jpeg')
-    form.add_field('data', data_val)
-    form.add_field('userKey', str(user_key))
-    print(f"Form fields: media={image_name} ({len(image_data)} bytes), data={data_val[:80]}..., userKey={user_key}")
-
-    session = await get_api_session()
-    cookies = dict(session.cookie_jar.filter_cookies(YarlURL(BASE_URL)))
-    print(f"Cookies: {cookies}")
+    signed_data = build_signed_data(payload, data_key)
 
     headers = {
-        'referer': f'{BASE_URL}/take-stick-photo',
         'accept': '*/*',
         'accept-language': 'en-US,en;q=0.9',
-        'user-agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36',
         'origin': BASE_URL,
+        'referer': f'{BASE_URL}{referer}',
+        'user-agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36',
         'x-requested-with': 'XMLHttpRequest',
     }
     if jwt_token:
         headers['authorization'] = f'Bearer {jwt_token}'
-    print(f"Request headers: {dict(headers)}")
 
-    async with session.post(url, data=form, headers=headers) as resp:
-        elapsed = (datetime.now() - start).total_seconds()
-        resp_text = await _log_response(resp, 'UPLOAD IMAGE')
-        print(f"Time taken: {elapsed:.2f}s")
-        decoded = decode_resp(resp_text)
-        status_code = decoded.get('statusCode', 400)
-        print(f"Decoded statusCode: {status_code}")
-        print(f"Decoded message: {decoded.get('message', 'N/A')}")
-        print(f"{'='*60}\n")
-        return status_code in [200, 201, 202], decoded
+    request_url = f"{url}?t={t}"
+    logger.info(f"SIGNED POST {endpoint} t={t}")
 
-async def submit_upi(user_key, data_key: str, upi_number: str, jwt_token: str = None) -> Tuple[bool, dict]:
-    payload = {'upiNo': upi_number}
-    return await _make_signed_request('/api/users/getUpiNo/{userKey}', payload, data_key, user_key, referer='/stick-cashback', jwt_token=jwt_token)
-
-async def get_pack_progress(user_key, data_key: str, jwt_token: str = None) -> Tuple[bool, dict]:
-    payload = {}
-    return await _make_signed_request('/api/users/getPackProgress/{userKey}', payload, data_key, user_key, referer='/stick-cashback', jwt_token=jwt_token)
-
-async def get_stick_progress(user_key, data_key: str, jwt_token: str = None) -> Tuple[bool, dict]:
-    payload = {}
-    return await _make_signed_request('/api/users/getStickProgress/{userKey}', payload, data_key, user_key, referer='/stick-cashback', jwt_token=jwt_token)
-
-async def click_track(user_key, data_key: str, jwt_token: str = None) -> Tuple[bool, dict]:
-    payload = {'smoker': 'yes'}
-    return await _make_signed_request('/api/users/clickTrack/{userKey}', payload, data_key, user_key, referer='/', jwt_token=jwt_token)
-
-async def download_image(url: str) -> Tuple[bool, bytes]:
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=30) as resp:
+        if files:
+            form = FormData()
+            form.add_field('userKey', str(user_key))
+            form.add_field('data', signed_data)
+            for field_name, (filename, content, content_type) in files.items():
+                form.add_field(field_name, content, filename=filename, content_type=content_type)
+            async with session.post(request_url, data=form, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                text = await resp.text()
+                logger.info(f"{endpoint} response ({resp.status}): {text[:500]}")
+                try:
+                    decoded = decode_resp(text)
+                except Exception:
+                    logger.warning(f"Could not decode response: {text[:200]}")
+                    decoded = {"statusCode": resp.status, "message": text[:200]}
+                status_ok = decoded.get('statusCode', 400) in (200, 201, 202)
+                return status_ok, decoded
+        else:
+            headers['content-type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
+            async with session.post(request_url, data=signed_data, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                text = await resp.text()
+                logger.info(f"{endpoint} response ({resp.status}): {text[:500]}")
+                try:
+                    decoded = decode_resp(text)
+                except Exception:
+                    logger.warning(f"Could not decode response: {text[:200]}")
+                    decoded = {"statusCode": resp.status, "message": text[:200]}
+                status_ok = decoded.get('statusCode', 400) in (200, 201, 202)
+                return status_ok, decoded
+    except Exception as e:
+        logger.error(f"{endpoint} error: {e}")
+        return False, {"message": str(e)}
+
+
+# ============================================================
+# API STEP FUNCTIONS
+# ============================================================
+async def click_track(user_key, data_key) -> Tuple[bool, dict]:
+    payload = {"smoker": "yes"}
+    return await make_signed_request('/api/users/clickTrack/{userKey}', payload, data_key, user_key, referer='/')
+
+
+async def register_user(phone: str, user_key, data_key) -> Tuple[bool, dict]:
+    payload = {"mobile": phone, "limit": ""}
+    return await make_signed_request('/api/users/register/{userKey}', payload, data_key, user_key, referer='/register')
+
+
+async def verify_otp(otp: str, user_key, data_key, jwt_token: str = None) -> Tuple[bool, dict]:
+    payload = {"otp": otp}
+    return await make_signed_request('/api/users/verifyOTP/{userKey}', payload, data_key, user_key, referer='/login', jwt_token=jwt_token)
+
+
+async def select_pack(user_key, data_key, jwt_token) -> Tuple[bool, dict]:
+    payload = {"pack": "single"}
+    return await make_signed_request('/api/users/selectPack/{userKey}', payload, data_key, user_key, referer='/dashboard', jwt_token=jwt_token)
+
+
+async def select_vibe(user_key, data_key, jwt_token) -> Tuple[bool, dict]:
+    payload = {"vibe": "soft savage"}
+    return await make_signed_request('/api/users/selectVibe/{userKey}', payload, data_key, user_key, referer='/dashboard', jwt_token=jwt_token)
+
+
+async def upload_image(image_bytes: bytes, filename: str, user_key, data_key, jwt_token) -> Tuple[bool, dict]:
+    payload = {}
+    files = {'media': (filename, image_bytes, 'image/jpeg')}
+    return await make_signed_request('/api/users/uploadImage/{userKey}', payload, data_key, user_key, referer='/dashboard', files=files, jwt_token=jwt_token)
+
+
+async def submit_upi(upi_number: str, user_key, data_key, jwt_token) -> Tuple[bool, dict]:
+    payload = {"upiNo": upi_number}
+    return await make_signed_request('/api/users/getUpiNo/{userKey}', payload, data_key, user_key, referer='/dashboard', jwt_token=jwt_token)
+
+
+async def get_pack_progress(user_key, data_key, jwt_token) -> Tuple[bool, dict]:
+    payload = {}
+    return await make_signed_request('/api/users/getPackProgress/{userKey}', payload, data_key, user_key, referer='/dashboard', jwt_token=jwt_token)
+
+
+async def get_stick_progress(user_key, data_key, jwt_token) -> Tuple[bool, dict]:
+    payload = {}
+    return await make_signed_request('/api/users/getStickProgress/{userKey}', payload, data_key, user_key, referer='/dashboard', jwt_token=jwt_token)
+
+
+async def download_image() -> Tuple[Optional[bytes], str]:
+    urls = [
+        "https://picsum.photos/400",
+        "https://fastly.picsum.photos/id/0/400/300.jpg",
+    ]
+    session = await get_http_session()
+    for url in urls:
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 200:
-                    return True, await resp.read()
-                return False, None
-    except Exception:
-        return False, None
+                    data = await resp.read()
+                    return data, "image.jpg"
+        except Exception as e:
+            logger.warning(f"Image download failed {url}: {e}")
+    return None, ""
 
-# ==================== CONVERSATION STATES ====================
-PHONE, OTP, UPI = range(3)
 
-# ==================== FORCE JOIN CHECK ====================
-async def check_force_join(user_id: int, bot) -> bool:
+# ============================================================
+# KEYBOARDS
+# ============================================================
+main_keyboard = ReplyKeyboardMarkup([
+    [KeyboardButton("🏠 Start Process")],
+    [KeyboardButton("👥 Refer & Earn"), KeyboardButton("📊 Dashboard")],
+    [KeyboardButton("📞 Support")],
+], resize_keyboard=True)
+
+cancel_keyboard = ReplyKeyboardMarkup([
+    [KeyboardButton("❌ Cancel")]
+], resize_keyboard=True)
+
+
+# ============================================================
+# CONVERSATION STATES
+# ============================================================
+SELECTING_ACTION, ASK_MOBILE, ASK_OTP, ASK_UPI = range(4)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+async def is_channel_member(bot, user_id: int) -> bool:
     try:
-        member = await bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
-        return member.status in ['member', 'administrator', 'creator']
-    except:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        return member.status in ('member', 'administrator', 'creator')
+    except Exception as e:
+        logger.warning(f"Channel check failed for {user_id}: {e}")
         return False
 
-# ==================== KEYBOARDS ====================
-def get_main_keyboard(is_admin: bool = False):
-    buttons = [
-        ["🏠 Start Process"],
-        ["👥 Refer & Earn"],
-        ["📊 Dashboard"],
-        ["📞 Support"]
-    ]
-    if is_admin:
-        buttons.append(["🔐 Admin Panel"])
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-def get_admin_keyboard():
-    buttons = [
-        ["📊 Admin Stats", "👥 Users List"],
-        ["➕ Add Credits", "➖ Remove Credits"],
-        ["📢 Broadcast", "📂 Export DB"],
-        ["🔙 Back to Menu"]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+async def validate_mobile(phone: str) -> bool:
+    return len(phone) == 10 and phone.isdigit()
 
-def get_join_keyboard():
-    return ReplyKeyboardMarkup([["✅ Check Membership"]], resize_keyboard=True)
 
-# ==================== COMMAND HANDLERS ====================
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def validate_otp(code: str) -> bool:
+    return len(code) == 6 and code.isdigit()
+
+
+async def show_main_menu(update: Update, text: str = "Choose an option:"):
+    await update.message.reply_text(text, reply_markup=main_keyboard)
+
+
+# ============================================================
+# COMMAND HANDLERS
+# ============================================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    user_id = user.id
-    username = user.username or ""
-    first_name = user.first_name or "User"
+    tid = user.id
+    args = context.args
 
-    db_user = get_user(user_id)
-    if db_user and db_user.get('is_banned'):
-        await update.message.reply_text("🚫 You are banned from using this bot.")
+    existing = await db_user(tid)
+    if existing is None:
+        await db_upsert(tid, name=user.full_name or "", username=user.username or "")
+        if args and args[0].isdigit():
+            referrer_id = int(args[0])
+            if referrer_id != tid:
+                await db_add_referral(referrer_id)
+                await db_upsert(tid, referred_by=referrer_id)
+
+    member = await is_channel_member(context.bot, tid)
+    if not member:
+        await update.message.reply_text(
+            f"⚠️ You must join @{CHANNEL_USERNAME} to use this bot.\n"
+            f"Join and then send /start again.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_USERNAME}")]
+            ])
+        )
         return
 
-    channel_joined = await check_force_join(user_id, context.bot)
-    if not channel_joined:
-        msg = "🔒 **Access Restricted**\n\n"
-        msg += "❌ You haven't joined our channel.\n"
-        msg += "\n📢 Channel: https://t.me/" + CHANNEL_USERNAME + "\n\n"
-        msg += "After joining, click the button below."
-        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_join_keyboard())
-        return
+    await db_upsert(tid, joined_channel=1)
+    await show_main_menu(update, f"👋 Welcome {user.first_name}! Choose an option below.")
 
-    if not db_user:
-        create_user(user_id, username, first_name)
-        db_user = get_user(user_id)
 
-    if context.args and context.args[0].startswith('ref_'):
-        ref_code = context.args[0].replace('ref_', '')
-        referrer_id = get_user_by_referral_code(ref_code)
-        if referrer_id and referrer_id != user_id:
-            add_referral(referrer_id, user_id)
-            try:
-                await context.bot.send_message(
-                    referrer_id,
-                    f"🎉 **New Referral!**\n\n"
-                    f"@{username or first_name} joined using your referral link.\n"
-                    f"Referrals: {get_user(referrer_id)['referrals_count']}\n"
-                    f"Process Credits: {get_user(referrer_id)['process_credits']}",
-                    parse_mode="HTML"
-                )
-            except:
-                pass
-
-    is_admin = (user_id == ADMIN_ID)
+async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"👋 Welcome, {first_name}!\n\n"
-        f"Select an option below to get started.",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(is_admin)
+        f"📞 Contact support: {SUPPORT_LINK}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Open Channel", url=SUPPORT_LINK)]
+        ])
     )
 
-async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+
+async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = update.effective_user.id
+    u = await db_user(tid)
+    if not u:
+        await show_main_menu(update, "No data found. Use /start first.")
+        return
+    text = (
+        f"📊 <b>Your Dashboard</b>\n\n"
+        f"👤 Name: {u['name']}\n"
+        f"🆔 Telegram ID: <code>{u['telegram_id']}</code>\n"
+        f"📱 Mobile: {u['mobile'] or 'Not set'}\n"
+        f"💳 UPI: {u['upi'] or 'Not set'}\n"
+        f"👥 Referrals: {u['referrals']}\n"
+        f"💎 Credits: {u['credits']}\n"
+        f"✅ Completed: {u['completed_processes']}\n"
+    )
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=main_keyboard)
+
+
+async def refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = update.effective_user.id
+    bot_user = await context.bot.get_me()
+    link = f"https://t.me/{bot_user.username}?start={tid}"
+    text = (
+        f"👥 <b>Refer & Earn</b>\n\n"
+        f"Share your referral link and earn <b>+1 Credit</b> for every new user who joins!\n\n"
+        f"Your link:\n<code>{link}</code>"
+    )
+    await update.message.reply_text(
+        text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Share Link", url=f"https://t.me/share/url?url={link}&text=Join%20this%20bot!")],
+        ])
+    )
+    await show_main_menu(update)
+
+
+# ============================================================
+# START PROCESS HANDLER
+# ============================================================
+async def start_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tid = update.effective_user.id
+    member = await is_channel_member(context.bot, tid)
+    if not member:
+        await update.message.reply_text(
+            f"⚠️ You must join @{CHANNEL_USERNAME} first!",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_USERNAME}")]
+            ])
+        )
+        return ConversationHandler.END
+
+    u = await db_user(tid)
+    credits = u['credits'] if u else 1
+    if credits < 1:
+        await update.message.reply_text(
+            "❌ You have no credits left. Earn credits by referring friends!",
+            reply_markup=main_keyboard
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "📱 Enter your 10-digit mobile number:",
+        reply_markup=cancel_keyboard
+    )
+    return ASK_MOBILE
+
+
+async def ask_mobile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "❌ Cancel":
+        await show_main_menu(update, "Cancelled.")
+        return ConversationHandler.END
+
+    if not await validate_mobile(text):
+        await update.message.reply_text("❌ Invalid number. Enter a 10-digit mobile number:")
+        return ASK_MOBILE
+
+    tid = update.effective_user.id
+    phone = text
+    context.user_data['phone'] = phone
+
+    await update.message.reply_text("⏳ Initializing session...")
+
+    ok, init_data = await api_init()
+    if not ok or init_data.get('statusCode') != 200:
+        await update.message.reply_text(f"❌ Init failed: {init_data.get('message', 'Unknown error')}", reply_markup=main_keyboard)
+        return ConversationHandler.END
+
+    user_key = init_data['userKey']
+    data_key = init_data['dataKey']
+    context.user_data['userKey'] = user_key
+    context.user_data['dataKey'] = data_key
+
+    logger.info(f"Session OK: userKey={user_key}, dataKey={data_key}")
+
+    await update.message.reply_text("⏳ Tracking...")
+    await click_track(user_key, data_key)
+
+    await update.message.reply_text("⏳ Sending OTP...")
+    reg_ok, reg_data = await register_user(phone, user_key, data_key)
+    if not reg_ok:
+        msg = reg_data.get('message', 'Unknown error')
+        await update.message.reply_text(f"❌ Registration failed: {msg}", reply_markup=main_keyboard)
+        return ConversationHandler.END
+
+    await update.message.reply_text("✅ OTP sent! Enter the 6-digit OTP:")
+    return ASK_OTP
+
+
+async def ask_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "❌ Cancel":
+        await show_main_menu(update, "Cancelled.")
+        return ConversationHandler.END
+
+    if not await validate_otp(text):
+        await update.message.reply_text("❌ Invalid OTP. Enter a 6-digit code:")
+        return ASK_OTP
+
+    otp = text
+    user_key = context.user_data['userKey']
+    data_key = context.user_data['dataKey']
+
+    await update.message.reply_text("⏳ Verifying OTP...")
+    ok, data = await verify_otp(otp, user_key, data_key)
+    if not ok:
+        msg = data.get('message', 'Unknown error')
+        await update.message.reply_text(f"❌ OTP verification failed: {msg}", reply_markup=main_keyboard)
+        return ConversationHandler.END
+
+    access_token = data.get('accessToken') or data.get('data', {}).get('accessToken', '')
+    if not access_token:
+        await update.message.reply_text("❌ No access token received. Contact support.", reply_markup=main_keyboard)
+        return ConversationHandler.END
+
+    context.user_data['jwt'] = access_token
+    tid = update.effective_user.id
+    await db_upsert(tid, mobile=context.user_data['phone'], user_key=str(user_key), data_key=data_key, access_token=access_token)
+
+    await update.message.reply_text("✅ OTP verified! Setting up your process...")
+
+    # Auto steps: selectPack, selectVibe, uploadImage
+    await update.message.reply_text("⏳ Selecting pack...")
+    ok, pdata = await select_pack(user_key, data_key, access_token)
+    if not ok:
+        await update.message.reply_text(f"⚠️ Pack selection: {pdata.get('message', 'failed')}")
+
+    await update.message.reply_text("⏳ Selecting vibe...")
+    ok, vdata = await select_vibe(user_key, data_key, access_token)
+    if not ok:
+        await update.message.reply_text(f"⚠️ Vibe selection: {vdata.get('message', 'failed')}")
+
+    await update.message.reply_text("⏳ Downloading & uploading image...")
+    img_bytes, img_name = await download_image()
+    if img_bytes:
+        ok, img_data = await upload_image(img_bytes, img_name, user_key, data_key, access_token)
+        if not ok:
+            await update.message.reply_text(f"⚠️ Image upload: {img_data.get('message', 'failed')}")
+    else:
+        await update.message.reply_text("⚠️ Could not download image, skipping upload.")
+
+    await update.message.reply_text(
+        "💳 Enter your UPI-registered mobile number (10 digits):",
+        reply_markup=cancel_keyboard
+    )
+    return ASK_UPI
+
+
+async def ask_upi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "❌ Cancel":
+        await show_main_menu(update, "Cancelled.")
+        return ConversationHandler.END
+
+    if not await validate_mobile(text):
+        await update.message.reply_text("❌ Invalid number. Enter a 10-digit UPI mobile number:")
+        return ASK_UPI
+
+    upi_number = text
+    user_key = context.user_data['userKey']
+    data_key = context.user_data['dataKey']
+    jwt = context.user_data['jwt']
+    tid = update.effective_user.id
+
+    await update.message.reply_text("⏳ Submitting UPI...")
+    ok, upi_data = await submit_upi(upi_number, user_key, data_key, jwt)
+    if not ok:
+        await update.message.reply_text("⏳ Retrying UPI submission...")
+        ok, upi_data = await submit_upi(upi_number, user_key, data_key, jwt)
+
+    if ok:
+        await db_upsert(tid, upi=upi_number)
+        await update.message.reply_text(f"✅ UPI submitted: {upi_data.get('message', 'Success')}")
+    else:
+        msg = upi_data.get('message', 'Unknown error')
+        await update.message.reply_text(f"⚠️ UPI result: {msg}")
+
+    await update.message.reply_text("⏳ Fetching progress...")
+    pk_ok, pk_data = await get_pack_progress(user_key, data_key, jwt)
+    sk_ok, sk_data = await get_stick_progress(user_key, data_key, jwt)
+
+    result_lines = []
+    if pk_ok:
+        result_lines.append(f"📦 Pack: {json.dumps(pk_data, indent=2)}")
+    if sk_ok:
+        result_lines.append(f"🎯 Stick: {json.dumps(sk_data, indent=2)}")
+
+    if result_lines:
+        result_text = "\n\n".join(result_lines)
+        await update.message.reply_text(f"📋 <b>Process Complete</b>\n\n<pre>{result_text}</pre>", parse_mode="HTML")
+    else:
+        await update.message.reply_text("📋 Process complete. Check dashboard for details.")
+
+    # Deduct credit, increment completed
+    u = await db_user(tid)
+    new_credits = max(0, (u['credits'] if u else 1) - 1)
+    new_completed = (u['completed_processes'] if u else 0) + 1
+    await db_upsert(tid, credits=new_credits, completed_processes=new_completed)
+
+    await show_main_menu(update, "✅ Process finished!")
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_main_menu(update, "Cancelled.")
+    return ConversationHandler.END
+
+
+# ============================================================
+# ADMIN COMMANDS
+# ============================================================
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    async with conn_lock:
+        db = get_db()
+        total = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        with_credits = db.execute("SELECT SUM(credits) FROM users").fetchone()[0] or 0
+        completed = db.execute("SELECT SUM(completed_processes) FROM users").fetchone()[0] or 0
+        db.close()
+    await update.message.reply_text(
+        f"📊 <b>Admin Stats</b>\n\n"
+        f"👥 Total users: {total}\n"
+        f"💎 Total credits: {with_credits}\n"
+        f"✅ Total completed: {completed}",
+        parse_mode="HTML"
+    )
+
+
+async def admin_add_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    try:
+        tid = int(context.args[0])
+        amount = int(context.args[1])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /addcredits <telegram_id> <amount>")
+        return
+    u = await db_user(tid)
+    if u:
+        new_credits = u['credits'] + amount
+        await db_upsert(tid, credits=new_credits)
+        await update.message.reply_text(f"✅ Added {amount} credits to {tid}. Total: {new_credits}")
+    else:
+        await update.message.reply_text("❌ User not found.")
+
+
+async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    msg = " ".join(context.args)
+    if not msg:
+        await update.message.reply_text("Usage: /broadcast <message>")
+        return
+    async with conn_lock:
+        db = get_db()
+        rows = db.execute("SELECT telegram_id FROM users WHERE joined_channel=1").fetchall()
+        db.close()
+    sent = 0
+    failed = 0
+    for row in rows:
+        try:
+            await context.bot.send_message(chat_id=row['telegram_id'], text=msg, parse_mode="HTML")
+            sent += 1
+        except Exception:
+            failed += 1
+    await update.message.reply_text(f"📢 Broadcast: {sent} sent, {failed} failed.")
+
+
+# ============================================================
+# MAIN MENU ROUTER
+# ============================================================
+async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    is_admin = (user_id == ADMIN_ID)
-
-    if is_admin and context.user_data.get('admin_action'):
-        await admin_input_handler(update, context)
-        return
-
-    if text == "✅ Check Membership":
-        channel_joined = await check_force_join(user_id, context.bot)
-        if channel_joined:
-            db_user = get_user(user_id)
-            if db_user and db_user.get('is_banned'):
-                await update.message.reply_text("🚫 You are banned from using this bot.")
-                return
-            await update.message.reply_text(
-                "✅ You have joined! Welcome!\n\nSelect an option below:",
-                reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-            )
-        else:
-            msg = "🔒 **Access Restricted**\n\n"
-            msg += "❌ You haven't joined our channel.\n"
-            msg += "\n📢 Channel: https://t.me/" + CHANNEL_USERNAME + "\n\n"
-            msg += "After joining, click the button below."
-            await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_join_keyboard())
-        return
-
     if text == "🏠 Start Process":
-        await start_process(update, context)
+        return await start_process(update, context)
     elif text == "👥 Refer & Earn":
-        await refer_earn(update, context)
+        await refer(update, context)
     elif text == "📊 Dashboard":
         await dashboard(update, context)
     elif text == "📞 Support":
         await support(update, context)
-    elif text == "🔐 Admin Panel":
-        await admin_command(update, context)
-    elif text == "🔙 Back to Menu":
-        context.user_data['admin_mode'] = False
-        context.user_data['admin_action'] = None
-        await update.message.reply_text(
-            "👋 Welcome back!",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
     else:
-        if context.user_data.get('admin_mode', False):
-            await admin_handler(update, context)
-        else:
-            await update.message.reply_text(
-                "Please use the buttons below.",
-                reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-            )
+        await show_main_menu(update)
 
-# ==================== START PROCESS ====================
-async def start_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    db_user = get_user(user_id)
 
-    if db_user.get('process_credits', 0) <= 0:
-        await update.message.reply_text(
-            "❌ You don't have any Process Credits.\n\n"
-            "Invite one friend to unlock one new process.\n\n"
-            f"Your Referrals: {db_user['referrals_count']}",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "📱 **Enter your mobile number**\n\n"
-        "Please enter your 10-digit mobile number:\n"
-        "Example: 9876543210\n\n"
-        "Type /cancel to go back.",
-        parse_mode="HTML"
-    )
-    return PHONE
-
-async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
-    if text in ["🔙 Back", "Back", "/cancel"]:
-        await update.message.reply_text(
-            "Returning to main menu.",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-
-    menu_buttons = ["🏠 Start Process", "👥 Refer & Earn", "📊 Dashboard", "📞 Support", "🔐 Admin Panel"]
-    if text in menu_buttons:
-        context.user_data['pending_menu'] = text
-        await update.message.reply_text(
-            "Process cancelled.",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-
-    if not text.isdigit() or len(text) != 10:
-        await update.message.reply_text(
-            "❌ Please enter a valid 10-digit mobile number.\n\n"
-            "Enter your number or type /cancel:",
-            parse_mode="HTML"
-        )
-        return PHONE
-
-    phone = text
-    context.user_data['phone'] = phone
-    update_user(user_id, phone=phone)
-
-    await update.message.reply_text("⏳ Initializing...", parse_mode="HTML")
-
-    # Step 1: API Init - get userKey and dataKey
-    init_success, init_result = await api_init()
-    if not init_success:
-        print(f"API INIT FAILED: {json.dumps(init_result, indent=2)}")
-        await update.message.reply_text(
-            "❌ Initialization failed. Please try again later.\n\n"
-            "Type /start to restart.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-
-    user_key = init_result.get('userKey')
-    data_key = init_result.get('dataKey')
-    print(f"INIT SUCCESS: userKey={user_key}, dataKey={data_key}")
-
-    # Store credentials for subsequent steps
-    context.user_data['userKey'] = user_key
-    context.user_data['dataKey'] = data_key
-
-    # Step 2: Click Track (present in HAR flow before register)
-    await update.message.reply_text("⏳ Tracking...", parse_mode="HTML")
-    track_ok, track_result = await click_track(user_key, data_key)
-    print(f"CLICK TRACK RESULT: {json.dumps(track_result, indent=2)}")
-    if not track_ok:
-        print("Click track returned non-200, but continuing per HAR (optional step)")
-
-    # Step 3: Register (this sends the OTP)
-    await update.message.reply_text("⏳ Registering & sending OTP...", parse_mode="HTML")
-    reg_success, reg_result = await register_user(phone, user_key, data_key)
-    print(f"REGISTER RESULT: {json.dumps(reg_result, indent=2)}")
-
-    if not reg_success:
-        error_msg = reg_result.get('message', 'Unknown error')
-        status_code = reg_result.get('statusCode', 0)
-        print(f"REGISTER FAILED: statusCode={status_code}, message={error_msg}")
-        await update.message.reply_text(
-            f"❌ Registration failed (Code: {status_code}).\n"
-            f"Reason: {error_msg}\n\n"
-            "Type /start to restart.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        f"✅ OTP sent to {phone}!\n\n"
-        "📱 Enter the 6-digit OTP you received:\n"
-        "Type /cancel to go back.",
-        parse_mode="HTML"
-    )
-    return OTP
-
-async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    otp = update.message.text.strip()
-
-    if otp in ["🔙 Back", "Back", "/cancel"]:
-        await update.message.reply_text(
-            "Returning to main menu.",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-
-    if not otp.isdigit() or len(otp) != 6:
-        await update.message.reply_text(
-            "❌ Please enter a valid 6-digit OTP:\n"
-            "Type /cancel to go back.",
-            parse_mode="HTML"
-        )
-        return OTP
-
-    # Get stored credentials from init
-    user_key = context.user_data.get('userKey')
-    data_key = context.user_data.get('dataKey')
-    if not user_key or not data_key:
-        await update.message.reply_text(
-            "❌ Session expired. Please start over.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-
-    success, result = await verify_otp(user_key, data_key, otp)
-    print(f"VERIFY OTP RESULT: {json.dumps(result, indent=2)}")
-
-    if not success:
-        error_msg = result.get('message', 'Verification failed')
-        await update.message.reply_text(
-            f"❌ OTP verification failed.\nReason: {error_msg}\n\n"
-            "Enter the correct OTP or type /cancel:",
-            parse_mode="HTML"
-        )
-        return OTP
-
-    token = result.get('accessToken')
-    if not token:
-        await update.message.reply_text(
-            "❌ Server did not return access token. Please start over.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-
-    update_user(user_id, jwt_token=token)
-    context.user_data['jwt'] = token
-    print(f"JWT TOKEN SAVED: {token[:50]}...")
-    print(f"JWT TOKEN FULL: {token}")
-
-    # ===== STEP 1: SELECT PACK =====
-    await context.bot.send_message(user_id, "⏳ Selecting pack...", parse_mode="HTML")
-    pack_success, pack_result = await select_pack(user_key, data_key, jwt_token=token)
-    print(f"SELECT PACK RESULT: {json.dumps(pack_result, indent=2)}")
-    if not pack_success:
-        err = pack_result.get('message', 'Pack selection failed')
-        print(f"PACK SELECTION FAILED: {err}")
-        await update.message.reply_text(
-            f"❌ Pack selection failed.\nServer: {err}",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-    print("PACK SELECTION SUCCESS")
-
-    # ===== STEP 2: SELECT VIBE =====
-    await asyncio.sleep(0.5)
-    await context.bot.send_message(user_id, "⏳ Selecting stick/vibe...", parse_mode="HTML")
-    vibe_success, vibe_result = await select_vibe(user_key, data_key, jwt_token=token)
-    print(f"SELECT VIBE RESULT: {json.dumps(vibe_result, indent=2)}")
-    if not vibe_success:
-        err = vibe_result.get('message', 'Vibe selection failed')
-        print(f"VIBE SELECTION FAILED: {err}")
-        await update.message.reply_text(
-            f"❌ Vibe selection failed.\nServer: {err}",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-    print("VIBE SELECTION SUCCESS")
-
-    # ===== STEP 3: DOWNLOAD IMAGE =====
-    await asyncio.sleep(0.5)
-    await context.bot.send_message(user_id, "⏳ Downloading image...", parse_mode="HTML")
-    img_ok, image_data = await download_image(IMAGE_URL)
-    if not img_ok or not image_data:
-        print("IMAGE DOWNLOAD FAILED")
-        await update.message.reply_text(
-            "❌ Failed to download image. Please try again.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-    print(f"IMAGE DOWNLOADED: {len(image_data)} bytes")
-
-    # ===== STEP 4: UPLOAD IMAGE =====
-    await context.bot.send_message(user_id, "⏳ Uploading image...", parse_mode="HTML")
-    upload_success, upload_result = await upload_image(user_key, data_key, image_data, IMAGE_NAME, jwt_token=token)
-    print(f"UPLOAD IMAGE RESULT: {json.dumps(upload_result, indent=2)}")
-    if not upload_success:
-        err = upload_result.get('message', 'Image upload failed')
-        print(f"IMAGE UPLOAD FAILED: {err}")
-        await update.message.reply_text(
-            f"❌ Image upload failed.\nServer: {err}",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-    print("IMAGE UPLOAD SUCCESS")
-
-    await update.message.reply_text(
-        "📱 **Please enter your UPI-registered mobile number.**\n\n"
-        "This is the number linked to your UPI account:\n"
-        "Example: 9876543210\n\n"
-        "Type /cancel to go back.",
-        parse_mode="HTML"
-    )
-    return UPI
-
-async def upi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    upi_number = update.message.text.strip()
-
-    if upi_number in ["🔙 Back", "Back", "/cancel"]:
-        await update.message.reply_text(
-            "Returning to main menu.",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-
-    if not upi_number.isdigit() or len(upi_number) != 10:
-        await update.message.reply_text(
-            "❌ Please enter a valid 10-digit mobile number:\n"
-            "Type /cancel to go back.",
-            parse_mode="HTML"
-        )
-        return UPI
-
-    user_key = context.user_data.get('userKey')
-    data_key = context.user_data.get('dataKey')
-    jwt_token = context.user_data.get('jwt')
-
-    if not user_key or not data_key or not jwt_token:
-        await update.message.reply_text(
-            "❌ Session expired. Please start over.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-
-    # ===== STEP 1: SUBMIT UPI =====
-    # HAR note: First attempt may return 400, later attempts return 200
-    await context.bot.send_message(user_id, "⏳ Submitting UPI...", parse_mode="HTML")
-    upi_success, upi_result = await submit_upi(user_key, data_key, upi_number, jwt_token=jwt_token)
-    print(f"SUBMIT UPI RESULT: {json.dumps(upi_result, indent=2)}")
-    if not upi_success:
-        # First attempt may return 400 per HAR spec - retry once
-        print("UPI first attempt returned non-200. Retrying once (per HAR pattern)...")
-        await asyncio.sleep(1)
-        upi_success, upi_result = await submit_upi(user_key, data_key, upi_number, jwt_token=jwt_token)
-        print(f"SUBMIT UPI RETRY RESULT: {json.dumps(upi_result, indent=2)}")
-    if not upi_success:
-        err = upi_result.get('message', 'UPI submission failed')
-        print(f"UPI SUBMISSION FAILED AFTER RETRY: {err}")
-        await update.message.reply_text(
-            f"❌ UPI submission failed.\nServer: {err}",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-    print("UPI SUBMISSION SUCCESS")
-
-    # ===== STEP 2: GET PACK PROGRESS =====
-    await asyncio.sleep(0.5)
-    await context.bot.send_message(user_id, "⏳ Checking pack progress...", parse_mode="HTML")
-    pack_prog_success, pack_prog_result = await get_pack_progress(user_key, data_key, jwt_token=jwt_token)
-    print(f"GET PACK PROGRESS RESULT: {json.dumps(pack_prog_result, indent=2)}")
-    if not pack_prog_success:
-        err = pack_prog_result.get('message', 'Pack progress check failed')
-        print(f"PACK PROGRESS CHECK FAILED: {err}")
-        await update.message.reply_text(
-            f"❌ Pack progress check failed.\nServer: {err}",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-    print("PACK PROGRESS CHECK SUCCESS")
-
-    # ===== STEP 3: GET STICK PROGRESS =====
-    await asyncio.sleep(0.5)
-    await context.bot.send_message(user_id, "⏳ Checking stick progress...", parse_mode="HTML")
-    stick_prog_success, stick_prog_result = await get_stick_progress(user_key, data_key, jwt_token=jwt_token)
-    print(f"GET STICK PROGRESS RESULT: {json.dumps(stick_prog_result, indent=2)}")
-    if not stick_prog_success:
-        err = stick_prog_result.get('message', 'Stick progress check failed')
-        print(f"STICK PROGRESS CHECK FAILED: {err}")
-        await update.message.reply_text(
-            f"❌ Stick progress check failed.\nServer: {err}",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-    print("STICK PROGRESS CHECK SUCCESS")
-
-    # ===== STEP 4: CLICK TRACK =====
-    await asyncio.sleep(0.5)
-    await context.bot.send_message(user_id, "⏳ Finalizing...", parse_mode="HTML")
-    track_success, track_result = await click_track(user_key, data_key, jwt_token=jwt_token)
-    print(f"CLICK TRACK RESULT: {json.dumps(track_result, indent=2)}")
-    if not track_success:
-        err = track_result.get('message', 'Track click failed')
-        print(f"CLICK TRACK FAILED: {err}")
-        await update.message.reply_text(
-            f"❌ Finalization failed.\nServer: {err}",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return ConversationHandler.END
-    print("CLICK TRACK SUCCESS")
-
-    # ===== ALL STEPS PASSED - Record success =====
-    update_user(user_id, upi_number=upi_number)
-    add_process(user_id, REWARD_PER_PROCESS, upi_number)
-
-    await update.message.reply_text(
-        "✅ **Process Completed Successfully**\n\n"
-        "💸 Your payment will be credited to your registered UPI number within 24\u201348 hours.\n\n"
-        f"📱 UPI Number: {upi_number}\n"
-        f"💰 Amount: \u20b9{REWARD_PER_PROCESS}\n"
-        f"📅 Date: {datetime.now().strftime('%d-%m-%Y %H:%M')}",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-    )
-
-    try:
-        db_user = get_user(user_id)
-        stats = get_total_stats()
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"🎯 **New Process Completed!**\n\n"
-            f"👤 User: {db_user.get('first_name')} (ID: {user_id})\n"
-            f"📱 Phone: {db_user.get('phone')}\n"
-            f"💳 UPI: {upi_number}\n"
-            f"💰 Reward: \u20b9{REWARD_PER_PROCESS}\n"
-            f"📊 Total: {stats['total_processes']}",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        print(f"ADMIN NOTIFICATION FAILED: {e}")
-
-    return ConversationHandler.END
-
-async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard(user_id == ADMIN_ID))
-    return ConversationHandler.END
-
-# ==================== MENU FUNCTIONS ====================
-async def refer_earn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    db_user = get_user(user_id)
-    bot_info = await context.bot.get_me()
-    ref_link = f"https://t.me/{bot_info.username}?start=ref_{db_user['referral_code']}"
-
-    await update.message.reply_text(
-        f"🔗 **Refer & Earn**\n\n"
-        f"👥 Your Referral Link:\n"
-        f"<code>{ref_link}</code>\n\n"
-        f"📊 Your Stats:\n"
-        f"• Referrals: {db_user['referrals_count']}\n"
-        f"• Process Credits: {db_user['process_credits']}\n\n"
-        f"💡 **How it works:**\n"
-        f"• Each friend who joins = 1 referral\n"
-        f"• Every {REFERRAL_REQUIRED} referral = 1 Process Credit\n"
-        f"• Each Process = \u20b9{REWARD_PER_PROCESS}\n\n"
-        f"Share your link and earn!",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-    )
-
-async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    db_user = get_user(user_id)
-    get_today_reset(user_id)
-    db_user = get_user(user_id)
-    stats = get_total_stats()
-
-    await update.message.reply_text(
-        f"📊 **Dashboard**\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 **Your Stats:**\n"
-        f"• Name: {db_user['first_name']}\n"
-        f"• 👥 Referrals: {db_user['referrals_count']}\n"
-        f"• 💳 Process Credits: {db_user['process_credits']}\n"
-        f"• ✅ Processes: {db_user['total_processes']}\n"
-        f"• 🎁 Rewards: \u20b9{db_user['total_rewards']}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📅 **Today:**\n"
-        f"• Today's Processes: {db_user['today_processes']}\n"
-        f"• Today's Completed: {db_user['today_completed']}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📊 **Overall:**\n"
-        f"• Total Users: {stats['total_users']}\n"
-        f"• Total Processes: {stats['total_processes']}\n"
-        f"• Completed: {stats['total_completed']}\n"
-        f"• Pending: {stats['pending']}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-    )
-
-async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"📞 **Support**\n\n"
-        f"Need help? Join our support group:\n\n"
-        f"💬 @{GROUP_USERNAME}\n\n"
-        f"Click the link above to open Telegram and join the group.\n"
-        f"Our team will assist you within 24 hours.",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(update.effective_user.id == ADMIN_ID)
-    )
-
-# ==================== ADMIN COMMANDS ====================
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ Unauthorized!")
-        return
-
-    context.user_data['admin_mode'] = True
-    stats = get_total_stats()
-    await update.message.reply_text(
-        f"👑 **Admin Panel**\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📊 **Quick Stats:**\n"
-        f"• Total Users: {stats['total_users']}\n"
-        f"• Total Processes: {stats['total_processes']}\n"
-        f"• Completed: {stats['total_completed']}\n"
-        f"• Pending: {stats['pending']}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Select an option:",
-        parse_mode="HTML",
-        reply_markup=get_admin_keyboard()
-    )
-
-async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        return
-
-    text = update.message.text
-
-    if text == "📊 Admin Stats":
-        stats = get_total_stats()
-        await update.message.reply_text(
-            f"📊 **Statistics**\n\n"
-            f"👥 Total Users: {stats['total_users']}\n"
-            f"📋 Total Processes: {stats['total_processes']}\n"
-            f"✅ Completed: {stats['total_completed']}\n"
-            f"⏳ Pending: {stats['pending']}",
-            parse_mode="HTML",
-            reply_markup=get_admin_keyboard()
-        )
-        return
-
-    if text == "👥 Users List":
-        users = get_all_users()
-        if not users:
-            await update.message.reply_text("No users found.", reply_markup=get_admin_keyboard())
-            return
-        text_msg = "👤 **Users List:**\n\n"
-        for uid, username, fname, phone, refs, credits, processes, banned in users[:20]:
-            name = fname or username or f"User_{uid}"
-            status = "🚫" if banned else "✅"
-            text_msg += f"{status} {name} - Ref: {refs} | Credits: {credits} | Processes: {processes}\n"
-        if len(users) > 20:
-            text_msg += f"\n... and {len(users) - 20} more"
-        await update.message.reply_text(text_msg, parse_mode="HTML", reply_markup=get_admin_keyboard())
-        return
-
-    if text == "➕ Add Credits":
-        context.user_data['admin_action'] = 'add_credits'
-        await update.message.reply_text(
-            "➕ **Add Process Credits**\n\n"
-            "Enter: `user_id amount`\n"
-            "Example: `123456789 5`\n\n"
-            "Send /cancel to abort.",
-            parse_mode="HTML"
-        )
-        return
-
-    if text == "➖ Remove Credits":
-        context.user_data['admin_action'] = 'remove_credits'
-        await update.message.reply_text(
-            "➖ **Remove Process Credits**\n\n"
-            "Enter: `user_id amount`\n"
-            "Example: `123456789 3`\n\n"
-            "Send /cancel to abort.",
-            parse_mode="HTML"
-        )
-        return
-
-    if text == "📢 Broadcast":
-        context.user_data['admin_action'] = 'broadcast'
-        await update.message.reply_text(
-            "📢 **Broadcast**\n\n"
-            "Send the message to broadcast to all users.\n"
-            "Send /cancel to abort.",
-            parse_mode="HTML"
-        )
-        return
-
-    if text == "📂 Export DB":
-        filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('SELECT * FROM users')
-        rows = c.fetchall()
-        conn.close()
-        with open(filename, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['user_id', 'username', 'first_name', 'phone', 'upi_number',
-                           'referrals_count', 'process_credits', 'total_processes', 'total_rewards'])
-            for row in rows:
-                writer.writerow(row[:9])
-        with open(filename, 'rb') as f:
-            await update.message.reply_document(document=f, filename=filename)
-        os.remove(filename)
-        await update.message.reply_text("✅ Database exported!", reply_markup=get_admin_keyboard())
-        return
-
-    if text == "🔙 Back to Menu":
-        context.user_data['admin_mode'] = False
-        context.user_data['admin_action'] = None
-        await update.message.reply_text(
-            "👋 Welcome back!",
-            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
-        )
-        return
-
-    # If none matched, it might be input for admin action
-    await admin_input_handler(update, context)
-
-async def admin_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        return
-
-    text = update.message.text
-    action = context.user_data.get('admin_action')
-
-    if not action:
-        return
-
-    if text.lower() == '/cancel':
-        context.user_data['admin_action'] = None
-        await update.message.reply_text("Cancelled.", reply_markup=get_admin_keyboard())
-        return
-
-    if action == 'add_credits':
-        parts = text.split()
-        if len(parts) != 2:
-            await update.message.reply_text("❌ Invalid format. Use: `user_id amount`", parse_mode="HTML")
-            return
-        try:
-            target_id = int(parts[0])
-            amount = int(parts[1])
-            add_process_credits(target_id, amount)
-            await update.message.reply_text(
-                f"✅ Added {amount} Process Credits to user {target_id}",
-                reply_markup=get_admin_keyboard()
-            )
-        except:
-            await update.message.reply_text("❌ Invalid input.", reply_markup=get_admin_keyboard())
-        context.user_data['admin_action'] = None
-        return
-
-    if action == 'remove_credits':
-        parts = text.split()
-        if len(parts) != 2:
-            await update.message.reply_text("❌ Invalid format. Use: `user_id amount`", parse_mode="HTML")
-            return
-        try:
-            target_id = int(parts[0])
-            amount = int(parts[1])
-            add_process_credits(target_id, -amount)
-            await update.message.reply_text(
-                f"✅ Removed {amount} Process Credits from user {target_id}",
-                reply_markup=get_admin_keyboard()
-            )
-        except:
-            await update.message.reply_text("❌ Invalid input.", reply_markup=get_admin_keyboard())
-        context.user_data['admin_action'] = None
-        return
-
-    if action == 'broadcast':
-        users = get_all_users()
-        success = 0
-        failed = 0
-        for uid, username, fname, phone, refs, credits, processes, banned in users:
-            if banned:
-                continue
-            try:
-                await context.bot.send_message(
-                    uid,
-                    f"📢 **Announcement**\n\n{text}",
-                    parse_mode="HTML"
-                )
-                success += 1
-            except:
-                failed += 1
-            await asyncio.sleep(0.05)
-        await update.message.reply_text(
-            f"✅ Broadcast Complete!\n\nSent: {success}\nFailed: {failed}",
-            reply_markup=get_admin_keyboard()
-        )
-        context.user_data['admin_action'] = None
-        return
-
-    await update.message.reply_text("Unknown command.", reply_markup=get_admin_keyboard())
-
-# ==================== MAIN ====================
+# ============================================================
+# MAIN
+# ============================================================
 def main():
-    application = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex('^🏠 Start Process$'), start_process)],
+        entry_points=[
+            MessageHandler(filters.Text("🏠 Start Process"), start_process),
+            CommandHandler("startprocess", start_process),
+        ],
         states={
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_handler)],
-            OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, otp_handler)],
-            UPI: [MessageHandler(filters.TEXT & ~filters.COMMAND, upi_handler)],
+            ASK_MOBILE: [
+                MessageHandler(filters.Text("❌ Cancel"), cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_mobile),
+            ],
+            ASK_OTP: [
+                MessageHandler(filters.Text("❌ Cancel"), cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_otp),
+            ],
+            ASK_UPI: [
+                MessageHandler(filters.Text("❌ Cancel"), cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_upi),
+            ],
         },
-        fallbacks=[CommandHandler('cancel', cancel_handler)],
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,
     )
 
-    application.add_handler(conv_handler)
-    application.add_handler(CommandHandler('start', start_command))
-    application.add_handler(CommandHandler('admin', admin_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("support", support))
+    app.add_handler(CommandHandler("dashboard", dashboard))
+    app.add_handler(CommandHandler("refer", refer))
+    app.add_handler(CommandHandler("stats", admin_stats))
+    app.add_handler(CommandHandler("addcredits", admin_add_credits))
+    app.add_handler(CommandHandler("broadcast", admin_broadcast))
 
-    print("=" * 60)
-    print("SALY V2 - TELEGRAM BOT")
-    print("=" * 60)
-    print(f"Bot Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Admin ID: {ADMIN_ID}")
-    print(f"Channel: @{CHANNEL_USERNAME}")
-    print(f"Group: @{GROUP_USERNAME}")
-    print("=" * 60)
+    app.add_handler(conv_handler)
 
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Non-conversation menu items
+    app.add_handler(MessageHandler(
+        filters.Text(["👥 Refer & Earn", "📊 Dashboard", "📞 Support"]),
+        menu_handler
+    ))
+
+    logger.info("🤖 Bot started polling...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
