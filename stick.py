@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 SLAY YOUR PLAY - TELEGRAM BOT
-Complete automated claim bot with referral system, force join, and auto upload
+Clean, professional bot with Reply Keyboard, OTP fix, and hidden process credit system
 """
 
 import os
@@ -18,7 +18,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple, List
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -40,8 +40,8 @@ CHANNEL_USERNAME = "viedietlooters"
 GROUP_USERNAME = "viedietlooterschat"
 IMAGE_URL = "https://cdn.phototourl.com/free/2026-07-28-56446cd9-7512-40c6-b11e-e66ceb923351.jpg"
 IMAGE_NAME = "photo_2026-07-28_11-11-35.jpg"
-REFERRAL_REQUIRED = 2
-REWARD_PER_UPLOAD = 20
+REFERRAL_REQUIRED = 1  # 1 referral = 1 process credit
+REWARD_PER_PROCESS = 20
 
 # ==================== DATABASE ====================
 DB_PATH = "slayyourplay.db"
@@ -61,13 +61,13 @@ def init_db():
         referral_code TEXT UNIQUE,
         referred_by INTEGER DEFAULT NULL,
         referrals_count INTEGER DEFAULT 0,
-        upload_balance INTEGER DEFAULT 0,
-        total_claims INTEGER DEFAULT 0,
-        successful_uploads INTEGER DEFAULT 0,
+        process_credits INTEGER DEFAULT 0,
+        total_processes INTEGER DEFAULT 0,
+        successful_processes INTEGER DEFAULT 0,
         total_rewards INTEGER DEFAULT 0,
-        today_claims INTEGER DEFAULT 0,
-        today_uploads INTEGER DEFAULT 0,
-        last_claim_date TEXT,
+        today_processes INTEGER DEFAULT 0,
+        today_completed INTEGER DEFAULT 0,
+        last_process_date TEXT,
         is_banned INTEGER DEFAULT 0,
         registered_at TEXT,
         last_activity TEXT
@@ -82,25 +82,15 @@ def init_db():
         is_valid INTEGER DEFAULT 1
     )''')
     
-    # Claims table
-    c.execute('''CREATE TABLE IF NOT EXISTS claims (
+    # Processes table
+    c.execute('''CREATE TABLE IF NOT EXISTS processes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
-        claim_type TEXT,
         status TEXT DEFAULT 'pending',
         reward INTEGER DEFAULT 0,
         upi_number TEXT,
         created_at TEXT,
-        processed_at TEXT
-    )''')
-    
-    # Upload logs
-    c.execute('''CREATE TABLE IF NOT EXISTS upload_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        image_name TEXT,
-        status TEXT,
-        uploaded_at TEXT
+        completed_at TEXT
     )''')
     
     conn.commit()
@@ -126,13 +116,13 @@ def get_user(user_id: int) -> Optional[Dict]:
             'referral_code': row[6],
             'referred_by': row[7],
             'referrals_count': row[8],
-            'upload_balance': row[9],
-            'total_claims': row[10],
-            'successful_uploads': row[11],
+            'process_credits': row[9],
+            'total_processes': row[10],
+            'successful_processes': row[11],
             'total_rewards': row[12],
-            'today_claims': row[13],
-            'today_uploads': row[14],
-            'last_claim_date': row[15],
+            'today_processes': row[13],
+            'today_completed': row[14],
+            'last_process_date': row[15],
             'is_banned': row[16],
             'registered_at': row[17],
             'last_activity': row[18]
@@ -165,10 +155,10 @@ def update_user(user_id: int, **kwargs):
     conn.commit()
     conn.close()
 
-def add_upload_balance(user_id: int, amount: int):
+def add_process_credits(user_id: int, amount: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('UPDATE users SET upload_balance = upload_balance + ? WHERE user_id = ?', (amount, user_id))
+    c.execute('UPDATE users SET process_credits = process_credits + ? WHERE user_id = ?', (amount, user_id))
     conn.commit()
     conn.close()
 
@@ -180,31 +170,31 @@ def add_referral(referrer_id: int, referred_id: int):
         c.execute('INSERT INTO referrals (referrer_id, referred_id, referred_at) VALUES (?, ?, ?)',
                   (referrer_id, referred_id, now))
         c.execute('UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id = ?', (referrer_id,))
-        # Check if referral milestone reached
+        # Check if referral milestone reached (every 1 referral = 1 credit)
         c.execute('SELECT referrals_count FROM users WHERE user_id = ?', (referrer_id,))
         count = c.fetchone()[0]
         if count % REFERRAL_REQUIRED == 0:
-            add_upload_balance(referrer_id, 1)
+            add_process_credits(referrer_id, 1)
         conn.commit()
     except sqlite3.IntegrityError:
         pass
     conn.close()
 
-def add_claim(user_id: int, reward: int, upi_number: str):
+def add_process(user_id: int, reward: int, upi_number: str):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     now = datetime.now().isoformat()
-    c.execute('''INSERT INTO claims (user_id, claim_type, status, reward, upi_number, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?)''',
-              (user_id, 'upload', 'pending', reward, upi_number, now))
+    c.execute('''INSERT INTO processes (user_id, status, reward, upi_number, created_at)
+                 VALUES (?, ?, ?, ?, ?)''',
+              (user_id, 'completed', reward, upi_number, now))
     c.execute('''UPDATE users SET 
-                 total_claims = total_claims + 1,
-                 successful_uploads = successful_uploads + 1,
+                 total_processes = total_processes + 1,
+                 successful_processes = successful_processes + 1,
                  total_rewards = total_rewards + ?,
-                 today_claims = today_claims + 1,
-                 today_uploads = today_uploads + 1,
-                 last_claim_date = ?,
-                 upload_balance = upload_balance - 1
+                 today_processes = today_processes + 1,
+                 today_completed = today_completed + 1,
+                 last_process_date = ?,
+                 process_credits = process_credits - 1
                  WHERE user_id = ?''',
               (reward, now, user_id))
     conn.commit()
@@ -214,12 +204,11 @@ def get_today_reset(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     today = datetime.now().date().isoformat()
-    c.execute('SELECT last_claim_date FROM users WHERE user_id = ?', (user_id,))
+    c.execute('SELECT last_process_date FROM users WHERE user_id = ?', (user_id,))
     row = c.fetchone()
     if row and row[0] and row[0].startswith(today):
         return False
-    # Reset daily counters
-    c.execute('UPDATE users SET today_claims = 0, today_uploads = 0 WHERE user_id = ?', (user_id,))
+    c.execute('UPDATE users SET today_processes = 0, today_completed = 0 WHERE user_id = ?', (user_id,))
     conn.commit()
     conn.close()
     return True
@@ -237,31 +226,30 @@ def get_total_stats():
     c = conn.cursor()
     c.execute('SELECT COUNT(*) FROM users')
     total_users = c.fetchone()[0]
-    c.execute('SELECT SUM(total_claims) FROM users')
-    total_claims = c.fetchone()[0] or 0
-    c.execute('SELECT SUM(successful_uploads) FROM users')
-    total_uploads = c.fetchone()[0] or 0
-    c.execute('SELECT COUNT(*) FROM claims WHERE status = "pending"')
-    pending_claims = c.fetchone()[0]
+    c.execute('SELECT SUM(total_processes) FROM users')
+    total_processes = c.fetchone()[0] or 0
+    c.execute('SELECT SUM(successful_processes) FROM users')
+    total_completed = c.fetchone()[0] or 0
+    c.execute('SELECT COUNT(*) FROM processes WHERE status = "pending"')
+    pending = c.fetchone()[0]
     conn.close()
     return {
         'total_users': total_users,
-        'total_claims': total_claims,
-        'total_uploads': total_uploads,
-        'pending_claims': pending_claims
+        'total_processes': total_processes,
+        'total_completed': total_completed,
+        'pending': pending
     }
 
 def get_all_users():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('SELECT user_id, username, first_name, phone, referrals_count, upload_balance, total_claims, is_banned FROM users ORDER BY registered_at DESC')
+    c.execute('SELECT user_id, username, first_name, phone, referrals_count, process_credits, total_processes, is_banned FROM users ORDER BY registered_at DESC')
     rows = c.fetchall()
     conn.close()
     return rows
 
 # ==================== API FUNCTIONS ====================
 async def api_request(method: str, endpoint: str, user_key: str = None, data: dict = None, files: dict = None, token: str = None) -> Tuple[bool, dict]:
-    """Make API request with retry logic"""
     url = f"{BASE_URL}{endpoint}"
     if user_key:
         url = url.replace('{userKey}', user_key)
@@ -297,45 +285,35 @@ async def api_request(method: str, endpoint: str, user_key: str = None, data: di
     return False, {'error': 'Max retries exceeded'}
 
 async def register_user(phone: str) -> Tuple[bool, dict]:
-    """Register user with phone number"""
     return await api_request('POST', '/api/users/register/{userKey}', phone, {'phone': phone})
 
 async def send_otp(phone: str) -> Tuple[bool, dict]:
-    """Send OTP to phone"""
     return await api_request('POST', '/api/users/sendOTP/{userKey}', phone, {'phone': phone})
 
 async def verify_otp(phone: str, otp: str) -> Tuple[bool, dict]:
-    """Verify OTP and get token"""
     return await api_request('POST', '/api/users/verifyOTP/{userKey}', phone, {'phone': phone, 'otp': otp})
 
 async def select_pack(phone: str, token: str) -> Tuple[bool, dict]:
-    """Select pack automatically"""
-    # Try to get available packs first
     success, result = await api_request('POST', '/api/users/getPackProgress/{userKey}', phone, token=token)
     if success:
         packs = result.get('data', {}).get('packs', [])
         if packs:
-            # Select first available pack
             pack_id = packs[0].get('id')
             if pack_id:
                 return await api_request('POST', '/api/users/selectPack/{userKey}', phone, {'packId': pack_id}, token=token)
     return await api_request('POST', '/api/users/selectPack/{userKey}', phone, {}, token=token)
 
 async def select_vibe(phone: str, token: str) -> Tuple[bool, dict]:
-    """Select vibe/stick automatically"""
     return await api_request('POST', '/api/users/selectVibe/{userKey}', phone, {}, token=token)
 
 async def upload_image(phone: str, token: str, image_data: bytes, image_name: str) -> Tuple[bool, dict]:
-    """Upload image to API"""
     files = {'media': (image_name, image_data, 'image/jpeg')}
     return await api_request('POST', '/api/users/uploadImage/{userKey}', phone, data={}, files=files, token=token)
 
 async def submit_upi(phone: str, upi_number: str, token: str) -> Tuple[bool, dict]:
-    """Submit UPI number"""
     return await api_request('POST', '/api/users/getUpiNo/{userKey}', phone, {'upi': upi_number}, token=token)
 
 async def download_image(url: str) -> Tuple[bool, bytes]:
-    """Download image from URL"""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=30) as resp:
@@ -350,19 +328,16 @@ PHONE, OTP, UPI = range(3)
 
 # ==================== FORCE JOIN CHECK ====================
 async def check_force_join(user_id: int) -> Tuple[bool, bool]:
-    """Check if user joined channel and group"""
     channel_joined = False
     group_joined = False
     
     try:
-        # Check channel
         member = await application.bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
         channel_joined = member.status in ['member', 'administrator', 'creator']
     except:
         pass
     
     try:
-        # Check group
         member = await application.bot.get_chat_member(f"@{GROUP_USERNAME}", user_id)
         group_joined = member.status in ['member', 'administrator', 'creator']
     except:
@@ -378,6 +353,18 @@ def get_force_join_keyboard():
     ])
     return kb
 
+# ==================== REPLY KEYBOARD ====================
+def get_main_keyboard(is_admin: bool = False):
+    buttons = [
+        ["🏠 Start Process"],
+        ["👥 Refer & Earn"],
+        ["📊 Dashboard"],
+        ["📞 Support"]
+    ]
+    if is_admin:
+        buttons.append(["🔐 Admin Panel"])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
 # ==================== COMMAND HANDLERS ====================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -385,13 +372,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = user.username or ""
     first_name = user.first_name or "User"
     
-    # Check ban
     db_user = get_user(user_id)
     if db_user and db_user.get('is_banned'):
         await update.message.reply_text("🚫 You are banned from using this bot.")
         return
     
-    # Check force join
     channel_joined, group_joined = await check_force_join(user_id)
     if not channel_joined or not group_joined:
         msg = "🔒 **Access Restricted**\n\n"
@@ -403,7 +388,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, reply_markup=get_force_join_keyboard(), parse_mode="HTML")
         return
     
-    # Create user if not exists
     if not db_user:
         create_user(user_id, username, first_name)
         db_user = get_user(user_id)
@@ -414,88 +398,67 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         referrer_id = get_user_by_referral_code(ref_code)
         if referrer_id and referrer_id != user_id:
             add_referral(referrer_id, user_id)
-            # Notify referrer
             try:
                 await application.bot.send_message(
                     referrer_id,
                     f"🎉 **New Referral!**\n\n"
                     f"@{username or first_name} joined using your referral link.\n"
                     f"Referrals: {get_user(referrer_id)['referrals_count']}\n"
-                    f"Upload Balance: {get_user(referrer_id)['upload_balance']}",
+                    f"Process Credits: {get_user(referrer_id)['process_credits']}",
                     parse_mode="HTML"
                 )
             except:
                 pass
     
-    await show_main_menu(update, context)
+    is_admin = (user_id == ADMIN_ID)
+    await update.message.reply_text(
+        f"👋 Welcome, {first_name}!\n\n"
+        f"Select an option below to get started.",
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard(is_admin)
+    )
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    
+    if text == "🏠 Start Process":
+        await start_process(update, context)
+    elif text == "👥 Refer & Earn":
+        await refer_earn(update, context)
+    elif text == "📊 Dashboard":
+        await dashboard(update, context)
+    elif text == "📞 Support":
+        await support(update, context)
+    elif text == "🔐 Admin Panel":
+        await admin_command(update, context)
+    else:
+        await update.message.reply_text("Please use the buttons below.", reply_markup=get_main_keyboard())
+
+# ==================== START PROCESS ====================
+async def start_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db_user = get_user(user_id)
     
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Start Claim", callback_data="start_claim")],
-        [InlineKeyboardButton("👥 Refer & Earn", callback_data="refer")],
-        [InlineKeyboardButton("💰 Upload Balance", callback_data="balance")],
-        [InlineKeyboardButton("📊 Dashboard", callback_data="dashboard")],
-        [InlineKeyboardButton("🎁 Rewards", callback_data="rewards")],
-        [InlineKeyboardButton("📞 Support", callback_data="support")]
-    ])
-    
-    text = f"""
-🏠 **Home**
-
-Welcome back, {db_user['first_name']}! 👋
-
-📊 Quick Stats:
-• 👥 Referrals: {db_user['referrals_count']}
-• 🖼 Upload Balance: {db_user['upload_balance']}
-• ✅ Claims: {db_user['total_claims']}
-• 🎁 Rewards: {db_user['total_rewards']}
-
-Select an option below:
-"""
-    
-    if update.message:
-        await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
-
-# ==================== CLAIM FLOW ====================
-async def start_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    
-    db_user = get_user(user_id)
-    
-    # Check upload balance
-    if db_user['upload_balance'] <= 0:
-        await query.edit_message_text(
-            "❌ You don't have any upload balance.\n\n"
-            f"Invite **{REFERRAL_REQUIRED} friends** to unlock 1 image upload.\n\n"
-            f"Current Referrals: {db_user['referrals_count']}\n"
-            f"Need: {REFERRAL_REQUIRED - (db_user['referrals_count'] % REFERRAL_REQUIRED)} more for next upload.",
+    if db_user.get('process_credits', 0) <= 0:
+        await update.message.reply_text(
+            f"❌ You don't have any Process Credits.\n\n"
+            f"Invite **{REFERRAL_REQUIRED} friend** to unlock one new process.\n\n"
+            f"Current Referrals: {db_user['referrals_count']}",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔗 Get Referral Link", callback_data="refer")],
-                [InlineKeyboardButton("🔙 Back", callback_data="home")]
-            ])
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
         )
         return
     
-    # Check if already has phone
     if db_user.get('phone'):
-        await query.edit_message_text(
-            "📱 You're already registered!\n"
-            "Starting claim process...",
+        await update.message.reply_text(
+            "📱 Starting process...",
             parse_mode="HTML"
         )
-        await process_claim(query.from_user.id, context)
+        await process_claim(user_id, context)
         return
     
-    # Start phone registration
-    await query.edit_message_text(
+    await update.message.reply_text(
         "📱 **Enter your mobile number**\n\n"
         "Please enter your 10-digit mobile number:\n"
         "(Example: 9876543210)\n\n"
@@ -510,7 +473,7 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     
     if phone.lower() == '/cancel':
-        await update.message.reply_text("❌ Claim cancelled.")
+        await update.message.reply_text("❌ Cancelled.", reply_markup=get_main_keyboard(user_id == ADMIN_ID))
         return ConversationHandler.END
     
     if not phone.isdigit() or len(phone) != 10:
@@ -521,10 +484,7 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return PHONE
     
-    # Register user
     context.user_data['phone'] = phone
-    
-    # Save phone to database
     update_user(user_id, phone=phone)
     
     # Register with API
@@ -533,7 +493,8 @@ async def phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ Registration failed: {result.get('message', 'Unknown error')}\n\n"
             "Please try again later.",
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
         )
         return ConversationHandler.END
     
@@ -561,7 +522,7 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = context.user_data.get('phone')
     
     if otp.lower() == '/cancel':
-        await update.message.reply_text("❌ OTP verification cancelled.")
+        await update.message.reply_text("❌ Cancelled.", reply_markup=get_main_keyboard(user_id == ADMIN_ID))
         return ConversationHandler.END
     
     if not otp.isdigit() or len(otp) != 6:
@@ -572,7 +533,6 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return OTP
     
-    # Verify OTP
     success, result = await verify_otp(phone, otp)
     if not success:
         await update.message.reply_text(
@@ -582,23 +542,20 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return OTP
     
-    # Save JWT token
     token = result.get('accessToken')
     if token:
         update_user(user_id, jwt_token=token)
     
     await update.message.reply_text(
-        "✅ **OTP Verified Successfully!**\n\n"
-        "🔄 Processing your claim automatically...",
+        "✅ **Verified Successfully!**\n\n"
+        "🔄 Processing...",
         parse_mode="HTML"
     )
     
-    # Process claim automatically
     await process_claim(user_id, context)
     return ConversationHandler.END
 
 async def process_claim(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Automatic claim process - all steps happen here without user input"""
     db_user = get_user(user_id)
     phone = db_user.get('phone')
     token = db_user.get('jwt_token')
@@ -607,94 +564,57 @@ async def process_claim(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             user_id,
             "❌ Missing authentication. Please start over.",
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
         )
         return
     
-    # Step 1: Select Pack (automatic)
-    await context.bot.send_message(
-        user_id,
-        "📦 Selecting best pack for you...",
-        parse_mode="HTML"
-    )
-    
+    # Step 1: Select Pack
+    await context.bot.send_message(user_id, "📦 Processing...", parse_mode="HTML")
     success, result = await select_pack(phone, token)
     if not success:
         await context.bot.send_message(
             user_id,
-            f"⚠️ Pack selection issue: {result.get('message', 'Unknown')}\n"
-            "Continuing with default pack...",
+            f"⚠️ Processing issue, continuing...",
             parse_mode="HTML"
         )
     
     await asyncio.sleep(1)
     
-    # Step 2: Select Vibe/Stick (automatic)
-    await context.bot.send_message(
-        user_id,
-        "🎯 Selecting vibe/stick for you...",
-        parse_mode="HTML"
-    )
-    
+    # Step 2: Select Vibe
     success, result = await select_vibe(phone, token)
-    if not success:
-        await context.bot.send_message(
-            user_id,
-            f"⚠️ Vibe selection issue: {result.get('message', 'Unknown')}\n"
-            "Continuing with default vibe...",
-            parse_mode="HTML"
-        )
-    
     await asyncio.sleep(1)
     
-    # Step 3: Download image (automatic)
-    await context.bot.send_message(
-        user_id,
-        "📥 Downloading image for upload...",
-        parse_mode="HTML"
-    )
-    
+    # Step 3: Download image
     success, image_data = await download_image(IMAGE_URL)
     if not success or not image_data:
         await context.bot.send_message(
             user_id,
-            "❌ Failed to download image. Please try again later.",
-            parse_mode="HTML"
+            "❌ Failed to download. Please try again later.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
         )
         return
     
-    await asyncio.sleep(1)
-    
-    # Step 4: Upload image (automatic)
-    await context.bot.send_message(
-        user_id,
-        "📤 Uploading image...",
-        parse_mode="HTML"
-    )
-    
+    # Step 4: Upload image
     success, result = await upload_image(phone, token, image_data, IMAGE_NAME)
     if not success:
         await context.bot.send_message(
             user_id,
-            f"❌ Image upload failed: {result.get('message', 'Unknown error')}\n\n"
+            f"❌ Upload failed: {result.get('message', 'Unknown error')}\n\n"
             "Please try again later.",
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(user_id == ADMIN_ID)
         )
         return
-    
-    await context.bot.send_message(
-        user_id,
-        "✅ Image uploaded successfully!",
-        parse_mode="HTML"
-    )
     
     await asyncio.sleep(1)
     
     # Step 5: Ask UPI number
     await context.bot.send_message(
         user_id,
-        "📱 **Enter your UPI registered mobile number.**\n\n"
-        "Please enter the mobile number linked to your UPI:\n"
+        "📱 **Please enter your UPI-registered mobile number.**\n\n"
+        "This is the number linked to your UPI account:\n"
         "(Example: 9876543210)\n\n"
         "Send /cancel to abort.",
         parse_mode="HTML"
@@ -707,7 +627,7 @@ async def upi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upi_number = update.message.text.strip()
     
     if upi_number.lower() == '/cancel':
-        await update.message.reply_text("❌ Claim cancelled.")
+        await update.message.reply_text("❌ Cancelled.", reply_markup=get_main_keyboard(user_id == ADMIN_ID))
         return ConversationHandler.END
     
     if not upi_number.isdigit() or len(upi_number) != 10:
@@ -722,46 +642,38 @@ async def upi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = db_user.get('phone')
     token = db_user.get('jwt_token')
     
-    # Save UPI number
     update_user(user_id, upi_number=upi_number)
-    
-    # Submit UPI number to API
     success, result = await submit_upi(phone, upi_number, token)
-    
-    # Add claim record
-    add_claim(user_id, REWARD_PER_UPLOAD, upi_number)
+    add_process(user_id, REWARD_PER_PROCESS, upi_number)
     
     await update.message.reply_text(
         f"""
-✅ **Claim Submitted Successfully**
+✅ **Process Completed Successfully**
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-💸 Your reward/payment will be credited to your registered UPI number within 24–48 hours.
+💸 Your payment will be credited to your registered UPI number within 24–48 hours.
 
 📱 UPI Number: {upi_number}
-💰 Reward: ₹{REWARD_PER_UPLOAD}
+💰 Amount: ₹{REWARD_PER_PROCESS}
 📅 Date: {datetime.now().strftime('%d-%m-%Y %H:%M')}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """,
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🏠 Home", callback_data="home")]
-        ])
+        reply_markup=get_main_keyboard(user_id == ADMIN_ID)
     )
     
-    # Notify admin
     try:
         stats = get_total_stats()
         await application.bot.send_message(
             ADMIN_ID,
-            f"🎯 **New Claim!**\n\n"
+            f"🎯 **New Process Completed!**\n\n"
             f"👤 User: {db_user.get('first_name')} (ID: {user_id})\n"
             f"📱 Phone: {phone}\n"
             f"💳 UPI: {upi_number}\n"
-            f"💰 Reward: ₹{REWARD_PER_UPLOAD}\n"
-            f"📊 Total Claims: {stats['total_claims']}",
+            f"💰 Reward: ₹{REWARD_PER_PROCESS}\n"
+            f"📊 Total: {stats['total_processes']}",
             parse_mode="HTML"
         )
     except:
@@ -770,48 +682,19 @@ async def upi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Operation cancelled.")
+    user_id = update.effective_user.id
+    await update.message.reply_text("❌ Cancelled.", reply_markup=get_main_keyboard(user_id == ADMIN_ID))
     return ConversationHandler.END
 
-# ==================== CALLBACK HANDLERS ====================
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+# ==================== MENU FUNCTIONS ====================
+async def refer_earn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db_user = get_user(user_id)
+    bot_info = await application.bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start=ref_{db_user['referral_code']}"
     
-    user_id = query.from_user.id
-    data = query.data
-    
-    if data == "check_join":
-        channel_joined, group_joined = await check_force_join(user_id)
-        if channel_joined and group_joined:
-            db_user = get_user(user_id)
-            if db_user and db_user.get('is_banned'):
-                await query.edit_message_text("🚫 You are banned from using this bot.")
-                return
-            await query.edit_message_text("✅ All joined! Welcome to Slay Your Play Bot!")
-            await show_main_menu(update, context)
-        else:
-            msg = "🔒 **Access Restricted**\n\n"
-            if not channel_joined:
-                msg += "❌ You haven't joined our channel.\n"
-            if not group_joined:
-                msg += "❌ You haven't joined our group.\n"
-            msg += "\nPlease join both to access the bot."
-            await query.edit_message_text(msg, reply_markup=get_force_join_keyboard(), parse_mode="HTML")
-    
-    elif data == "home":
-        await show_main_menu(update, context)
-    
-    elif data == "start_claim":
-        await start_claim(update, context)
-    
-    elif data == "refer":
-        db_user = get_user(user_id)
-        bot_info = await application.bot.get_me()
-        ref_link = f"https://t.me/{bot_info.username}?start=ref_{db_user['referral_code']}"
-        
-        await query.edit_message_text(
-            f"""
+    await update.message.reply_text(
+        f"""
 🔗 **Refer & Earn**
 
 👥 Your Referral Link:
@@ -819,146 +702,89 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📊 Your Stats:
 • Referrals: {db_user['referrals_count']}
-• Upload Balance: {db_user['upload_balance']}
+• Process Credits: {db_user['process_credits']}
 
 💡 **How it works:**
 • Each friend who joins = 1 referral
-• Every {REFERRAL_REQUIRED} referrals = 1 free upload
-• Each upload = ₹{REWARD_PER_UPLOAD}
+• Every {REFERRAL_REQUIRED} referral = 1 Process Credit
+• Each Process = ₹{REWARD_PER_PROCESS}
 
-Share your link with friends and earn rewards! 🎉
+Share your link and earn! 🎉
 """,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📤 Share Link", switch_inline_query=f"Join Slay Your Play and earn rewards! {ref_link}")],
-                [InlineKeyboardButton("🔙 Back", callback_data="home")]
-            ])
-        )
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+    )
+
+async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db_user = get_user(user_id)
+    get_today_reset(user_id)
+    db_user = get_user(user_id)
+    stats = get_total_stats()
     
-    elif data == "balance":
-        db_user = get_user(user_id)
-        await query.edit_message_text(
-            f"""
-💰 **Upload Balance**
-
-🖼 Available Uploads: {db_user['upload_balance']}
-
-📊 Referral Progress:
-• Referrals: {db_user['referrals_count']}
-• Next Upload: {REFERRAL_REQUIRED - (db_user['referrals_count'] % REFERRAL_REQUIRED)} more referrals
-
-Each upload gives you ₹{REWARD_PER_UPLOAD} reward! 🎁
-""",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔗 Refer & Earn", callback_data="refer")],
-                [InlineKeyboardButton("🔙 Back", callback_data="home")]
-            ])
-        )
-    
-    elif data == "dashboard":
-        db_user = get_user(user_id)
-        get_today_reset(user_id)
-        db_user = get_user(user_id)
-        stats = get_total_stats()
-        
-        await query.edit_message_text(
-            f"""
+    await update.message.reply_text(
+        f"""
 📊 **Dashboard**
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 👤 **Your Stats:**
 • Name: {db_user['first_name']}
-• Telegram ID: {user_id}
-• 📱 Phone: {db_user.get('phone', 'Not set')}
 • 👥 Referrals: {db_user['referrals_count']}
-• 🖼 Upload Balance: {db_user['upload_balance']}
-• ✅ Claims: {db_user['total_claims']}
+• 💳 Process Credits: {db_user['process_credits']}
+• ✅ Processes: {db_user['total_processes']}
 • 🎁 Rewards: ₹{db_user['total_rewards']}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 📅 **Today:**
-• Today's Claims: {db_user['today_claims']}
-• Today's Uploads: {db_user['today_uploads']}
+• Today's Processes: {db_user['today_processes']}
+• Today's Completed: {db_user['today_completed']}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📊 **Overall Statistics:**
+📊 **Overall:**
 • Total Users: {stats['total_users']}
-• Total Claims: {stats['total_claims']}
-• Successful Uploads: {stats['total_uploads']}
-• Pending Claims: {stats['pending_claims']}
+• Total Processes: {stats['total_processes']}
+• Completed: {stats['total_completed']}
+• Pending: {stats['pending']}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Refresh", callback_data="dashboard")],
-                [InlineKeyboardButton("🔙 Back", callback_data="home")]
-            ])
-        )
-    
-    elif data == "rewards":
-        db_user = get_user(user_id)
-        await query.edit_message_text(
-            f"""
-🎁 **Rewards**
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+    )
 
-Total Rewards: ₹{db_user['total_rewards']}
-
-📊 Reward Details:
-• Per Upload: ₹{REWARD_PER_UPLOAD}
-• Successful Uploads: {db_user['successful_uploads']}
-• Total Claims: {db_user['total_claims']}
-
-💡 Keep uploading to earn more rewards!
-""",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="home")]
-            ])
-        )
-    
-    elif data == "support":
-        await query.edit_message_text(
-            f"""
+async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Join Support Group", url=f"https://t.me/{GROUP_USERNAME}")]
+    ])
+    await update.message.reply_text(
+        f"""
 📞 **Support**
 
-Need help? Contact us:
+Need help? Join our support group:
 
-👑 Admin: @{get_admin_username()}
+💬 @{GROUP_USERNAME}
 
-📢 Channel: @{CHANNEL_USERNAME}
-👥 Group: @{GROUP_USERNAME}
-
-💬 Response time: Usually within 24 hours.
+Our team will assist you within 24 hours.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 **FAQ:**
-❓ How do I get upload balance?
-→ Invite {REFERRAL_REQUIRED} friends.
+❓ How do I get Process Credits?
+→ Invite {REFERRAL_REQUIRED} friend.
 
 ❓ How much do I earn?
-→ ₹{REWARD_PER_UPLOAD} per successful upload.
+→ ₹{REWARD_PER_PROCESS} per process.
 
 ❓ When do I get paid?
-→ Within 24-48 hours after claim.
+→ Within 24-48 hours.
 """,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="home")]
-            ])
-        )
-
-async def get_admin_username():
-    try:
-        admin = await application.bot.get_chat(ADMIN_ID)
-        return admin.username or "admin"
-    except:
-        return "admin"
+        parse_mode="HTML",
+        reply_markup=kb
+    )
 
 # ==================== ADMIN COMMANDS ====================
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -967,14 +793,12 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Unauthorized!")
         return
     
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("👤 User Management", callback_data="admin_users")],
-        [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
-        [InlineKeyboardButton("➕ Add Balance", callback_data="admin_add_balance")],
-        [InlineKeyboardButton("➖ Remove Balance", callback_data="admin_remove_balance")],
-        [InlineKeyboardButton("📂 Export DB", callback_data="admin_export")]
-    ])
+    kb = ReplyKeyboardMarkup([
+        ["📊 Admin Stats", "👥 Users List"],
+        ["➕ Add Credits", "➖ Remove Credits"],
+        ["📢 Broadcast", "📂 Export DB"],
+        ["🔙 Back"]
+    ], resize_keyboard=True)
     
     stats = get_total_stats()
     await update.message.reply_text(
@@ -985,9 +809,9 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📊 **Quick Stats:**
 • Total Users: {stats['total_users']}
-• Total Claims: {stats['total_claims']}
-• Total Uploads: {stats['total_uploads']}
-• Pending Claims: {stats['pending_claims']}
+• Total Processes: {stats['total_processes']}
+• Completed: {stats['total_completed']}
+• Pending: {stats['pending']}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -996,89 +820,89 @@ Select an option:
         parse_mode="HTML",
         reply_markup=kb
     )
+    context.user_data['admin_mode'] = True
 
-async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    
+async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     if user_id != ADMIN_ID:
-        await query.edit_message_text("❌ Unauthorized!")
         return
     
-    data = query.data
+    text = update.message.text
     
-    if data == "admin_stats":
+    if text == "🔙 Back":
+        context.user_data['admin_mode'] = False
+        await update.message.reply_text(
+            "👋 Welcome back!",
+            reply_markup=get_main_keyboard(True)
+        )
+        return
+    
+    if text == "📊 Admin Stats":
         stats = get_total_stats()
-        await query.edit_message_text(
+        await update.message.reply_text(
             f"""
 📊 **Statistics**
 
 👥 Total Users: {stats['total_users']}
-📋 Total Claims: {stats['total_claims']}
-🖼 Total Uploads: {stats['total_uploads']}
-⏳ Pending Claims: {stats['pending_claims']}
+📋 Total Processes: {stats['total_processes']}
+✅ Completed: {stats['total_completed']}
+⏳ Pending: {stats['pending']}
 """,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-            ])
+            parse_mode="HTML"
         )
+        return
     
-    elif data == "admin_users":
+    if text == "👥 Users List":
         users = get_all_users()
         if not users:
-            await query.edit_message_text("No users found.")
+            await update.message.reply_text("No users found.")
             return
         
         text = "👤 **Users List:**\n\n"
-        for uid, username, fname, phone, refs, balance, claims, banned in users[:20]:
+        for uid, username, fname, phone, refs, credits, processes, banned in users[:20]:
             name = fname or username or f"User_{uid}"
             status = "🚫" if banned else "✅"
-            text += f"{status} {name} - Ref: {refs} | Bal: {balance} | Claims: {claims}\n"
+            text += f"{status} {name} - Ref: {refs} | Credits: {credits} | Processes: {processes}\n"
         
         if len(users) > 20:
             text += f"\n... and {len(users) - 20} more"
         
-        await query.edit_message_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-            ])
-        )
+        await update.message.reply_text(text, parse_mode="HTML")
+        return
     
-    elif data == "admin_add_balance":
-        await query.edit_message_text(
-            "➕ **Add Upload Balance**\n\n"
+    if text == "➕ Add Credits":
+        await update.message.reply_text(
+            "➕ **Add Process Credits**\n\n"
             "Enter: `user_id amount`\n"
             "Example: `123456789 5`\n\n"
             "Send /cancel to abort.",
             parse_mode="HTML"
         )
-        context.user_data['admin_action'] = 'add_balance'
+        context.user_data['admin_action'] = 'add_credits'
+        return
     
-    elif data == "admin_remove_balance":
-        await query.edit_message_text(
-            "➖ **Remove Upload Balance**\n\n"
+    if text == "➖ Remove Credits":
+        await update.message.reply_text(
+            "➖ **Remove Process Credits**\n\n"
             "Enter: `user_id amount`\n"
             "Example: `123456789 3`\n\n"
             "Send /cancel to abort.",
             parse_mode="HTML"
         )
-        context.user_data['admin_action'] = 'remove_balance'
+        context.user_data['admin_action'] = 'remove_credits'
+        return
     
-    elif data == "admin_broadcast":
-        await query.edit_message_text(
+    if text == "📢 Broadcast":
+        await update.message.reply_text(
             "📢 **Broadcast**\n\n"
             "Send the message to broadcast to all users.\n"
             "Send /cancel to abort.",
             parse_mode="HTML"
         )
         context.user_data['admin_action'] = 'broadcast'
+        return
     
-    elif data == "admin_export":
-        # Export database
+    if text == "📂 Export DB":
         import csv
         filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         
@@ -1091,17 +915,16 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         with open(filename, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(['user_id', 'username', 'first_name', 'phone', 'upi_number', 
-                           'referrals_count', 'upload_balance', 'total_claims', 'total_rewards'])
+                           'referrals_count', 'process_credits', 'total_processes', 'total_rewards'])
             for row in rows:
-                writer.writerow(row[:9])  # First 9 columns
+                writer.writerow(row[:9])
         
         with open(filename, 'rb') as f:
-            await query.message.reply_document(document=f, filename=filename)
+            await update.message.reply_document(document=f, filename=filename)
         os.remove(filename)
         
-        await query.edit_message_text("✅ Database exported!", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-        ]))
+        await update.message.reply_text("✅ Database exported!")
+        return
 
 async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1119,7 +942,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ Cancelled.")
         return
     
-    if action == 'add_balance':
+    if action == 'add_credits':
         parts = text.split()
         if len(parts) != 2:
             await update.message.reply_text("❌ Invalid format. Use: `user_id amount`", parse_mode="HTML")
@@ -1127,14 +950,14 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             target_id = int(parts[0])
             amount = int(parts[1])
-            add_upload_balance(target_id, amount)
-            await update.message.reply_text(f"✅ Added {amount} upload balance to user {target_id}")
+            add_process_credits(target_id, amount)
+            await update.message.reply_text(f"✅ Added {amount} Process Credits to user {target_id}")
         except:
             await update.message.reply_text("❌ Invalid input.")
         context.user_data['admin_action'] = None
         await admin_command(update, context)
     
-    elif action == 'remove_balance':
+    elif action == 'remove_credits':
         parts = text.split()
         if len(parts) != 2:
             await update.message.reply_text("❌ Invalid format. Use: `user_id amount`", parse_mode="HTML")
@@ -1142,8 +965,8 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             target_id = int(parts[0])
             amount = int(parts[1])
-            add_upload_balance(target_id, -amount)
-            await update.message.reply_text(f"✅ Removed {amount} upload balance from user {target_id}")
+            add_process_credits(target_id, -amount)
+            await update.message.reply_text(f"✅ Removed {amount} Process Credits from user {target_id}")
         except:
             await update.message.reply_text("❌ Invalid input.")
         context.user_data['admin_action'] = None
@@ -1155,7 +978,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         failed = 0
         msg = await update.message.reply_text(f"📢 Broadcasting to {len(users)} users...")
         
-        for uid, username, fname, phone, refs, balance, claims, banned in users:
+        for uid, username, fname, phone, refs, credits, processes, banned in users:
             if banned:
                 continue
             try:
@@ -1178,7 +1001,6 @@ def main():
     global application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Conversation handler for claim flow
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start_command)],
         states={
@@ -1190,12 +1012,13 @@ def main():
     )
     
     application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(callback_handler, pattern="^(?!admin_)"))
-    application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^admin_"))
+    application.add_handler(CommandHandler('start', start_command))
+    application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(CommandHandler('admin', admin_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
     application.add_handler(MessageHandler(filters.TEXT & filters.User(ADMIN_ID), admin_message_handler))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^🔐 Admin Panel$'), admin_command))
     
-    # Start bot
     print("=" * 60)
     print("🤖 SLAY YOUR PLAY - TELEGRAM BOT")
     print("=" * 60)
@@ -1206,6 +1029,34 @@ def main():
     print("=" * 60)
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    data = query.data
+    
+    if data == "check_join":
+        channel_joined, group_joined = await check_force_join(user_id)
+        if channel_joined and group_joined:
+            db_user = get_user(user_id)
+            if db_user and db_user.get('is_banned'):
+                await query.edit_message_text("🚫 You are banned from using this bot.")
+                return
+            await query.edit_message_text("✅ All joined! Welcome!")
+            await query.message.reply_text(
+                "👋 Welcome!\n\nSelect an option below:",
+                reply_markup=get_main_keyboard(user_id == ADMIN_ID)
+            )
+        else:
+            msg = "🔒 **Access Restricted**\n\n"
+            if not channel_joined:
+                msg += "❌ You haven't joined our channel.\n"
+            if not group_joined:
+                msg += "❌ You haven't joined our group.\n"
+            msg += "\nPlease join both to access the bot."
+            await query.edit_message_text(msg, reply_markup=get_force_join_keyboard(), parse_mode="HTML")
 
 if __name__ == "__main__":
     main()
