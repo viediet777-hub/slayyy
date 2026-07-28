@@ -1,1 +1,1 @@
-web: python stick.py
+worker: python slay_local.py
