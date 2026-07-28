@@ -34,7 +34,7 @@ if not BOT_TOKEN:
 ADMIN_IDS = [int(os.environ.get("ADMIN_ID", 1364476174))]
 
 CHANNEL_USERNAME = "viedietlooters"
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1002388556922))
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1003872664875))
 SUPPORT_LINK = "https://t.me/viedietlooterschat"
 IMAGE_URL = "https://cdn.phototourl.com/free/2026-07-28-8e8c2998-b55d-4799-81f5-3777e0548b1a.jpg"
 IMAGE_NAME = "photo_2026-07-28.jpg"
