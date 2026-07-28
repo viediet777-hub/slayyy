@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SLAY YOUR PLAY - TELEGRAM BOT
-Clean, professional bot with Reply Keyboard, OTP fix, and hidden process credit system
+SLAY YOUR PLAY - TELEGRAM BOT (FIXED)
+Working Admin Panel + Referral System
 """
 
 import os
@@ -165,14 +165,40 @@ def add_referral(referrer_id: int, referred_id: int):
     c = conn.cursor()
     now = datetime.now().isoformat()
     try:
+        # Check if already referred
+        c.execute('SELECT * FROM referrals WHERE referrer_id = ? AND referred_id = ?', (referrer_id, referred_id))
+        if c.fetchone():
+            conn.close()
+            return
+        
         c.execute('INSERT INTO referrals (referrer_id, referred_id, referred_at) VALUES (?, ?, ?)',
                   (referrer_id, referred_id, now))
+        
+        # Update referrer's referral count
         c.execute('UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id = ?', (referrer_id,))
+        
+        # Check if referral milestone reached
         c.execute('SELECT referrals_count FROM users WHERE user_id = ?', (referrer_id,))
         count = c.fetchone()[0]
-        if count % REFERRAL_REQUIRED == 0:
-            add_process_credits(referrer_id, 1)
+        
+        # Add process credit for each referral (1 referral = 1 credit)
+        add_process_credits(referrer_id, 1)
+        
         conn.commit()
+        
+        # Notify referrer
+        try:
+            bot = application.bot
+            asyncio.create_task(bot.send_message(
+                referrer_id,
+                f"🎉 **New Referral!**\n\n"
+                f"You now have {count} referrals!\n"
+                f"Process Credits: {get_user(referrer_id)['process_credits']}",
+                parse_mode="HTML"
+            ))
+        except:
+            pass
+            
     except sqlite3.IntegrityError:
         pass
     conn.close()
@@ -403,17 +429,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         referrer_id = get_user_by_referral_code(ref_code)
         if referrer_id and referrer_id != user_id:
             add_referral(referrer_id, user_id)
-            try:
-                await application.bot.send_message(
-                    referrer_id,
-                    f"🎉 **New Referral!**\n\n"
-                    f"@{username or first_name} joined using your referral link.\n"
-                    f"Referrals: {get_user(referrer_id)['referrals_count']}\n"
-                    f"Process Credits: {get_user(referrer_id)['process_credits']}",
-                    parse_mode="HTML"
-                )
-            except:
-                pass
     
     is_admin = (user_id == ADMIN_ID)
     await update.message.reply_text(
@@ -444,7 +459,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard(user_id == ADMIN_ID)
         )
     else:
-        # Check if in admin mode
         if context.user_data.get('admin_mode', False):
             await admin_handler(update, context)
         else:
@@ -732,7 +746,7 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-👤 **Your Stats:**
+👤 **Your Stats:
 • Name: {db_user['first_name']}
 • 👥 Referrals: {db_user['referrals_count']}
 • 💳 Process Credits: {db_user['process_credits']}
@@ -790,7 +804,7 @@ Our team will assist you within 24 hours.
         reply_markup=kb
     )
 
-# ==================== ADMIN COMMANDS ====================
+# ==================== ADMIN COMMANDS (FIXED) ====================
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -827,7 +841,6 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = update.message.text
     
-    # Handle admin menu buttons
     if text == "📊 Admin Stats":
         stats = get_total_stats()
         await update.message.reply_text(
@@ -863,7 +876,6 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     elif text == "➕ Add Credits":
-        context.user_data['admin_action'] = 'add_credits'
         await update.message.reply_text(
             "➕ **Add Process Credits**\n\n"
             "Enter: `user_id amount`\n"
@@ -874,7 +886,6 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     elif text == "➖ Remove Credits":
-        context.user_data['admin_action'] = 'remove_credits'
         await update.message.reply_text(
             "➖ **Remove Process Credits**\n\n"
             "Enter: `user_id amount`\n"
@@ -885,7 +896,6 @@ async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     elif text == "📢 Broadcast":
-        context.user_data['admin_action'] = 'broadcast'
         await update.message.reply_text(
             "📢 **Broadcast**\n\n"
             "Send the message to broadcast to all users.\n"
@@ -934,6 +944,11 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     text = update.message.text
     action = context.user_data.get('admin_action')
     
+    # If no action, check if user is in admin mode
+    if not action and context.user_data.get('admin_mode', False):
+        await admin_handler(update, context)
+        return
+    
     if not action:
         return
     
@@ -943,7 +958,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     if action == 'add_credits':
-        parts = text.split()
+        parts = text.strip().split()
         if len(parts) != 2:
             await update.message.reply_text("❌ Invalid format. Use: `user_id amount`", parse_mode="HTML")
             return
@@ -961,7 +976,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     elif action == 'remove_credits':
-        parts = text.split()
+        parts = text.strip().split()
         if len(parts) != 2:
             await update.message.reply_text("❌ Invalid format. Use: `user_id amount`", parse_mode="HTML")
             return
@@ -1029,7 +1044,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & filters.User(ADMIN_ID), admin_message_handler))
     
     print("=" * 60)
-    print("🤖 SLAY YOUR PLAY - TELEGRAM BOT")
+    print("🤖 SLAY YOUR PLAY - TELEGRAM BOT (FIXED)")
     print("=" * 60)
     print(f"Bot Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Admin ID: {ADMIN_ID}")
