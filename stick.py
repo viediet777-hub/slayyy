@@ -35,7 +35,7 @@ ADMIN_IDS = [int(os.environ.get("ADMIN_ID", 1364476174))]
 
 # Channel Configuration
 CHANNEL_USERNAME = "viedietlooters"  # without @
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1002388556922))
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1003872664875))
 SUPPORT_LINK = "https://t.me/viedietlooters"
 
 BASE_URL = "https://slayyourplaypromo.in"
