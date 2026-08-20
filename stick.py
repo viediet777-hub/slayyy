@@ -52,12 +52,24 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_ID", "1364476174").split(",") if x.strip()]
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8773133018:AAEpo5FvlodjuPvthv2-iNoMMWNzFL02_uM")
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_ID", "8139558808").split(",") if x.strip()]
 DATA_DIR = os.getenv("DATA_DIR", "viediet_data")
 OTP_TIMEOUT = int(os.getenv("OTP_TIMEOUT", "25"))
 NUMBER_DELAY = int(os.getenv("NUMBER_DELAY", "2"))
 PANEL_DELAY = int(os.getenv("PANEL_DELAY", "2"))
+
+# Coloured buttons: style (primary/danger/success) is standard Telegram Bot API 8+.
+# icon_custom_emoji_id needs the bot owner to have Premium / purchased usernames —
+# Coloured buttons: style (primary/success/danger) har client pe color deta hai.
+# icon_custom_emoji_id ke liye bot owner ke paas Telegram Premium / purchased
+# username hona chahiye — nahi hai toh USE_CUSTOM_EMOJI=0 kar do.
+USE_CUSTOM_EMOJI = os.getenv("USE_CUSTOM_EMOJI", "0") == "1"
+
+# Custom emoji IDs (Telegram built-in set)
+EMO_BLUE = "5373141891321699086"
+EMO_RED = "5370810157871667232"
+EMO_GREEN = "5471984997361523302"
 
 # ═══════════════════════════════════════════════════════════════
 # BLINKIT COUPON CHECKER  (merged from blinkitcheck.py)
@@ -163,10 +175,59 @@ def init_db():
                     codes TEXT,
                     ts REAL
                 );
+                CREATE TABLE IF NOT EXISTS admins (
+                    user_id INTEGER PRIMARY KEY,
+                    added_by INTEGER,
+                    created_at REAL
+                );
                 CREATE INDEX IF NOT EXISTS idx_panels_user ON panels(user_id);
                 CREATE INDEX IF NOT EXISTS idx_results_user ON results(user_id);
             """)
             con.commit()
+        finally:
+            con.close()
+
+
+def is_admin(user_id):
+    if user_id in ADMIN_IDS:
+        return True
+    with _db_lock:
+        con = _db()
+        try:
+            row = con.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,)).fetchone()
+            return row is not None
+        finally:
+            con.close()
+
+
+def add_admin(user_id, added_by):
+    with _db_lock:
+        con = _db()
+        try:
+            con.execute(
+                "INSERT OR REPLACE INTO admins(user_id, added_by, created_at) VALUES(?,?,?)",
+                (user_id, added_by, time.time()))
+            con.commit()
+        finally:
+            con.close()
+
+
+def remove_admin(user_id):
+    with _db_lock:
+        con = _db()
+        try:
+            con.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
+            con.commit()
+        finally:
+            con.close()
+
+
+def list_admins():
+    with _db_lock:
+        con = _db()
+        try:
+            rows = con.execute("SELECT user_id FROM admins ORDER BY created_at DESC").fetchall()
+            return [r[0] for r in rows]
         finally:
             con.close()
 
@@ -384,8 +445,8 @@ def has_joined(user_id):
 def force_join_markup():
     kb = InlineKeyboardMarkup(row_width=1)
     for label, _, link in FORCE_JOIN:
-        kb.add(InlineKeyboardButton(f"🔴 JOIN {label.upper()} {link}", url=link))
-    kb.add(InlineKeyboardButton("✅ I HAVE JOINED", callback_data="check_join"))
+        kb.add(url_btn(f"🔴 JOIN {label.upper()}", link, style="danger", icon=EMO_RED))
+    kb.add(btn("✅ I HAVE JOINED", "check_join", style="success", icon=EMO_GREEN))
     return kb
 
 
@@ -408,7 +469,7 @@ def send_force_join(chat_id):
 
 
 def check_and_reply(chat_id, user_id):
-    if has_joined(user_id) or user_id in ADMIN_IDS:
+    if has_joined(user_id) or is_admin(user_id):
         send_home(chat_id, user_id)
     else:
         send_force_join(chat_id)
@@ -418,20 +479,34 @@ def check_and_reply(chat_id, user_id):
 # UI
 # ═══════════════════════════════════════════════════════════════
 
-def btn(text, data):
+def btn(text, data, style=None, icon=None):
     if not data:
         raise ValueError("callback_data required")
-    return InlineKeyboardButton(text, callback_data=data)
+    kwargs = {}
+    if style:
+        kwargs["style"] = style
+    if USE_CUSTOM_EMOJI and icon:
+        kwargs["icon_custom_emoji_id"] = icon
+    return InlineKeyboardButton(text, callback_data=data, **kwargs)
+
+
+def url_btn(text, url, style=None, icon=None):
+    kwargs = {}
+    if style:
+        kwargs["style"] = style
+    if USE_CUSTOM_EMOJI and icon:
+        kwargs["icon_custom_emoji_id"] = icon
+    return InlineKeyboardButton(text, url=url, **kwargs)
 
 
 def home_markup(is_admin=False):
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(btn("📂 ➕ ADD PANEL", "add_panel"))
-    kb.add(btn("🎯 ▶️ RUN CODES", "run_menu"))
-    kb.add(btn("📊 📈 MY STATS", "my_stats"))
-    kb.add(btn("🔗 💰 REFER & EARN", "refer"))
+    kb.add(btn("📂 ADD PANEL", "add_panel", style="primary", icon=EMO_BLUE))
+    kb.add(btn("🎯 RUN CODES", "run_menu", style="primary", icon=EMO_BLUE))
+    kb.add(btn("📊 MY STATS", "my_stats", style="primary", icon=EMO_BLUE))
+    kb.add(btn("🔗 REFER & EARN", "refer", style="success", icon=EMO_GREEN))
     if is_admin:
-        kb.add(btn("🛠 👑 ADMIN PANEL", "admin_menu"))
+        kb.add(btn("🛠 ADMIN PANEL", "admin_menu", style="danger", icon=EMO_RED))
     return kb
 
 
@@ -440,22 +515,23 @@ def send_home(chat_id, user_id):
     name = (u[2] or "user") if u else "user"
     code = u[3] if u else ""
     total, used = user_slots(user_id)
+    link = f"https://t.me/{BOT_USERNAME or 'autoblinkitbot'}?start={code}"
     BOT.send_message(
         chat_id,
         f"{BRAND}\n\n"
         f"👤 <b>{html.escape(name)}</b>\n"
-        f"🎫 Refer Code: <code>{code}</code>\n"
+        f"🔗 Refer: <code>{link}</code>\n"
         f"📂 Panels: <b>{used}/{total}</b> slots\n"
         f"🎁 Codes Found: <b>{u[7] if u else 0}</b>\n\n"
         f"Select karo 👇" + FOOTER,
         parse_mode="HTML",
-        reply_markup=home_markup(user_id in ADMIN_IDS),
+        reply_markup=home_markup(is_admin(user_id)),
     )
 
 
 def back_home_markup():
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(btn("🏠 🏠 HOME", "home"))
+    kb.add(btn("🏠 HOME", "home", style="primary", icon=EMO_BLUE))
     return kb
 
 
@@ -1310,7 +1386,7 @@ def process_panel(chat_id, user_id, panel_url):
                                         check_status, check_line = check_code_with_blinkit(c)
                                     except Exception:
                                         check_line = ""
-                                    msg = (f"🎁🎁 <b>CODE FOUND!</b>\n"
+                                    msg = (f"🎁 <b>CODE FOUND!</b>\n"
                                            f"📱 <code>{mobile}</code>\n"
                                            f"🔑 <code>{html.escape(c)}</code>\n"
                                            f"📡 <code>{html.escape(panel_url[:50])}</code>")
@@ -1386,7 +1462,7 @@ def cmd_start(message):
                 try:
                     BOT.send_message(
                         referrer[0],
-                        f"🎉🎉 <b>NEW REFERRAL!</b>\n\n"
+                        f"🎉 <b>NEW REFERRAL!</b>\n\n"
                         f"👤 {html.escape(first or username or 'Someone')} joined via your link!\n"
                         f"➕ <b>+1 Firebase slot</b> mila hai.\n\n"
                         f"🧾 Total referrals: <b>{referrer[5] + 1}</b>"
@@ -1402,7 +1478,7 @@ def cmd_start(message):
 def cmd_help(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
-    if not has_joined(user_id) and user_id not in ADMIN_IDS:
+    if not has_joined(user_id) and not is_admin(user_id):
         send_force_join(chat_id)
         return
     BOT.send_message(
@@ -1422,7 +1498,7 @@ def cmd_help(message):
 def handle_doc(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
-    if not has_joined(user_id) and user_id not in ADMIN_IDS:
+    if not has_joined(user_id) and not is_admin(user_id):
         send_force_join(chat_id)
         return
     doc = message.document
@@ -1446,7 +1522,7 @@ def handle_doc(message):
 def handle_text(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
-    if not has_joined(user_id) and user_id not in ADMIN_IDS:
+    if not has_joined(user_id) and not is_admin(user_id):
         send_force_join(chat_id)
         return
     if message.text and message.text.startswith("/"):
@@ -1456,7 +1532,7 @@ def handle_text(message):
         handle_urls(chat_id, user_id, urls)
     else:
         BOT.reply_to(message, "❌ Firebase URL nahi mila.\n📂 <b>ADD PANEL</b> dabao ya URL paste karo.",
-                     parse_mode="HTML", reply_markup=home_markup(user_id in ADMIN_IDS))
+                     parse_mode="HTML", reply_markup=home_markup(is_admin(user_id)))
 
 
 def handle_urls(chat_id, user_id, urls):
@@ -1491,7 +1567,7 @@ def reply_add_result(chat_id, user_id, added, rejected):
     msg += f"📊 Slots: <b>{used}/{total}</b>\n\n"
     msg += "🎯 RUN CODES dabao ab!"
     BOT.send_message(chat_id, msg, parse_mode="HTML",
-                     reply_markup=home_markup(user_id in ADMIN_IDS))
+                     reply_markup=home_markup(is_admin(user_id)))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1505,6 +1581,10 @@ def handle_callback(call):
     data = call.data
     try:
         BOT.answer_callback_query(call.id)
+    except Exception:
+        pass
+    try:
+        BOT.delete_message(chat_id, call.message.message_id)
     except Exception:
         pass
     try:
@@ -1533,6 +1613,8 @@ def handle_callback(call):
             cb_admin_codes(chat_id, user_id)
         elif data == "admin_top":
             cb_admin_top(chat_id, user_id)
+        elif data == "admin_access":
+            cb_admin_access(chat_id, user_id)
         elif data == "blinkit_menu":
             cb_blinkit_menu(chat_id, user_id)
         elif data == "blinkit_login":
@@ -1554,7 +1636,7 @@ def cb_add_panel(chat_id, user_id):
             f"🔗 <b>REFER & EARN</b> ➜ 1 referral = 1 panel slot.\n"
             f"Bulk add possible: jitne referrals utne panels ek sath.",
             parse_mode="HTML",
-            reply_markup=home_markup(user_id in ADMIN_IDS),
+            reply_markup=home_markup(is_admin(user_id)),
         )
         return
     BOT.send_message(
@@ -1576,7 +1658,7 @@ def cb_run_menu(chat_id, user_id):
             chat_id,
             f"❌ <b>Koi panel nahi hai.</b>\n\n📂 ADD PANEL se pehle panel add karo.",
             parse_mode="HTML",
-            reply_markup=home_markup(user_id in ADMIN_IDS),
+            reply_markup=home_markup(is_admin(user_id)),
         )
         return
     if user_id in _processing:
@@ -1584,13 +1666,13 @@ def cb_run_menu(chat_id, user_id):
                          parse_mode="HTML")
         return
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(btn(f"🚀 RUN ALL ({len(panels)})", "run_all"))
+    kb.add(btn(f"🚀 RUN ALL ({len(panels)})", "run_all", style="success", icon=EMO_GREEN))
     for i, url in enumerate(panels[:12]):
         tag = url.split("//")[1][:38] if "//" in url else url
-        kb.add(btn(f"📡 {i + 1}. {tag}", f"runpanel|{url}"))
+        kb.add(btn(f"📡 {i + 1}. {tag}", f"runpanel|{url}", style="primary", icon=EMO_BLUE))
     if len(panels) > 12:
-        kb.add(btn(f"➕ +{len(panels) - 12} aur panels", "run_all"))
-    kb.add(btn("🏠 HOME", "home"))
+        kb.add(btn(f"➕ +{len(panels) - 12} aur panels", "run_all", style="primary", icon=EMO_BLUE))
+    kb.add(btn("🏠 HOME", "home", style="danger", icon=EMO_RED))
     BOT.send_message(
         chat_id,
         f"🎯 <b>RUN CODES</b>\n\nApne {len(panels)} panels mein se select karo, ya RUN ALL:",
@@ -1650,14 +1732,14 @@ def cb_my_stats(chat_id, user_id):
         chat_id,
         f"{BRAND} - <b>MY STATS</b>\n\n"
         f"👤 Name: <b>{html.escape(u[2] or 'user')}</b>\n"
-        f"🎫 Refer Code: <code>{u[3]}</code>\n"
+        f"🔗 Refer Link: <code>https://t.me/{BOT_USERNAME or 'autoblinkitbot'}?start={u[3]}</code>\n"
         f"📂 Panels: <b>{used}/{total}</b>\n"
         f"👥 Referrals: <b>{u[5]}</b>\n"
         f"➕ Free slots: <b>{u[6]}</b>\n"
         f"🎁 Codes found: <b>{total_codes}</b>\n\n"
         f"📊 Runs: {status_line}" + FOOTER,
         parse_mode="HTML",
-        reply_markup=home_markup(user_id in ADMIN_IDS),
+        reply_markup=home_markup(is_admin(user_id)),
     )
 
 
@@ -1680,8 +1762,9 @@ def cb_refer(chat_id, user_id):
         f"🧮 <b>Bulk add:</b> {u[5]} referrals = {u[5]} panels ek sath add kar sakte ho.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(row_width=1).add(
-            InlineKeyboardButton("📤 SHARE LINK", url=f"https://t.me/share/url?url={link}&text=🚕%20Join%20VIEDIET%20Panel%20Master%20%E2%80%94%20earn%20free%20codes!"),
-            btn("🏠 HOME", "home"),
+            url_btn("📤 SHARE LINK", f"https://t.me/share/url?url={link}&text=🚕%20Join%20VIEDIET%20Panel%20Master%20%E2%80%94%20earn%20free%20codes!",
+                    style="success", icon=EMO_GREEN),
+            btn("🏠 HOME", "home", style="primary", icon=EMO_BLUE),
         ),
         disable_web_page_preview=True,
     )
@@ -1693,15 +1776,16 @@ def cb_refer(chat_id, user_id):
 
 def admin_markup():
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(btn("👥 ALL USERS", "admin_users"))
-    kb.add(btn("🎁 TOP CODE HUNTERS", "admin_top"))
-    kb.add(btn("🛒 BLINKIT CHECKER", "blinkit_menu"))
-    kb.add(btn("🏠 HOME", "home"))
+    kb.add(btn("👥 ALL USERS", "admin_users", style="primary", icon=EMO_BLUE))
+    kb.add(btn("🎁 TOP CODE HUNTERS", "admin_top", style="primary", icon=EMO_BLUE))
+    kb.add(btn("👑 ADMIN ACCESS", "admin_access", style="success", icon=EMO_GREEN))
+    kb.add(btn("🛒 BLINKIT CHECKER", "blinkit_menu", style="primary", icon=EMO_BLUE))
+    kb.add(btn("🏠 HOME", "home", style="danger", icon=EMO_RED))
     return kb
 
 
 def cb_admin_menu(chat_id, user_id):
-    if user_id not in ADMIN_IDS:
+    if not is_admin(user_id):
         BOT.send_message(chat_id, "❌ Admin only.", parse_mode="HTML")
         return
     users, panels, codes, today = db_stats()
@@ -1716,6 +1800,7 @@ def cb_admin_menu(chat_id, user_id):
         f"Commands:\n"
         f"<code>/user &lt;id|@username&gt;</code> ➜ user stats (counts only)\n"
         f"<code>/give &lt;user_id&gt; &lt;slots&gt;</code> ➜ free slots do\n"
+        f"<code>/addadmin &lt;user_id&gt;</code> ➜ kisi ko admin access do\n"
         f"<code>/blinkitlogin</code> ➜ Blinkit login (auto-check)\n"
         f"<code>/check CODE</code> ➜ manual check",
         parse_mode="HTML",
@@ -1724,7 +1809,7 @@ def cb_admin_menu(chat_id, user_id):
 
 
 def cb_admin_users(chat_id, user_id):
-    if user_id not in ADMIN_IDS:
+    if not is_admin(user_id):
         return
     with _db_lock:
         con = _db()
@@ -1750,7 +1835,7 @@ def cb_admin_users(chat_id, user_id):
 
 
 def cb_admin_top(chat_id, user_id):
-    if user_id not in ADMIN_IDS:
+    if not is_admin(user_id):
         return
     rows = top_users(10)
     msg = f"🏆 <b>TOP CODE HUNTERS</b>\n\n"
@@ -1763,7 +1848,7 @@ def cb_admin_top(chat_id, user_id):
 
 
 def cb_admin_codes(chat_id, user_id):
-    if user_id not in ADMIN_IDS:
+    if not is_admin(user_id):
         return
     BOT.send_message(chat_id, "🔒 <b>Codes private hain</b> — har user apne codes "
                               "sirf khud dekh sakta hai. Admin sirf counts dekhta hai "
@@ -1771,7 +1856,7 @@ def cb_admin_codes(chat_id, user_id):
 
 
 def cb_blinkit_menu(chat_id, user_id):
-    if user_id not in ADMIN_IDS:
+    if not is_admin(user_id):
         return
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(btn("🔑 BLINKIT LOGIN", "blinkit_login"))
@@ -1795,7 +1880,7 @@ def cb_blinkit_menu(chat_id, user_id):
 @BOT.message_handler(commands=["user"])
 def admin_user(message):
     chat_id = message.chat.id
-    if message.from_user.id not in ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     parts = message.text.split()
     if len(parts) < 2:
@@ -1832,7 +1917,7 @@ def admin_user(message):
 @BOT.message_handler(commands=["give"])
 def admin_give(message):
     chat_id = message.chat.id
-    if message.from_user.id not in ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     parts = message.text.split()
     if len(parts) < 3 or not parts[1].isdigit() or not parts[2].isdigit():
@@ -1846,11 +1931,71 @@ def admin_give(message):
     BOT.send_message(chat_id, f"✅ <b>{n} free slots</b> user <code>{uid}</code> ko de diye.",
                      parse_mode="HTML", reply_markup=admin_markup())
     try:
-        BOT.send_message(uid, f"🎁🎁 <b>+{n} FREE SLOTS!</b>\n\n"
+        BOT.send_message(uid, f"🎁 <b>+{n} FREE SLOTS!</b>\n\n"
                               f"Admin ne aapko {n} extra panel slots diye. 🎉\n"
                               f"Ab aur panels add karo!" + FOOTER, parse_mode="HTML")
     except Exception:
         pass
+
+
+def cb_admin_access(chat_id, user_id):
+    if not is_admin(user_id):
+        return
+    db_admins = list_admins()
+    msg = f"👑 <b>ADMIN ACCESS</b>\n\n"
+    msg += f"Yahan se kisi ko bhi <b>admin access</b> de sakte ho bot se hi:\n\n"
+    msg += f"<code>/addadmin &lt;user_id&gt;</code> ➜ admin banao\n"
+    msg += f"<code>/deladmin &lt;user_id&gt;</code> ➜ admin hatao\n\n"
+    msg += f"👑 DB admins ({len(db_admins)}):\n"
+    for a in db_admins[:20]:
+        msg += f"  • <code>{a}</code>\n"
+    if not db_admins:
+        msg += "  (koi nahi)\n"
+    msg += f"\n⚙️ Owner/ENV admins: {', '.join(str(a) for a in ADMIN_IDS)}"
+    BOT.send_message(chat_id, msg, parse_mode="HTML",
+                     reply_markup=admin_markup())
+
+
+@BOT.message_handler(commands=["addadmin"])
+def admin_add_admin(message):
+    chat_id = message.chat.id
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].lstrip("+-").isdigit():
+        BOT.send_message(chat_id, "Usage: <code>/addadmin &lt;user_id&gt;</code>", parse_mode="HTML")
+        return
+    uid = int(parts[1])
+    add_admin(uid, message.from_user.id)
+    BOT.send_message(chat_id, f"✅ <b>Admin added:</b> <code>{uid}</code>\n"
+                              f"Ab isko full access hai.", parse_mode="HTML",
+                     reply_markup=admin_markup())
+    try:
+        BOT.send_message(uid, f"👑 <b>ADMIN ACCESS MILA!</b>\n\n"
+                              f"Aapko bot ka <b>full admin access</b> de diya gaya hai. 🎉\n"
+                              f"🛠 ADMIN PANEL ab aapko home menu me dikhega." + FOOTER,
+                         parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@BOT.message_handler(commands=["deladmin"])
+def admin_del_admin(message):
+    chat_id = message.chat.id
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].lstrip("+-").isdigit():
+        BOT.send_message(chat_id, "Usage: <code>/deladmin &lt;user_id&gt;</code>", parse_mode="HTML")
+        return
+    uid = int(parts[1])
+    if uid in ADMIN_IDS:
+        BOT.send_message(chat_id, f"❌ <code>{uid}</code> owner/ENV admin hai — hata nahi sakte.",
+                         parse_mode="HTML", reply_markup=admin_markup())
+        return
+    remove_admin(uid)
+    BOT.send_message(chat_id, f"✅ <b>Admin removed:</b> <code>{uid}</code>", parse_mode="HTML",
+                     reply_markup=admin_markup())
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1871,7 +2016,7 @@ def blinkit_status_line():
 
 @BOT.message_handler(commands=["blinkitlogin"])
 def admin_blinkit_login(message):
-    if message.from_user.id not in ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     _start_blinkit_login(message.chat.id)
 
@@ -1897,7 +2042,7 @@ def _start_blinkit_login(chat_id):
 
 def _blinkit_phone_step(message):
     chat_id = message.chat.id
-    if message.from_user.id not in ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     phone = (message.text or "").strip()
     if len(phone) != 10 or not phone.isdigit():
@@ -1916,7 +2061,7 @@ def _blinkit_phone_step(message):
 
 def _blinkit_otp_step(message):
     chat_id = message.chat.id
-    if message.from_user.id not in ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     state = _blinkit_login_state.get(chat_id, {})
     phone = state.get("phone")
@@ -1979,7 +2124,7 @@ def _blinkit_otp_step(message):
 @BOT.message_handler(commands=["check"])
 def admin_check(message):
     chat_id = message.chat.id
-    if message.from_user.id not in ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
@@ -2008,7 +2153,7 @@ def admin_check(message):
 @BOT.message_handler(commands=["blinkit"])
 def admin_blinkit_status(message):
     chat_id = message.chat.id
-    if message.from_user.id not in ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     BOT.send_message(
         chat_id,
@@ -2030,7 +2175,7 @@ def admin_blinkit_status(message):
 @BOT.message_handler(commands=["codes"])
 def admin_codes(message):
     chat_id = message.chat.id
-    if message.from_user.id not in ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     BOT.send_message(chat_id, "🔒 <b>Codes private hain</b> — har user apne codes "
                               "sirf khud dekh sakta hai. Admin sirf counts dekhta hai "
