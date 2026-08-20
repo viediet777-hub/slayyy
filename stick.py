@@ -45,6 +45,7 @@ import uuid
 import random
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import telebot
 import telebot.apihelper as apihelper
@@ -54,8 +55,8 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-_raw_admins = os.getenv("ADMIN_ID").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8773133018:AAEpo5FvlodjuPvthv2-iNoMMWNzFL02_uM")
+_raw_admins = os.getenv("ADMIN_ID", "8139558808").strip()
 ADMIN_IDS = [int(x) for x in _raw_admins.split(",") if x.strip().lstrip("+-").isdigit()]
 if not ADMIN_IDS:
     ADMIN_IDS = [8139558808]
@@ -88,8 +89,11 @@ BLINKIT_VALID_FILE = os.path.join(DATA_DIR, "blinkit_valid.txt")
 try:
     from curl_cffi import requests as cffi_requests
     CFFI_OK = True
+    # Blinkit TLS fingerprint check karta hai — Chrome impersonation zaroori
+    _cffi_session = cffi_requests.Session(impersonate="chrome110", verify=False)
 except Exception:
     cffi_requests = None
+    _cffi_session = None
     CFFI_OK = False
 
 _blinkit_lock = threading.Lock()
@@ -134,6 +138,7 @@ FOOTER = "\n\n🤖 Made by <b>viediet</b>"
 
 _db_lock = threading.Lock()
 _processing = set()
+_check_cache = {}
 
 
 def _db():
@@ -518,6 +523,7 @@ def url_btn(text, url, style=None, icon=None):
 def home_markup(is_admin=False):
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(btn("📂 ADD PANEL", "add_panel", style="primary", icon=EMO_BLUE))
+    kb.add(btn("🔎 CHECK PANELS", "check_panels", style="primary", icon=EMO_BLUE))
     kb.add(btn("🎯 RUN CODES", "run_menu", style="primary", icon=EMO_BLUE))
     kb.add(btn("📊 MY STATS", "my_stats", style="primary", icon=EMO_BLUE))
     kb.add(btn("🔗 REFER & EARN", "refer", style="success", icon=EMO_GREEN))
@@ -900,6 +906,77 @@ def check_panel_active(url):
     }
 
 
+# ═══════════════════════════════════════════════════════════════
+# PANEL CHECKER  (free, koi limit nahi)
+# ═══════════════════════════════════════════════════════════════
+
+def check_panel_status(url):
+    """Ek panel ki status — ACTIVE (numbers mile) / LIVE (DB live, numbers nahi) / DEAD."""
+    try:
+        panel = check_panel_active(url)
+        if panel:
+            return {"url": url, "active": True, "devices": panel["total_devices"],
+                    "numbers": panel["total_numbers"], "state": "ACTIVE"}
+    except Exception:
+        pass
+    try:
+        for probe in ("All_Users", "user_sms", "clients", ""):
+            resp = fb_get_sync(probe, url, timeout=4)
+            if resp is not None:
+                return {"url": url, "active": False, "devices": 0, "numbers": 0, "state": "LIVE"}
+    except Exception:
+        pass
+    return {"url": url, "active": False, "devices": 0, "numbers": 0, "state": "DEAD"}
+
+
+def check_panels_bulk(chat_id, user_id, urls, label):
+    """Sabhi URLs parallel check karke report bhejta hai (free, koi limit nahi)."""
+    total = len(urls)
+    done = 0
+    results = []
+    lines = []
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        futs = {ex.submit(check_panel_status, u): u for u in urls}
+        for fut in as_completed(futs):
+            try:
+                r = fut.result()
+            except Exception:
+                r = {"url": futs[fut], "active": False, "devices": 0, "numbers": 0, "state": "DEAD"}
+            results.append(r)
+            done += 1
+            tag = r["url"].split("//")[1][:34] if "//" in r["url"] else r["url"]
+            lines.append(f"{'✅' if r['active'] else '❌'} {tag}")
+            progress(chat_id, _progress_text(label, done, total, lines))
+    active = [r for r in results if r["active"]]
+    live = [r for r in results if r["state"] == "LIVE"]
+    dead = [r for r in results if r["state"] == "DEAD"]
+    _check_cache[user_id] = {"active": [r["url"] for r in active], "all": urls}
+    msg = (f"🔎 <b>CHECK PANELS — {label}</b> | <code>{done}/{total}</code>\n\n"
+           f"✅ <b>ACTIVE:</b> {len(active)}"
+           f"  |  ⚠️ <b>LIVE (no numbers):</b> {len(live)}"
+           f"  |  ❌ <b>INACTIVE:</b> {len(dead)}\n")
+    if active:
+        msg += "\n✅ <b>ACTIVE PANELS:</b>\n" + "\n".join(
+            f"✅ <code>{html.escape(r['url'][:60])}</code> ({r['devices']} dev / {r['numbers']} num)"
+            for r in active[:12])
+        if len(active) > 12:
+            msg += f"\n... +{len(active) - 12} aur"
+    if dead:
+        msg += "\n\n❌ <b>INACTIVE:</b>\n" + "\n".join(
+            f"❌ <code>{html.escape(r['url'][:60])}</code>" for r in dead[:12])
+        if len(dead) > 12:
+            msg += f"\n... +{len(dead) - 12} aur"
+    kb = InlineKeyboardMarkup(row_width=1)
+    if active:
+        kb.add(btn(f"✅ ADD ACTIVE PANELS ({len(active)})", "add_active", style="success", icon=EMO_GREEN))
+    kb.add(btn(f"📂 ADD ALL ({total})", "add_all_checked", style="primary", icon=EMO_BLUE))
+    kb.add(btn("🏠 HOME", "home", style="danger", icon=EMO_RED))
+    try:
+        BOT.send_message(chat_id, msg, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        BOT.send_message(chat_id, "🔎 Check done — report bhejte time error aaya.", reply_markup=kb)
+
+
 def extract_bharat_otp(body):
     if not body or "otp" not in body.lower():
         return None
@@ -1173,7 +1250,7 @@ def blinkit_request_otp(phone):
     if not CFFI_OK:
         return False, "curl_cffi install nahi hai (pip install curl_cffi)"
     try:
-        resp = cffi_requests.post(
+        resp = _cffi_session.post(
             f"{BLINKIT_BASE_URL}/v2/accounts/",
             data=f"country_code=91&otp_mode=SMS&user_phone={phone}&build_variant=release",
             headers=_blinkit_headers(fixed_device=True), timeout=10,
@@ -1192,7 +1269,7 @@ def blinkit_verify_otp(phone, otp):
     if not CFFI_OK:
         return None, "curl_cffi install nahi hai (pip install curl_cffi)"
     try:
-        resp = cffi_requests.post(
+        resp = _cffi_session.post(
             f"{BLINKIT_BASE_URL}/v2/accounts/verify/phone/code/",
             data=(f"country_code=91&otp_mode=SMS&user_phone={phone}&verify_code={otp}"
                   f"&adv_id={_FIXED_ADV_ID}&notification_permission_enabled=false"),
@@ -1211,7 +1288,7 @@ def blinkit_verify_otp(phone, otp):
 def blinkit_get_active_cart(token):
     addr_id = None
     try:
-        resp = cffi_requests.get(
+        resp = _cffi_session.get(
             f"{BLINKIT_BASE_URL}/v4/address?source=SOURCE_CART&address_id=-1&is_locality_selected_by_user=false",
             headers=_blinkit_headers(token, fixed_device=True), timeout=10,
         )
@@ -1222,7 +1299,7 @@ def blinkit_get_active_cart(token):
     except Exception:
         pass
     try:
-        resp = cffi_requests.post(
+        resp = _cffi_session.post(
             f"{BLINKIT_BASE_URL}/v5/carts",
             json={"is_initial_call": True, "cart_type": "product"},
             headers=_blinkit_headers(token, fixed_device=True), timeout=10,
@@ -1245,7 +1322,7 @@ def blinkit_check_coupon(coupon, token, cart_id, base_payload):
     url = f"{BLINKIT_BASE_URL}/v5/carts/{cart_id}"
     for attempt in range(3):
         try:
-            resp = cffi_requests.patch(url, json=p,
+            resp = _cffi_session.patch(url, json=p,
                                        headers=_blinkit_headers(token), timeout=15)
             if resp.status_code == 200:
                 data = resp.json()
@@ -1274,7 +1351,7 @@ def _blinkit_reset_cart(token, cart_id, base_payload):
     try:
         p = base_payload.copy()
         p["promo_codes"] = []
-        cffi_requests.patch(f"{BLINKIT_BASE_URL}/v5/carts/{cart_id}",
+        _cffi_session.patch(f"{BLINKIT_BASE_URL}/v5/carts/{cart_id}",
                             json=p, headers=_blinkit_headers(token), timeout=10)
     except Exception:
         pass
@@ -1531,7 +1608,7 @@ def handle_doc(message):
     if not urls:
         BOT.reply_to(message, "❌ File mein koi Firebase URL nahi mila.", parse_mode="HTML")
         return
-    handle_urls(chat_id, user_id, urls)
+    check_panels_bulk(chat_id, user_id, urls, "TXT FILE")
 
 
 @BOT.message_handler(func=lambda m: True)
@@ -1610,6 +1687,16 @@ def handle_callback(call):
             send_home(chat_id, user_id)
         elif data == "add_panel":
             cb_add_panel(chat_id, user_id)
+        elif data == "check_panels":
+            cb_check_panels(chat_id, user_id)
+        elif data == "check_my_panels":
+            cb_check_my_panels(chat_id, user_id)
+        elif data == "check_txt":
+            cb_check_txt(chat_id, user_id)
+        elif data == "add_active":
+            cb_add_checked(chat_id, user_id, "active")
+        elif data == "add_all_checked":
+            cb_add_checked(chat_id, user_id, "all")
         elif data == "run_menu":
             cb_run_menu(chat_id, user_id)
         elif data == "run_all":
@@ -1658,13 +1745,69 @@ def cb_add_panel(chat_id, user_id):
     BOT.send_message(
         chat_id,
         f"📂 <b>ADD PANEL</b>\n\n"
-        f"Apna Firebase URL bhejo ya <b>.txt file</b> upload karo.\n"
-        f"<b>Bulk allowed:</b> jitne referral slots hain utne URLs ek sath daal sakte ho.\n\n"
+        f"Apna Firebase URL bhejo — turant add ho jayega.\n"
+        f"<b>.txt file</b> upload karo to pehle sab URLs check honge (free), phir ADD kar sakte ho.\n\n"
         f"📊 Current: <b>{slots_display(used, total)}</b> slots\n\n"
         f"Example:\n<code>https://yourpanel.firebaseio.com</code>",
         parse_mode="HTML",
         reply_markup=back_home_markup(),
     )
+
+
+def cb_check_panels(chat_id, user_id):
+    panels = get_user_panels(user_id)
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(btn(f"📂 MY PANELS ({len(panels)})", "check_my_panels", style="primary", icon=EMO_BLUE))
+    kb.add(btn("📄 CHECK TXT FILE", "check_txt", style="success", icon=EMO_GREEN))
+    kb.add(btn("🏠 HOME", "home", style="danger", icon=EMO_RED))
+    BOT.send_message(
+        chat_id,
+        f"🔎 <b>CHECK PANELS</b>\n\n"
+        f"Sabhi panels check karo — kaun sa <b>ACTIVE</b>, kaun sa <b>INACTIVE</b>.\n"
+        f"✅ <b>Free</b> — koi limit nahi!\n\n"
+        f"📂 Saved panels check karo ya .txt file bhejo (bulk).",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+def cb_check_my_panels(chat_id, user_id):
+    panels = get_user_panels(user_id)
+    if not panels:
+        BOT.send_message(
+            chat_id,
+            f"❌ <b>Koi panel nahi hai.</b>\n\n📂 ADD PANEL se panel add karo ya txt file check karo.",
+            parse_mode="HTML",
+            reply_markup=home_markup(is_admin(user_id)),
+        )
+        return
+    check_panels_bulk(chat_id, user_id, panels, "MY PANELS")
+
+
+def cb_check_txt(chat_id, user_id):
+    BOT.send_message(
+        chat_id,
+        f"📄 <b>CHECK TXT FILE</b>\n\n"
+        f"Apni Firebase URLs wali <b>.txt</b> file bhejo — sab check honge (ACTIVE/INACTIVE).\n"
+        f"✅ <b>Free</b> — koi limit nahi.",
+        parse_mode="HTML",
+        reply_markup=back_home_markup(),
+    )
+
+
+def cb_add_checked(chat_id, user_id, which):
+    cache = _check_cache.pop(user_id, {})
+    urls = cache.get(which, [])
+    if not urls:
+        BOT.send_message(
+            chat_id,
+            f"❌ Koi panel cache nahi hai. Pehle 🔎 CHECK PANELS chalao.",
+            parse_mode="HTML",
+            reply_markup=home_markup(is_admin(user_id)),
+        )
+        return
+    added, rejected, _ = add_panels(user_id, urls)
+    reply_add_result(chat_id, user_id, added, rejected)
 
 
 def cb_run_menu(chat_id, user_id):
@@ -2120,7 +2263,7 @@ def _blinkit_otp_step(message):
     }
     _blinkit_save_session(session)
     try:
-        cffi_requests.patch(f"{BLINKIT_BASE_URL}/v5/carts/{cart_id}",
+        _cffi_session.patch(f"{BLINKIT_BASE_URL}/v5/carts/{cart_id}",
                             json=session["base_payload"],
                             headers=_blinkit_headers(token, fixed_device=True), timeout=10)
     except Exception:
