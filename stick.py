@@ -26,6 +26,8 @@ ENV:
 ADMIN COMMANDS:
   /user <id|@user>       user stats (counts only — codes/panels private)
   /give <id> <slots>     free slots
+  /addadmin <id>         kisi ko bhi admin access do (bot se hi)
+  /deladmin <id>         admin access hatao
   /blinkitlogin          login Blinkit once (auto-check engine)
   /check CODE            manual code check
   /blinkit               checker stats
@@ -52,8 +54,12 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8773133018:AAEpo5FvlodjuPvthv2-iNoMMWNzFL02_uM")
-ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_ID", "8139558808").split(",") if x.strip()]
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+_raw_admins = os.getenv("ADMIN_ID").strip()
+ADMIN_IDS = [int(x) for x in _raw_admins.split(",") if x.strip().lstrip("+-").isdigit()]
+if not ADMIN_IDS:
+    ADMIN_IDS = [8139558808]
+ADMIN_IDS = list(dict.fromkeys(ADMIN_IDS))
 DATA_DIR = os.getenv("DATA_DIR", "viediet_data")
 OTP_TIMEOUT = int(os.getenv("OTP_TIMEOUT", "25"))
 NUMBER_DELAY = int(os.getenv("NUMBER_DELAY", "2"))
@@ -183,6 +189,10 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_panels_user ON panels(user_id);
                 CREATE INDEX IF NOT EXISTS idx_results_user ON results(user_id);
             """)
+            for aid in ADMIN_IDS:
+                con.execute(
+                    "INSERT OR IGNORE INTO admins(user_id, added_by, created_at) VALUES(?,?,?)",
+                    (aid, aid, time.time()))
             con.commit()
         finally:
             con.close()
@@ -278,15 +288,21 @@ def user_slots(user_id):
     u = get_user(user_id)
     if not u:
         return 0, 0
-    refs = u[5] or 0  # referrals_count
-    free = u[6] or 0  # free_slots
     with _db_lock:
         con = _db()
         try:
             used = con.execute("SELECT COUNT(*) FROM panels WHERE user_id=?", (user_id,)).fetchone()[0]
         finally:
             con.close()
+    if is_admin(user_id):
+        return 10 ** 6, used  # admin = unlimited panels
+    refs = u[5] or 0  # referrals_count
+    free = u[6] or 0  # free_slots
     return refs + free, used
+
+
+def slots_display(used, total):
+    return "∞" if total >= 10 ** 6 else f"{used}/{total}"
 
 
 def add_referral(referrer_id, referred_id):
@@ -521,7 +537,7 @@ def send_home(chat_id, user_id):
         f"{BRAND}\n\n"
         f"👤 <b>{html.escape(name)}</b>\n"
         f"🔗 Refer: <code>{link}</code>\n"
-        f"📂 Panels: <b>{used}/{total}</b> slots\n"
+        f"📂 Panels: <b>{slots_display(used, total)}</b> slots\n"
         f"🎁 Codes Found: <b>{u[7] if u else 0}</b>\n\n"
         f"Select karo 👇" + FOOTER,
         parse_mode="HTML",
@@ -1418,7 +1434,7 @@ def run_all(chat_id, user_id):
         progress(chat_id, "❌ <b>Koi panel add nahi hai.</b>\n➕ Pehle panel add karo.")
         return
     total, used = user_slots(user_id)
-    progress(chat_id, f"🚀 <b>RUNNING {len(panels)} PANELS</b>\nSlots: {used}/{total}\n\n➡️ Ek ek kar ke...")
+    progress(chat_id, f"🚀 <b>RUNNING {len(panels)} PANELS</b>\nSlots: {slots_display(used, total)}\n\n➡️ Ek ek kar ke...")
     for i, url in enumerate(panels):
         process_panel(chat_id, user_id, url)
         if i < len(panels) - 1:
@@ -1542,7 +1558,7 @@ def handle_urls(chat_id, user_id, urls):
         BOT.send_message(
             chat_id,
             f"❌ <b>No slots left!</b>\n\n"
-            f"📂 Used: {used}/{total}\n"
+            f"📂 Used: {slots_display(used, total)}\n"
             f"🔗 <b>REFER & EARN</b> se naye slots pao (1 refer = 1 slot).\n\n"
             f"Bulk add: jitne referral utne panels ek sath daal sakte ho.",
             parse_mode="HTML",
@@ -1564,7 +1580,7 @@ def reply_add_result(chat_id, user_id, added, rejected):
         msg += "\n\n"
     if rejected:
         msg += f"❌ <b>Rejected (duplicate/no slot):</b> {len(rejected)}\n"
-    msg += f"📊 Slots: <b>{used}/{total}</b>\n\n"
+    msg += f"📊 Slots: <b>{slots_display(used, total)}</b>\n\n"
     msg += "🎯 RUN CODES dabao ab!"
     BOT.send_message(chat_id, msg, parse_mode="HTML",
                      reply_markup=home_markup(is_admin(user_id)))
@@ -1632,7 +1648,7 @@ def cb_add_panel(chat_id, user_id):
         BOT.send_message(
             chat_id,
             f"❌ <b>No slots left!</b>\n\n"
-            f"📂 {used}/{total} slots used.\n"
+            f"📂 {slots_display(used, total)} slots used.\n"
             f"🔗 <b>REFER & EARN</b> ➜ 1 referral = 1 panel slot.\n"
             f"Bulk add possible: jitne referrals utne panels ek sath.",
             parse_mode="HTML",
@@ -1644,7 +1660,7 @@ def cb_add_panel(chat_id, user_id):
         f"📂 <b>ADD PANEL</b>\n\n"
         f"Apna Firebase URL bhejo ya <b>.txt file</b> upload karo.\n"
         f"<b>Bulk allowed:</b> jitne referral slots hain utne URLs ek sath daal sakte ho.\n\n"
-        f"📊 Current: <b>{used}/{total}</b> slots\n\n"
+        f"📊 Current: <b>{slots_display(used, total)}</b> slots\n\n"
         f"Example:\n<code>https://yourpanel.firebaseio.com</code>",
         parse_mode="HTML",
         reply_markup=back_home_markup(),
@@ -1733,7 +1749,7 @@ def cb_my_stats(chat_id, user_id):
         f"{BRAND} - <b>MY STATS</b>\n\n"
         f"👤 Name: <b>{html.escape(u[2] or 'user')}</b>\n"
         f"🔗 Refer Link: <code>https://t.me/{BOT_USERNAME or 'autoblinkitbot'}?start={u[3]}</code>\n"
-        f"📂 Panels: <b>{used}/{total}</b>\n"
+        f"📂 Panels: <b>{slots_display(used, total)}</b>\n"
         f"👥 Referrals: <b>{u[5]}</b>\n"
         f"➕ Free slots: <b>{u[6]}</b>\n"
         f"🎁 Codes found: <b>{total_codes}</b>\n\n"
@@ -1758,7 +1774,7 @@ def cb_refer(chat_id, user_id):
         f"Ye link share karo:\n<code>{link}</code>\n\n"
         f"📤 Share button se copy karo 👇\n\n"
         f"👥 Referrals: <b>{u[5]}</b>\n"
-        f"📂 Slots: <b>{used}/{total}</b>\n"
+        f"📂 Slots: <b>{slots_display(used, total)}</b>\n"
         f"🧮 <b>Bulk add:</b> {u[5]} referrals = {u[5]} panels ek sath add kar sakte ho.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(row_width=1).add(
