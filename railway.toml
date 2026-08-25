@@ -1,0 +1,4 @@
+# Railway deployment config
+# Set BOT_TOKEN as an environment variable in Railway project settings.
+
+BOT_TOKEN=PASTE_YOUR_BOT_TOKEN_HERE
