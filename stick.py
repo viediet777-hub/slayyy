@@ -38,7 +38,13 @@ from telegram.ext import (
 # CONFIG
 # ============================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "8139558808").split(",") if x.strip()]
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "1364476174").split(",") if x.strip()]
+
+# GitHub backup (set GITHUB_TOKEN env var; owner/repo default to your repo)
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "viediet777-hub")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "slayyy")
+GITHUB_PATH = "bot_data.json"
 
 CHANNEL_USERNAME = "@viedietlooters"
 GROUP_USERNAME = "@viedietbackup"
@@ -80,6 +86,37 @@ def load_data():
 def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
+    github_push()
+
+
+def github_push():
+    """Backup bot_data.json to GitHub repo (owner/repo above)."""
+    if not GITHUB_TOKEN:
+        return
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_PATH}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+    try:
+        with open(DATA_FILE, "r") as f:
+            content = f.read()
+    except Exception:
+        return
+    try:
+        sha = None
+        r = requests.get(url, headers=headers, timeout=20)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+        payload = {
+            "message": "Update bot_data.json [bot backup]",
+            "content": base64.b64encode(content.encode()).decode(),
+        }
+        if sha:
+            payload["sha"] = sha
+        requests.put(url, headers=headers, json=payload, timeout=20)
+    except Exception as e:
+        print(f"[GitHub Backup] failed: {e}")
 
 
 DATA = load_data()
@@ -794,6 +831,13 @@ def main():
     app.add_handler(admin_conv)
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
+
+    # Periodic GitHub backup every 5 minutes
+    async def _github_job(context: ContextTypes.DEFAULT_TYPE):
+        await asyncio.to_thread(github_push)
+
+    if GITHUB_TOKEN:
+        app.job_queue.run_repeating(_github_job, interval=300, first=60)
 
     print("🤖 Bot started... Made By Viediet")
     app.run_polling()
