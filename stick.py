@@ -25,6 +25,7 @@ from datetime import datetime
 warnings.filterwarnings("ignore", message=".*per_message.*CallbackQueryHandler.*")
 
 from telegram import Update
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -317,21 +318,36 @@ class LenskartDevice:
         return self.s.post(url, headers=self._headers(), json=body, timeout=30)
 
     def create_session(self):
-        r = self._post("/v2/sessions", {})
-        if r.status_code == 200:
-            self.session_token = r.json().get("result", {}).get("id")
-            return True
+        for attempt in range(4):
+            try:
+                r = self._post("/v2/sessions", {})
+                if r.status_code == 200:
+                    sid = r.json().get("result", {}).get("id")
+                    if sid:
+                        self.session_token = sid
+                        return True
+            except Exception:
+                pass
+            # Fresh scraper to beat a new Cloudflare challenge, then backoff
+            self.s = cloudscraper.create_scraper()
+            time.sleep(1.5 * (attempt + 1))
         return False
 
     def send_otp(self):
         if not self.session_token:
             return None
         body = {"phoneCode": self.phone_code, "telephone": self.phone}
-        r = self._post("/v3/customers/sendOtp", body)
-        if r.status_code == 200:
-            res = r.json().get("result") or {}
-            self.customer_type = "NEW" if res.get("isNewUser") else "EXISTING"
-            return res
+        for attempt in range(4):
+            try:
+                r = self._post("/v3/customers/sendOtp", body)
+                if r.status_code == 200:
+                    res = r.json().get("result") or {}
+                    self.customer_type = "NEW" if res.get("isNewUser") else "EXISTING"
+                    return res
+            except Exception:
+                pass
+            self.s = cloudscraper.create_scraper()
+            time.sleep(1.5 * (attempt + 1))
         return None
 
     def verify_otp(self, code: str):
@@ -630,11 +646,13 @@ async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dev = LenskartDevice(phone)
     ok = await asyncio.to_thread(dev.create_session)
     if not ok:
+        PENDING.pop(uid, None)
         await tg_send(update.effective_chat.id, "❌ Could not create session. Try again later.",
                       reply_markup=cancel_inline(), message_id=entry["mid"])
         return ConversationHandler.END
     sent = await asyncio.to_thread(dev.send_otp)
     if not sent:
+        PENDING.pop(uid, None)
         await tg_send(update.effective_chat.id, "❌ Failed to send OTP. Try again.",
                       reply_markup=cancel_inline(), message_id=entry["mid"])
         return ConversationHandler.END
@@ -842,7 +860,17 @@ def main():
         threading.Thread(target=_github_backup_loop, daemon=True).start()
 
     print("🤖 Bot started... Made By Viediet")
-    app.run_polling()
+    while True:
+        try:
+            app.run_polling(drop_pending_updates=True, close_loop=False)
+            break
+        except Conflict:
+            print("⚠️ Conflict: another bot instance is already polling this token. "
+                  "Make sure ONLY ONE instance is running (stop local bot if deployed, "
+                  "or set Railway replicas to 1). Retrying in 15s...")
+            time.sleep(15)
+        except KeyboardInterrupt:
+            break
 
 
 if __name__ == "__main__":
