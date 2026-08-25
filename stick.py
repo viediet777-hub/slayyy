@@ -25,7 +25,7 @@ from datetime import datetime
 warnings.filterwarnings("ignore", message=".*per_message.*CallbackQueryHandler.*")
 
 from telegram import Update
-from telegram.error import Conflict
+from telegram.error import Conflict, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -318,19 +318,22 @@ class LenskartDevice:
         return self.s.post(url, headers=self._headers(), json=body, timeout=30)
 
     def create_session(self):
+        last = None
         for attempt in range(4):
             try:
                 r = self._post("/v2/sessions", {})
+                last = (r.status_code, r.text[:120])
                 if r.status_code == 200:
                     sid = r.json().get("result", {}).get("id")
                     if sid:
                         self.session_token = sid
                         return True
-            except Exception:
-                pass
+            except Exception as e:
+                last = ("EXC", str(e)[:120])
             # Fresh scraper to beat a new Cloudflare challenge, then backoff
             self.s = cloudscraper.create_scraper()
             time.sleep(1.5 * (attempt + 1))
+        print(f"[create_session] FAILED after retries. last_response={last}")
         return False
 
     def send_otp(self):
@@ -804,6 +807,15 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   reply_markup=main_menu_kb(str(update.effective_user.id)))
 
 
+async def err_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if isinstance(err, Conflict):
+        print("⚠️ Telegram Conflict: two instances are using this bot token. "
+              "Run ONLY ONE instance (stop local bot / set Railway replicas to 1).")
+        return
+    print(f"Unhandled error: {err}")
+
+
 def main():
     asyncio.set_event_loop(asyncio.new_event_loop())
 
@@ -847,6 +859,7 @@ def main():
     app.add_handler(admin_conv)
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
+    app.add_error_handler(err_handler)
 
     # Periodic GitHub backup every 5 minutes (background thread, no job-queue needed)
     if GITHUB_TOKEN:
@@ -860,17 +873,33 @@ def main():
         threading.Thread(target=_github_backup_loop, daemon=True).start()
 
     print("🤖 Bot started... Made By Viediet")
-    while True:
-        try:
-            app.run_polling(drop_pending_updates=True, close_loop=False)
-            break
-        except Conflict:
-            print("⚠️ Conflict: another bot instance is already polling this token. "
-                  "Make sure ONLY ONE instance is running (stop local bot if deployed, "
-                  "or set Railway replicas to 1). Retrying in 15s...")
-            time.sleep(15)
-        except KeyboardInterrupt:
-            break
+
+    public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+    webhook_url = os.getenv("WEBHOOK_URL")
+    use_webhook = bool(public_domain or webhook_url)
+
+    if use_webhook:
+        base = webhook_url or f"https://{public_domain}"
+        full = f"{base}/{BOT_TOKEN}"
+        print(f"🌐 Webhook mode: {base}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.getenv("PORT", "8080")),
+            url_path=BOT_TOKEN,
+            webhook_url=full,
+        )
+    else:
+        while True:
+            try:
+                app.run_polling(drop_pending_updates=True, close_loop=False)
+                break
+            except Conflict:
+                print("⚠️ Conflict: another bot instance is already polling this token. "
+                      "Make sure ONLY ONE instance is running (stop local bot if deployed, "
+                      "or set Railway replicas to 1). Retrying in 15s...")
+                time.sleep(15)
+            except KeyboardInterrupt:
+                break
 
 
 if __name__ == "__main__":
