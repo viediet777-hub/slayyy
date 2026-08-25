@@ -1,4 +1,15 @@
 {
-  "users": {},
+  "users": {
+    "1364476174": {
+      "points": 0,
+      "codes": 0,
+      "referred_by": null,
+      "credited": false,
+      "joined": false,
+      "username": "Viedietextraa",
+      "phone": null,
+      "codes_list": []
+    }
+  },
   "referrals": {}
 }
