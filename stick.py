@@ -15,6 +15,7 @@ import uuid
 import hashlib
 import base64
 import asyncio
+import threading
 import requests
 import cloudscraper
 import warnings
@@ -786,10 +787,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -832,12 +830,16 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
 
-    # Periodic GitHub backup every 5 minutes
-    async def _github_job(context: ContextTypes.DEFAULT_TYPE):
-        await asyncio.to_thread(github_push)
-
+    # Periodic GitHub backup every 5 minutes (background thread, no job-queue needed)
     if GITHUB_TOKEN:
-        app.job_queue.run_repeating(_github_job, interval=300, first=60)
+        def _github_backup_loop():
+            while True:
+                time.sleep(300)
+                try:
+                    github_push()
+                except Exception:
+                    pass
+        threading.Thread(target=_github_backup_loop, daemon=True).start()
 
     print("🤖 Bot started... Made By Viediet")
     app.run_polling()
