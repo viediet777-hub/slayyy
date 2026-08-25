@@ -277,8 +277,18 @@ class LenskartDevice:
         self.auth_token = None
         self.user_id = None
         self.customer_type = "EXISTING"
-        self.s = cloudscraper.create_scraper()
+        self.s = self._new_scraper()
         self.x_assertion = self._x_assertion()
+        # Prime: collect Cloudflare cookies so the API call isn't challenged
+        try:
+            self.s.get(BASE, headers=self._headers(), timeout=20)
+        except Exception:
+            pass
+
+    def _new_scraper(self):
+        return cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
 
     def _x_assertion(self):
         d = f"{self.udid}:{self.advertising_id}:{self.brand}:{self.model}:{self.phone}"
@@ -340,7 +350,7 @@ class LenskartDevice:
             except Exception as e:
                 last = ("EXC", str(e)[:120])
             # Fresh scraper to beat a new Cloudflare challenge, then backoff
-            self.s = cloudscraper.create_scraper()
+            self.s = self._new_scraper()
             time.sleep(1.5 * (attempt + 1))
         print(f"[create_session] FAILED after retries. last_response={last}")
         return False
@@ -358,7 +368,7 @@ class LenskartDevice:
                     return res
             except Exception:
                 pass
-            self.s = cloudscraper.create_scraper()
+            self.s = self._new_scraper()
             time.sleep(1.5 * (attempt + 1))
         return None
 
