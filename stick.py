@@ -88,28 +88,33 @@ def load_data():
 def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
-    github_push()
+    # Push to GitHub in background so it never blocks the bot event loop
+    if GITHUB_TOKEN:
+        threading.Thread(target=github_push, daemon=True).start()
 
 
 def github_push():
     """Backup bot_data.json to GitHub repo (owner/repo above)."""
-    if not GITHUB_TOKEN:
-        return
-    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_PATH}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
     try:
-        with open(DATA_FILE, "r") as f:
-            content = f.read()
-    except Exception:
-        return
-    try:
+        if not GITHUB_TOKEN:
+            return
+        url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_PATH}"
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        }
+        try:
+            with open(DATA_FILE, "r") as f:
+                content = f.read()
+        except Exception:
+            return
         sha = None
-        r = requests.get(url, headers=headers, timeout=20)
-        if r.status_code == 200:
-            sha = r.json().get("sha")
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            if r.status_code == 200:
+                sha = r.json().get("sha")
+        except Exception:
+            pass
         payload = {
             "message": "Update bot_data.json [bot backup]",
             "content": base64.b64encode(content.encode()).decode(),
