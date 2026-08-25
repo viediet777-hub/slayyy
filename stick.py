@@ -42,10 +42,11 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "1364476174").split(",") if x.strip()]
 
-# GitHub backup (set GITHUB_TOKEN env var; owner/repo default to your repo)
+# GitHub backup → SEPARATE data repo (so pushes never trigger Railway redeploy)
+# Owner/repo default to your dedicated data repo: https://github.com/viediet777-hub/bp
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "viediet777-hub")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "slayyy")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "bp")
 GITHUB_PATH = "bot_data.json"
 
 CHANNEL_USERNAME = "@viedietlooters"
@@ -150,12 +151,15 @@ def get_user(uid):
 # RAW TELEGRAM API (styled buttons)
 # ============================================================
 def _tg_request(method, payload):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    r = requests.post(url, json=payload, timeout=30)
     try:
-        return r.json()
-    except Exception:
-        return {"ok": False, "raw": r.text[:200]}
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+        r = requests.post(url, json=payload, timeout=30)
+        try:
+            return r.json()
+        except Exception:
+            return {"ok": False, "raw": r.text[:200]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
 
 
 def _strip_icons(mk):
