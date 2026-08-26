@@ -5,16 +5,13 @@ import os
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
 from hashlib import md5
-from io import BytesIO
 
 import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("bot")
 
-# ── ENV ──────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or ""
 ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "1364476174").split(",") if x.strip()]
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db"))
@@ -30,53 +27,44 @@ def get_db():
     db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id INTEGER PRIMARY KEY,
-            user_id TEXT, username TEXT, first_name TEXT,
-            points INTEGER DEFAULT 0,
-            referral_code TEXT UNIQUE,
-            referred_by INTEGER,
-            created_at TEXT DEFAULT (datetime('now')),
-            is_banned INTEGER DEFAULT 0
-        )""")
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS referrals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            referrer_id INTEGER,
-            referee_id INTEGER,
-            created_at TEXT DEFAULT (datetime('now'))
-        )""")
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            amount INTEGER,
-            type TEXT,
-            description TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
-        )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS users (
+        chat_id INTEGER PRIMARY KEY, user_id TEXT, username TEXT, first_name TEXT,
+        points INTEGER DEFAULT 0, referral_code TEXT UNIQUE, referred_by INTEGER,
+        created_at TEXT DEFAULT (datetime('now')), is_banned INTEGER DEFAULT 0)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS referrals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, referee_id INTEGER,
+        created_at TEXT DEFAULT (datetime('now')))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, amount INTEGER,
+        type TEXT, description TEXT, created_at TEXT DEFAULT (datetime('now')))""")
     db.commit()
     return db
 
 
 def user_exists(chat_id):
-    row = get_db().execute("SELECT 1 FROM users WHERE chat_id=?", (chat_id,)).fetchone()
-    return row is not None
+    return get_db().execute("SELECT 1 FROM users WHERE chat_id=?", (chat_id,)).fetchone() is not None
 
 
 def get_user(chat_id):
     return get_db().execute("SELECT * FROM users WHERE chat_id=?", (chat_id,)).fetchone()
 
 
-def create_user(chat_id, user_id, username, first_name, referred_by=None):
-    db = get_db()
+def ensure_user(chat_id, user_id, username, first_name):
+    u = get_db().execute("SELECT * FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+    if u:
+        return u
     code = md5(f"{chat_id}_{time.time()}".encode()).hexdigest()[:8]
-    db.execute("""
-        INSERT OR IGNORE INTO users (chat_id, user_id, username, first_name, referral_code, referred_by)
-        VALUES (?,?,?,?,?,?)
-    """, (chat_id, str(user_id) if user_id else "", username or "", first_name or "", code, referred_by))
-    db.commit()
+    get_db().execute("""INSERT OR IGNORE INTO users (chat_id, user_id, username, first_name, referral_code)
+        VALUES (?,?,?,?,?)""", (chat_id, str(user_id) or "", username or "", first_name or "", code))
+    get_db().commit()
+    return get_user(chat_id)
+
+
+def create_user(chat_id, user_id, username, first_name, referred_by=None):
+    code = md5(f"{chat_id}_{time.time()}".encode()).hexdigest()[:8]
+    get_db().execute("""INSERT OR IGNORE INTO users (chat_id, user_id, username, first_name, referral_code, referred_by)
+        VALUES (?,?,?,?,?,?)""", (chat_id, str(user_id) or "", username or "", first_name or "", code, referred_by))
+    get_db().commit()
     return code
 
 
@@ -89,25 +77,20 @@ def add_points(chat_id, amount, typ, desc):
 
 
 def get_points(chat_id):
-    row = get_db().execute("SELECT points FROM users WHERE chat_id=?", (chat_id,)).fetchone()
-    return row["points"] if row else 0
+    return (get_db().execute("SELECT points FROM users WHERE chat_id=?", (chat_id,)).fetchone() or {}).get("points", 0)
 
 
 def get_leaderboard(limit=10):
-    return get_db().execute(
-        "SELECT chat_id, username, first_name, points FROM users ORDER BY points DESC LIMIT ?",
-        (limit,)).fetchall()
+    return get_db().execute("SELECT chat_id, username, first_name, points FROM users ORDER BY points DESC LIMIT ?", (limit,)).fetchall()
 
 
 def count_referrals(chat_id):
-    row = get_db().execute("SELECT COUNT(*) c FROM referrals WHERE referrer_id=?", (chat_id,)).fetchone()
-    return row["c"] if row else 0
+    return (get_db().execute("SELECT COUNT(*) c FROM referrals WHERE referrer_id=?", (chat_id,)).fetchone() or {}).get("c", 0)
 
 
 def record_referral(referrer_id, referee_id):
-    db = get_db()
-    db.execute("INSERT INTO referrals (referrer_id, referee_id) VALUES (?,?)", (referrer_id, referee_id))
-    db.commit()
+    get_db().execute("INSERT INTO referrals (referrer_id, referee_id) VALUES (?,?)", (referrer_id, referee_id))
+    get_db().commit()
 
 
 def all_users():
@@ -115,18 +98,18 @@ def all_users():
 
 
 def total_users():
-    return get_db().execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    return (get_db().execute("SELECT COUNT(*) c FROM users").fetchone() or {}).get("c", 0)
 
 
 def total_points():
-    return get_db().execute("SELECT COALESCE(SUM(points),0) s FROM users").fetchone()["s"]
+    return (get_db().execute("SELECT COALESCE(SUM(points),0) s FROM users").fetchone() or {}).get("s", 0)
 
 
 def total_referrals():
-    return get_db().execute("SELECT COUNT(*) c FROM referrals").fetchone()["c"]
+    return (get_db().execute("SELECT COUNT(*) c FROM referrals").fetchone() or {}).get("c", 0)
 
 
-# ── SWIGGY OFFER API ─────────────────────────────────────────────────────────
+# ── SWIGGY API ───────────────────────────────────────────────────────────────
 
 CAMPAIGN_HOST = "https://disc.swiggy.com"
 CAMPAIGN_ID = "rakhi_wars"
@@ -152,10 +135,8 @@ OFFER_LINKS = [
 ]
 
 LOGIN_HEADERS = {
-    "Accept": "application/json; charset=utf-8",
-    "app-version": "4.106.1", "category": "food",
-    "deviceId": DEVICE_ID, "swuid": DEVICE_ID,
-    "os-version": "9", "pl-version": "131",
+    "Accept": "application/json; charset=utf-8", "app-version": "4.106.1", "category": "food",
+    "deviceId": DEVICE_ID, "swuid": DEVICE_ID, "os-version": "9", "pl-version": "131",
     "User-Agent": "Swiggy-Android", "version-code": "1716", "x-channel": "swiggy",
 }
 
@@ -173,46 +154,6 @@ class SwiggyError(Exception):
     pass
 
 
-def send_otp(mobile10):
-    r = requests.get(f"{SMS_OTP_URL}?mobile={mobile10}", headers=LOGIN_HEADERS, timeout=30)
-    return _checked(r)
-
-
-def verify_otp(mobile10, otp, tid, sid):
-    h = {**LOGIN_HEADERS, "sid": sid, "Tid": tid, "Content-Type": "application/json; charset=utf-8"}
-    p = {"cloningSignalsData": {"appFilesDirPathInvalid": 0, "developerModeEnabled": 1,
-                                "deviceModelVmos": 0, "emulatorStatus": 0,
-                                "packageName": "in.swiggy.android", "workProfileEnabled": 0},
-         "otp": otp}
-    r = requests.post(f"{VERIFY_URL}?otp_source=Sms-automatic", headers=h, json=p, timeout=30)
-    return _checked(r)
-
-
-def _jwt_payload(token):
-    try:
-        p = token.split(".")[1] + "=" * (-len(token.split(".")[1]) % 4)
-        return json.loads(base64.urlsafe_b64decode(p))
-    except Exception:
-        return {}
-
-
-def build_session(v):
-    tid = v.get("tid", "")
-    sid = v.get("sid", "")
-    payload = _jwt_payload(tid)
-    userid = payload.get("user_id") or ""
-    if not userid:
-        d = v.get("data") or {}
-        user = d.get("user") or {}
-        userid = str(user.get("id") or d.get("user_id") or d.get("userId") or "")
-    token = ""
-    for k in ("token", "accessToken", "refreshToken"):
-        if (v.get("data") or {}).get(k):
-            token = (v.get("data") or {})[k]
-            break
-    return {"userid": userid, "tid": tid, "sid": sid, "token": token}
-
-
 def _checked(r):
     try:
         d = r.json()
@@ -226,6 +167,51 @@ def _checked(r):
     if isinstance(st, int) and st != 0:
         raise SwiggyError(f"api error {st}: {d.get('statusMessage')}")
     return d
+
+
+def send_otp(mobile10):
+    return _checked(requests.get(f"{SMS_OTP_URL}?mobile={mobile10}", headers=LOGIN_HEADERS, timeout=30))
+
+
+def verify_otp(mobile10, otp, tid, sid):
+    h = {**LOGIN_HEADERS, "sid": sid, "Tid": tid, "Content-Type": "application/json; charset=utf-8"}
+    p = {"cloningSignalsData": {"appFilesDirPathInvalid": 0, "developerModeEnabled": 1,
+                                "deviceModelVmos": 0, "emulatorStatus": 0,
+                                "packageName": "in.swiggy.android", "workProfileEnabled": 0},
+         "otp": otp}
+    return _checked(requests.post(f"{VERIFY_URL}?otp_source=Sms-automatic", headers=h, json=p, timeout=30))
+
+
+def _jwt_payload(token):
+    try:
+        part = token.split(".")[1] + "=" * (-len(token.split(".")[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(part))
+    except Exception:
+        return {}
+
+
+def build_session(v):
+    tid = v.get("tid", "")
+    sid = v.get("sid", "")
+    userid = _jwt_payload(tid).get("user_id") or ""
+    token = ""
+    for k in ("token", "accessToken", "refreshToken"):
+        if (v.get("data") or {}).get(k):
+            token = (v.get("data") or {})[k]
+            break
+    return {"userid": userid, "tid": tid, "sid": sid, "token": token}
+
+
+def build_session_from_json(obj):
+    tid = obj.get("tid") or ""
+    sid = obj.get("sid") or ""
+    if "data" in obj and tid:
+        return build_session(obj)
+    userid = str(obj.get("userid") or obj.get("userId") or obj.get("user_id") or "")
+    token = obj.get("token") or ""
+    if not userid and tid:
+        userid = str(_jwt_payload(tid).get("user_id") or "")
+    return {"userid": userid, "tid": tid, "sid": sid, "token": token}
 
 
 def _sh(session, referral="", **extra):
@@ -257,7 +243,8 @@ def run_one(session, ref, team=1):
         campaign_details(session, ref)
         campaign_submit(session, "JOIN_MATCH", team, ref)
         for _ in range(5):
-            if (campaign_submit(session, "ATTACK", team, ref).get("data") or {}).get("userState", {}).get("attacksLeft", 0) <= 0:
+            atk = campaign_submit(session, "ATTACK", team, ref)
+            if (atk.get("data") or {}).get("userState", {}).get("attacksLeft", 0) <= 0:
                 break
             time.sleep(1)
         campaign_poll(session, ref)
@@ -284,60 +271,62 @@ def is_admin(uid):
     return uid in ADMIN_IDS
 
 
+def main_menu(uid=None):
+    rows = [
+        [btn("My Balance", "balance", "primary")],
+        [btn("Invite Friends", "invite", "success"),
+         btn("Leaderboard", "leaderboard", "primary")],
+        [btn("Rakhi Offer", "rakhi_offer", "danger")],
+    ]
+    if uid and is_admin(uid):
+        rows.append([btn("Admin Panel", "admin_panel", "danger")])
+    return InlineKeyboardMarkup(rows)
+
+
 # ── force-join ───────────────────────────────────────────────────────────────
 
-# numeric chat ids resolved at startup (more reliable than usernames)
 CHAT_IDS = {}
 
 
 async def resolve_chat_ids(app):
     for ch in REQUIRED_CHANNELS:
         try:
-            chat = await app.bot.get_chat(_chat_username(ch["username"]))
+            chat = await app.bot.get_chat("@" + ch["username"])
             CHAT_IDS[ch["username"]] = chat.id
             log.info("resolved %s -> %s", ch["username"], chat.id)
         except Exception as e:
             log.warning("could not resolve %s: %s", ch["username"], e)
 
 
-def _chat_username(u):
-    return u if u.startswith("@") else "@" + u
-
-
 async def check_membership(bot, user_id):
-    """Returns (ok, missing_channel). Fail-open: if the bot can't verify a chat
-    (e.g. not in it), that chat is skipped so users aren't locked out."""
     for ch in REQUIRED_CHANNELS:
-        chat_id = CHAT_IDS.get(ch["username"]) or _chat_username(ch["username"])
+        chat_id = CHAT_IDS.get(ch["username"]) or ("@" + ch["username"])
         try:
             member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
             if member.status not in ("creator", "administrator", "member", "restricted"):
                 return False, ch
         except Exception as e:
-            log.warning("membership check skipped for %s user %s: %s",
-                        ch["username"], user_id, e)
+            log.warning("membership skip %s user %s: %s", ch["username"], user_id, e)
             continue
     return True, None
 
 
 def force_join_kb():
-    rows = [[InlineKeyboardButton(f"🔗 {ch['title']}", url=ch["url"])]
+    rows = [[InlineKeyboardButton("Join " + ch["title"], url=ch["url"])]
             for ch in REQUIRED_CHANNELS]
-    rows.append([btn("✅ I've Joined", "join_verified", "success")])
+    rows.append([btn("I've Joined", "join_verified", "success")])
     return InlineKeyboardMarkup(rows)
 
 
 def force_join_text():
-    lines = ["🔒 **Join to continue using the bot**\n"]
+    lines = ["Join to continue using the bot"]
     for ch in REQUIRED_CHANNELS:
-        lines.append(f"• {ch['title']}: {ch['url']}")
-    lines.append("\nJoin both, then tap 'I've Joined' ✅")
+        lines.append("* " + ch["title"] + ": " + ch["url"])
+    lines.append("\nJoin both, then tap 'I've Joined'.")
     return "\n".join(lines)
 
 
 async def ensure_joined(update, ctx):
-    """If user not in required channels, show join prompt and return False.
-    Admins are always allowed."""
     uid = update.effective_user.id
     if is_admin(uid):
         return True
@@ -345,12 +334,9 @@ async def ensure_joined(update, ctx):
     if not ok:
         if update.callback_query:
             await update.callback_query.answer()
-            await update.callback_query.edit_message_text(
-                force_join_text(), parse_mode="Markdown",
-                reply_markup=force_join_kb())
+            await update.callback_query.edit_message_text(force_join_text(), reply_markup=force_join_kb())
         else:
-            await update.message.reply_text(force_join_text(), parse_mode="Markdown",
-                                            reply_markup=force_join_kb())
+            await update.message.reply_text(force_join_text(), reply_markup=force_join_kb())
         return False
     return True
 
@@ -361,37 +347,22 @@ async def join_verified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     if is_admin(uid):
         if not user_exists(uid):
-            user = q.from_user
-            create_user(uid, user.id, user.username, user.first_name)
+            u = q.from_user
+            create_user(uid, u.id, u.username, u.first_name)
             add_points(uid, 2, "signup", "New user bonus")
-        await q.edit_message_text("✅ Welcome admin! Main menu below.",
-                                  reply_markup=main_menu())
+        await q.edit_message_text("Welcome admin!", reply_markup=main_menu(uid))
         return
     ok, missing = await check_membership(ctx.bot, uid)
     if not ok:
-        await q.answer(f"You haven't joined {missing['title']} yet!",
-                       show_alert=True)
+        await q.answer("You haven't joined " + missing["title"] + " yet!", show_alert=True)
         return
     if not user_exists(uid):
-        user = q.from_user
-        create_user(uid, user.id, user.username, user.first_name)
+        u = q.from_user
+        create_user(uid, u.id, u.username, u.first_name)
         add_points(uid, 2, "signup", "New user bonus")
-        await q.edit_message_text(
-            f"🎉 Welcome {user.first_name}! +2 points credited.\n"
-            f"Invite friends to earn more points!",
-            reply_markup=main_menu())
+        await q.edit_message_text("Welcome! +2 points credited.\nInvite friends to earn more!", reply_markup=main_menu(uid))
     else:
-        await q.edit_message_text("✅ Verified! Welcome back.", reply_markup=main_menu())
-
-
-def main_menu():
-    return InlineKeyboardMarkup([
-        [btn("👤 My Balance", "balance", "primary")],
-        [btn("👥 Invite Friends", "invite", "success"),
-         btn("🏆 Leaderboard", "leaderboard", "primary")],
-        [btn("⚡ Rakhi Offer", "rakhi_offer", "danger")],
-        [btn("🔧 Admin Panel", "admin_panel", "danger")],
-    ])
+        await q.edit_message_text("Verified! Welcome back.", reply_markup=main_menu(uid))
 
 
 # ── handlers ─────────────────────────────────────────────────────────────────
@@ -401,19 +372,13 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = ctx.args or []
     referrer_code = args[0] if args else None
-
-    # store pending referral for when they join
     if referrer_code:
         LOGIN_SESSIONS[uid] = {"state": "pending_ref", "referrer_code": referrer_code}
-
     if not await ensure_joined(update, ctx):
         return
-
-    # referral applied only after membership verified
     pending = LOGIN_SESSIONS.pop(uid, None)
     if pending and pending.get("referrer_code") and not user_exists(uid):
         referrer_code = pending["referrer_code"]
-
     if not user_exists(uid):
         referred_by = None
         if referrer_code:
@@ -424,71 +389,62 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         add_points(uid, 2, "signup", "New user bonus")
         if referred_by:
             record_referral(referred_by, uid)
-            add_points(referred_by, 2, "referral_bonus", f"Referred user {uid}")
+            add_points(referred_by, 2, "referral_bonus", "Referred user " + str(uid))
             try:
-                await ctx.bot.send_message(referred_by, f"🎉 Referral bonus! +2 points (user @{user.username or uid})")
+                await ctx.bot.send_message(referred_by, "Referral bonus! +2 points (user @" + str(user.username or uid) + ")")
             except Exception:
                 pass
-        await update.message.reply_text(
-            f"🎉 Welcome {user.first_name}! +2 points credited.\n"
-            f"Invite friends to earn more points!\n"
-            f"Your referral: {referrer_code or ''}",
-            reply_markup=main_menu())
+        await update.message.reply_text("Welcome! +2 points credited.\nInvite friends to earn more!", reply_markup=main_menu(uid))
     else:
-        await update.message.reply_text(f"👋 Welcome back {user.first_name}!", reply_markup=main_menu())
+        await update.message.reply_text("Welcome back " + (user.first_name or "") + "!", reply_markup=main_menu(uid))
 
 
 async def balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
+    ensure_user(uid, uid, q.from_user.username, q.from_user.first_name)
     u = get_user(uid)
     refs = count_referrals(uid)
-    txt = (
-        f"👤 **Your Dashboard**\n\n"
-        f"💰 Points: `{u['points']}`\n"
-        f"👥 Referrals: `{refs}`\n"
-        f"🔗 Code: `{u['referral_code']}`\n"
-        f"📅 Joined: {u['created_at']}"
-    )
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=main_menu())
+    txt = ("Your Dashboard\n\n"
+           "Points: " + str(u["points"]) + "\n"
+           "Referrals: " + str(refs) + "\n"
+           "Code: " + u["referral_code"] + "\n"
+           "Joined: " + u["created_at"])
+    await q.edit_message_text(txt, reply_markup=main_menu(uid))
 
 
 async def invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
+    ensure_user(uid, uid, q.from_user.username, q.from_user.first_name)
     u = get_user(uid)
-    link = f"https://t.me/Viedietbypass_bot?start={u['referral_code']}"
-    txt = (
-        f"👥 **Invite Friends**\n\n"
-        f"Share your referral link:\n`{link}`\n\n"
-        f"🎁 You get **+2 points** and your friend gets **+2 points**\n"
-        f"📊 Referrals so far: `{count_referrals(uid)}`"
-    )
-    kb = InlineKeyboardMarkup([
-        [btn("📋 Copy Link", f"copy_{link}", "primary")],
-        [btn("🔙 Back", "back_menu", "danger")],
-    ])
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+    link = "https://t.me/Viedietbypass_bot?start=" + u["referral_code"]
+    txt = ("Invite Friends\n\nShare your referral link:\n" + link +
+           "\n\nYou get +2 points and your friend gets +2 points\nReferrals: " + str(count_referrals(uid)))
+    kb = InlineKeyboardMarkup([[btn("Copy Link", f"copy_{link}", "primary")], [btn("Back", "back_menu", "danger")]])
+    await q.edit_message_text(txt, reply_markup=kb)
 
 
 async def leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    uid = q.from_user.id
     lb = get_leaderboard(10)
     lines = []
     for i, row in enumerate(lb, 1):
         name = row["first_name"] or row["username"] or f"User{row['chat_id']}"
-        lines.append(f"{i}. {name} — `{row['points']}` pts")
-    txt = "🏆 **Leaderboard**\n\n" + "\n".join(lines) + "\n\n🔙 Back to menu"
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=main_menu())
+        lines.append(f"{i}. {name} - {row['points']} pts")
+    txt = "Leaderboard\n\n" + "\n".join(lines) + "\n\nBack to menu"
+    await q.edit_message_text(txt, reply_markup=main_menu(uid))
 
 
 async def back_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text("📌 **Main Menu**", parse_mode="Markdown", reply_markup=main_menu())
+    uid = q.from_user.id
+    await q.edit_message_text("Main Menu", reply_markup=main_menu(uid))
 
 
 async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -496,24 +452,21 @@ async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     uid = q.from_user.id
     if not is_admin(uid):
-        await q.edit_message_text("⛔ Access denied. Only admins.", reply_markup=main_menu())
+        await q.edit_message_text("Access denied. Only admins.", reply_markup=main_menu(uid))
         return
-    txt = (
-        f"🔧 **Admin Panel**\n\n"
-        f"👥 Total users: `{total_users()}`\n"
-        f"💰 Total points: `{total_points()}`\n"
-        f"🔗 Total referrals: `{total_referrals()}`\n\n"
-        f"Commands:\n"
-        f"`/give [user_id] [points]`\n"
-        f"`/stats` — detailed stats\n"
-        f"`/users` — list all users"
-    )
+    txt = ("Admin Panel\n\n"
+           "Total users: " + str(total_users()) + "\n"
+           "Total points: " + str(total_points()) + "\n"
+           "Total referrals: " + str(total_referrals()) + "\n\n"
+           "/give [user_id] [points]\n"
+           "/stats - detailed stats\n"
+           "/users - list all users")
     kb = InlineKeyboardMarkup([
-        [btn("📊 Stats", "admin_stats", "primary")],
-        [btn("👥 All Users", "admin_users", "primary")],
-        [btn("🔙 Back", "back_menu", "danger")],
+        [btn("Stats", "admin_stats", "primary")],
+        [btn("All Users", "admin_users", "primary")],
+        [btn("Back", "back_menu", "danger")],
     ])
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+    await q.edit_message_text(txt, reply_markup=kb)
 
 
 async def admin_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -521,18 +474,14 @@ async def admin_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if not is_admin(q.from_user.id):
         return
-    txt = (
-        f"📊 **Bot Statistics**\n\n"
-        f"👥 Total users: `{total_users()}`\n"
-        f"💰 Total points issued: `{total_points()}`\n"
-        f"🔗 Total referrals: `{total_referrals()}`\n"
-        f"🆔 Admins: `{ADMIN_IDS}`"
-    )
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=admin_back_kb())
-
-
-def admin_back_kb():
-    return InlineKeyboardMarkup([[btn("🔙 Back to Admin", "admin_panel", "danger")]])
+    uid = q.from_user.id
+    txt = ("Bot Statistics\n\n"
+           "Total users: " + str(total_users()) + "\n"
+           "Total points: " + str(total_points()) + "\n"
+           "Total referrals: " + str(total_referrals()) + "\n"
+           "Admins: " + str(ADMIN_IDS))
+    kb = InlineKeyboardMarkup([[btn("Back to Admin", "admin_panel", "danger")]])
+    await q.edit_message_text(txt, reply_markup=kb)
 
 
 async def admin_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -540,22 +489,23 @@ async def admin_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if not is_admin(q.from_user.id):
         return
+    uid = q.from_user.id
     us = all_users()
     lines = []
     for u in us[:20]:
-        lines.append(f"`{u['chat_id']}` | {u['first_name'] or u['username'] or '?'} | `{u['points']}` pts")
-    txt = "👥 **Users (last 20)**\n\n" + "\n".join(lines) + "\n\n🔙 Back"
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=admin_back_kb())
+        lines.append(f"{u['chat_id']} | {u['first_name'] or u['username'] or '?'} | {u['points']} pts")
+    txt = "Users (last 20)\n\n" + "\n".join(lines)
+    await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[btn("Back to Admin", "admin_panel", "danger")]]))
 
 
 async def handle_give(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
-        await update.message.reply_text("⛔ Only admins can use this command.")
+        await update.message.reply_text("Only admins can use this command.")
         return
     args = ctx.args
     if len(args) < 2:
-        await update.message.reply_text("Usage: `/give [user_id] [points]`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: /give [user_id] [points]")
         return
     try:
         target = int(args[0])
@@ -564,47 +514,42 @@ async def handle_give(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid user_id or points.")
         return
     if not user_exists(target):
-        await update.message.reply_text(f"User `{target}` not found in database.", parse_mode="Markdown")
+        await update.message.reply_text("User " + str(target) + " not found in database.")
         return
-    add_points(target, pts, "admin_gift", f"Admin {uid} gave {pts} points")
-    await update.message.reply_text(f"✅ `{pts}` points given to user `{target}`.", parse_mode="Markdown")
+    add_points(target, pts, "admin_gift", "Admin " + str(uid) + " gave " + str(pts) + " points")
+    await update.message.reply_text(str(pts) + " points given to user " + str(target) + ".")
 
 
 async def handle_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin(uid):
+    if not is_admin(update.effective_user.id):
         return
-    txt = (
-        f"📊 **Bot Statistics**\n\n"
-        f"👥 Total users: `{total_users()}`\n"
-        f"💰 Total points: `{total_points()}`\n"
-        f"🔗 Total referrals: `{total_referrals()}`\n"
-        f"🆔 Admins: `{ADMIN_IDS}`"
-    )
-    await update.message.reply_text(txt, parse_mode="Markdown")
+    txt = ("Bot Statistics\n\n"
+           "Total users: " + str(total_users()) + "\n"
+           "Total points: " + str(total_points()) + "\n"
+           "Total referrals: " + str(total_referrals()) + "\n"
+           "Admins: " + str(ADMIN_IDS))
+    await update.message.reply_text(txt)
 
 
 async def handle_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin(uid):
+    if not is_admin(update.effective_user.id):
         return
     us = all_users()
     lines = []
     for u in us:
-        lines.append(f"`{u['chat_id']}` | `{u['first_name'] or u['username'] or '?'}` | `{u['points']}` pts | `{u['referral_code']}`")
+        lines.append(f"{u['chat_id']} | {u['first_name'] or u['username'] or '?'} | {u['points']} pts | {u['referral_code']}")
     chunk = "\n".join(lines)
     for i in range(0, len(chunk), 4000):
-        await update.message.reply_text(chunk[i:i + 4000], parse_mode="Markdown")
+        await update.message.reply_text(chunk[i:i + 4000])
 
 
 # ── Rakhi Offer flow ─────────────────────────────────────────────────────────
 
 def login_method_kb():
-    """Choose OTP or JSON login."""
     return InlineKeyboardMarkup([
-        [btn("📱 Login with OTP", "login_otp", "primary")],
-        [btn("📄 Login with JSON", "login_json", "success")],
-        [btn("🔙 Back", "back_menu", "danger")],
+        [btn("Login with OTP", "login_otp", "primary")],
+        [btn("Login with JSON", "login_json", "success")],
+        [btn("Back", "back_menu", "danger")],
     ])
 
 
@@ -613,21 +558,16 @@ async def rakhi_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if not await ensure_joined(update, ctx):
         return
-    await q.edit_message_text(
-        "⚡ **Rakhi Sibling Wars Offer**\n\n"
-        "Choose login method:",
-        parse_mode="Markdown", reply_markup=login_method_kb())
+    uid = q.from_user.id
+    await q.edit_message_text("Rakhi Sibling Wars Offer\n\nChoose login method:", reply_markup=login_method_kb())
 
 
 async def login_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    LOGIN_SESSIONS[uid] = {"state": "await_mobile", "mobile": None, "tid": None,
-                           "sid": None, "headers": None, "team": 1}
-    await q.edit_message_text(
-        "📱 **OTP Login**\n\nSend your 10-digit mobile number:\n(/cancel to exit)",
-        parse_mode="Markdown")
+    LOGIN_SESSIONS[uid] = {"state": "await_mobile", "mobile": None, "tid": None, "sid": None, "headers": None, "team": 1}
+    await q.edit_message_text("OTP Login\n\nSend your 10-digit mobile number:\n(/cancel to exit)")
 
 
 async def login_json(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -635,78 +575,12 @@ async def login_json(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     uid = q.from_user.id
     LOGIN_SESSIONS[uid] = {"state": "await_json", "headers": None, "team": 1}
-    await q.edit_message_text(
-        "📄 **JSON Login**\n\n"
-        "Paste your session JSON:\n"
-        "```json\n{\"tid\": \"...\", \"sid\": \"...\", "
-        "\"userid\": \"...\", \"token\": \"...\"}\n```\n"
-        "Or paste the full login response JSON.\n"
-        "Minimum required: `tid` + `sid` or `userid`.\n"
-        "(/cancel to exit)",
-        parse_mode="Markdown")
-
-
-def build_session_from_json(obj):
-    tid = obj.get("tid") or ""
-    sid = obj.get("sid") or ""
-    # if it looks like a full verify response (has data + top-level tid)
-    if "data" in obj and tid:
-        return build_session(obj)
-    userid = str(obj.get("userid") or obj.get("userId") or obj.get("user_id") or "")
-    token = obj.get("token") or ""
-    if not userid and tid:
-        userid = str(_jwt_payload(tid).get("user_id") or "")
-    return {"userid": userid, "tid": tid, "sid": sid, "token": token}
-
-
-# ── callback router ──────────────────────────────────────────────────────────
-
-async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    data = q.data
-    uid = q.from_user.id
-    admin_only = data in ("admin_panel", "admin_stats", "admin_users")
-    if data != "join_verified" and not admin_only and not is_admin(uid):
-        if not await check_membership(ctx.bot, uid)[0]:
-            await q.answer()
-            await q.edit_message_text(force_join_text(), parse_mode="Markdown",
-                                      reply_markup=force_join_kb())
-            return
-    handlers = {
-        "balance": balance,
-        "invite": invite,
-        "leaderboard": leaderboard,
-        "back_menu": back_menu,
-        "admin_panel": admin_panel,
-        "admin_stats": admin_stats,
-        "admin_users": admin_users,
-        "rakhi_offer": rakhi_offer,
-        "login_otp": login_otp,
-        "login_json": login_json,
-        "join_verified": join_verified,
-    }
-    if data.startswith("copy_"):
-        await q.answer(text=data[5:], show_alert=True)
-        return
-    if data.startswith("team:"):
-        uid = q.from_user.id
-        s = LOGIN_SESSIONS.get(uid)
-        if s:
-            s["team"] = int(data.split(":")[1])
-        await q.edit_message_text(f"Team set. Now Run:", reply_markup=team_kb())
-        return
-    if data == "run":
-        await run_offers(update, ctx)
-        return
-    fn = handlers.get(data)
-    if fn:
-        await fn(update, ctx)
+    await q.edit_message_text("JSON Login\n\nPaste your session JSON:\n{\"tid\": \"...\", \"sid\": \"...\", \"userid\": \"...\"}\nMinimum: tid + sid\n(/cancel to exit)")
 
 
 def team_kb():
     return InlineKeyboardMarkup([
-        [btn("Sister (SIS)", "team:1", "primary"),
-         btn("Brother (BRO)", "team:2", "danger")],
+        [btn("Sister (SIS)", "team:1", "primary"), btn("Brother (BRO)", "team:2", "danger")],
         [btn("Run all 10 offers", "run", "success")],
     ])
 
@@ -717,10 +591,10 @@ async def run_offers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     s = LOGIN_SESSIONS.get(uid)
     if not s or not s.get("headers"):
-        await q.edit_message_text("❌ Not logged in. Start again with ⚡ Rakhi Offer.")
+        await q.edit_message_text("Not logged in. Start again with Rakhi Offer.")
         return
     team = s["team"]
-    msg = await q.edit_message_text(f"Running {len(OFFER_LINKS)} offers (team {team})...")
+    msg = await q.edit_message_text("Running " + str(len(OFFER_LINKS)) + " offers (team " + str(team) + ")...")
     results = []
     for i, link in enumerate(OFFER_LINKS, 1):
         m = re.search(r"rakhi_wars-([A-Za-z0-9_-]+)", link)
@@ -729,16 +603,70 @@ async def run_offers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         results.append((code, ok, err))
         lines = "\n".join(f"{'OK' if ok else 'ERR'}  {c}" for c, ok, *_ in results)
         try:
-            await msg.edit_text(f"Running {len(OFFER_LINKS)} offers...\n\n{lines}" +
+            await msg.edit_text("Running " + str(len(OFFER_LINKS)) + " offers...\n\n" + lines +
                                 ("\n\nWorking..." if i < len(OFFER_LINKS) else "\n\nDone!"))
         except Exception:
             pass
     done = sum(1 for _, ok, _ in results if ok)
-    detail = "\n".join(f"{'OK' if ok else 'ERR'} `{c}`" + (f"\n    {e}" if not ok else "") for c, ok, e in results)
-    await ctx.bot.send_message(uid, f"Finished: {done}/{len(OFFER_LINKS)} completed.\n\n{detail}", parse_mode="Markdown")
+    detail = "\n".join(f"{'OK' if ok else 'ERR'} {c}" + (f"\n  {e}" if not ok else "") for c, ok, e in results)
+    await ctx.bot.send_message(uid, "Finished: " + str(done) + "/" + str(len(OFFER_LINKS)) + " completed.\n\n" + detail)
 
 
-# ── OTP text handler ─────────────────────────────────────────────────────────
+# ── callback router ──────────────────────────────────────────────────────────
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data
+    uid = q.from_user.id
+
+    # answer immediately so no loading spinner lingers
+    await q.answer()
+
+    # handle copy
+    if data.startswith("copy_"):
+        await q.answer(text=data[5:], show_alert=True)
+        return
+
+    # handle team / run (no membership check needed — already in offer flow)
+    if data.startswith("team:"):
+        s = LOGIN_SESSIONS.get(uid)
+        if s:
+            s["team"] = int(data.split(":")[1])
+        await q.edit_message_text("Team set. Now Run:", reply_markup=team_kb())
+        return
+    if data == "run":
+        await run_offers(update, ctx)
+        return
+
+    # membership gate for non-admin, non-join buttons
+    admin_only = data in ("admin_panel", "admin_stats", "admin_users")
+    if data != "join_verified" and not admin_only and not is_admin(uid):
+        ok, _ = await check_membership(ctx.bot, uid)
+        if not ok:
+            await q.edit_message_text(force_join_text(), reply_markup=force_join_kb())
+            return
+
+    # dispatch to handler
+    handlers = {
+        "balance": balance, "invite": invite, "leaderboard": leaderboard,
+        "back_menu": back_menu, "admin_panel": admin_panel,
+        "admin_stats": admin_stats, "admin_users": admin_users,
+        "rakhi_offer": rakhi_offer, "login_otp": login_otp, "login_json": login_json,
+        "join_verified": join_verified,
+    }
+    fn = handlers.get(data)
+    if fn:
+        try:
+            await fn(update, ctx)
+        except Exception as e:
+            log.exception("handler error for %s", data)
+            try:
+                await q.edit_message_text("Something went wrong. Please try again.", reply_markup=main_menu(uid))
+            except Exception:
+                pass
+
+
+# ── text handler ─────────────────────────────────────────────────────────────
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or not update.message:
@@ -746,12 +674,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_chat.id
     text = (update.message.text or "").strip()
 
-    # non-login messages: keep bot locked until membership verified
     s = LOGIN_SESSIONS.get(uid)
     if not s or s.get("state") not in ("await_mobile", "await_otp", "await_json"):
         if not await ensure_joined(update, ctx):
             return
-        await update.message.reply_text("Use the main menu buttons below 👇", reply_markup=main_menu())
+        await update.message.reply_text("Use the main menu buttons below:", reply_markup=main_menu(uid))
         return
 
     if s["state"] == "await_mobile":
@@ -760,34 +687,25 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         try:
             data = send_otp(text)
-            s["mobile"] = text
-            s["tid"] = data["tid"]
-            s["sid"] = data["sid"]
+            s["mobile"] = text; s["tid"] = data["tid"]; s["sid"] = data["sid"]
             s["state"] = "await_otp"
-            await update.message.reply_text(f"OTP sent to +91{text}. Send the OTP.")
-        except SwiggyError as e:
-            await update.message.reply_text(f"Error: {e}")
-        except Exception as e:
+            await update.message.reply_text("OTP sent to +91" + text + ". Send the OTP.")
+        except (SwiggyError, Exception) as e:
             log.exception("send_otp")
-            await update.message.reply_text(f"Error: {e}")
+            await update.message.reply_text("Error: " + str(e))
 
     elif s["state"] == "await_otp":
         try:
             v = verify_otp(s["mobile"], text, s["tid"], s["sid"])
-            with open(DB_PATH.replace(".db", "_login_debug.json"), "w", encoding="utf-8") as fh:
-                json.dump(v, fh, indent=2, ensure_ascii=False)
             h = build_session(v)
             if not h.get("userid"):
-                await update.message.reply_text("Login failed: no user in response. " + json.dumps(v, ensure_ascii=False)[:300])
+                await update.message.reply_text("Login failed: no user in response.")
                 return
-            s["headers"] = h
-            s["state"] = "logged_in"
-            await update.message.reply_text(f"Logged in as user {h['userid']}.", reply_markup=team_kb())
-        except SwiggyError as e:
-            await update.message.reply_text(f"OTP error: {e}")
-        except Exception as e:
+            s["headers"] = h; s["state"] = "logged_in"
+            await update.message.reply_text("Logged in as user " + h["userid"] + ".", reply_markup=team_kb())
+        except (SwiggyError, Exception) as e:
             log.exception("verify")
-            await update.message.reply_text(f"OTP error: {e}")
+            await update.message.reply_text("OTP error: " + str(e))
 
     elif s["state"] == "await_json":
         try:
@@ -795,22 +713,19 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             h = build_session_from_json(obj)
             if not h.get("tid") and not h.get("userid"):
                 raise SwiggyError("JSON missing tid/sid/userid")
-            s["headers"] = h
-            s["state"] = "logged_in"
-            await update.message.reply_text(
-                f"✅ JSON session loaded (userid: {h.get('userid') or '?'}).",
-                reply_markup=team_kb())
+            s["headers"] = h; s["state"] = "logged_in"
+            await update.message.reply_text("JSON session loaded (userid: " + str(h.get("userid") or "?") + ").", reply_markup=team_kb())
         except Exception as e:
-            await update.message.reply_text(f"❌ Invalid JSON: {e}\nPaste a valid session JSON.")
+            await update.message.reply_text("Invalid JSON: " + str(e) + "\nPaste a valid session JSON.")
 
 
 async def handle_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     LOGIN_SESSIONS.pop(uid, None)
-    await update.message.reply_text("Cancelled. /start for main menu.", reply_markup=main_menu())
+    await update.message.reply_text("Cancelled. /start for main menu.", reply_markup=main_menu(uid))
 
 
-async def error_handler(update, ctx):
+async def error_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     log.warning("handler error: %s", ctx.error)
 
 
