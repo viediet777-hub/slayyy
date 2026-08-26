@@ -2,8 +2,10 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
+import string
 import time
 from hashlib import md5
 
@@ -211,6 +213,11 @@ SMS_OTP_URL = "https://profile.swiggy.com/api/v3/app/sms_otp"
 VERIFY_URL = "https://profile.swiggy.com/api/v3/app/login/verify"
 DEVICE_ID = "9b69ea5de1ef3f99"
 
+
+def random_device_id():
+    """Fresh random device id per login attempt so Swiggy doesn't rate-limit."""
+    return "".join(random.choices(string.hexdigits[:16], k=16)).lower()
+
 OFFER_LINKS = [
     "https://r.swiggy.com/rakhi_wars/rakhi_wars-1adhdtaCdQ",
     "https://r.swiggy.com/rakhi_wars/rakhi_wars-MZxgRHuBN",
@@ -224,11 +231,12 @@ OFFER_LINKS = [
     "https://r.swiggy.com/rakhi_wars/rakhi_wars-2SmfgnlXXd",
 ]
 
-LOGIN_HEADERS = {
-    "Accept": "application/json; charset=utf-8", "app-version": "4.106.1", "category": "food",
-    "deviceId": DEVICE_ID, "swuid": DEVICE_ID, "os-version": "9", "pl-version": "131",
-    "User-Agent": "Swiggy-Android", "version-code": "1716", "x-channel": "swiggy",
-}
+def _login_headers(device_id):
+    return {
+        "Accept": "application/json; charset=utf-8", "app-version": "4.106.1", "category": "food",
+        "deviceId": device_id, "swuid": device_id, "os-version": "9", "pl-version": "131",
+        "User-Agent": "Swiggy-Android", "version-code": "1716", "x-channel": "swiggy",
+    }
 
 BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 4 Build/RD2A.211001.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/83.0.4103.120 Mobile Safari/537.36",
@@ -259,12 +267,16 @@ def _checked(r):
     return d
 
 
-def send_otp(mobile10):
-    return _checked(requests.get(f"{SMS_OTP_URL}?mobile={mobile10}", headers=LOGIN_HEADERS, timeout=30))
+def send_otp(mobile10, device_id=None):
+    device_id = device_id or random_device_id()
+    return _checked(requests.get(f"{SMS_OTP_URL}?mobile={mobile10}",
+                                 headers=_login_headers(device_id), timeout=30))
 
 
-def verify_otp(mobile10, otp, tid, sid):
-    h = {**LOGIN_HEADERS, "sid": sid, "Tid": tid, "Content-Type": "application/json; charset=utf-8"}
+def verify_otp(mobile10, otp, tid, sid, device_id=None):
+    device_id = device_id or random_device_id()
+    h = {**_login_headers(device_id), "sid": sid, "Tid": tid,
+         "Content-Type": "application/json; charset=utf-8"}
     p = {"cloningSignalsData": {"appFilesDirPathInvalid": 0, "developerModeEnabled": 1,
                                 "deviceModelVmos": 0, "emulatorStatus": 0,
                                 "packageName": "in.swiggy.android", "workProfileEnabled": 0},
@@ -703,7 +715,7 @@ async def login_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    LOGIN_SESSIONS[uid] = {"state": "await_mobile", "mobile": None, "tid": None, "sid": None, "headers": None, "team": 1}
+    LOGIN_SESSIONS[uid] = {"state": "await_mobile", "mobile": None, "tid": None, "sid": None, "headers": None, "team": 1, "device_id": None}
     await q.edit_message_text("📱 **OTP Login**\n\nSend your 10-digit mobile number:\n(/cancel to exit)", parse_mode="Markdown")
 
 
@@ -845,7 +857,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Enter 10-digit number only.")
             return
         try:
-            data = send_otp(text)
+            s["device_id"] = random_device_id()
+            data = send_otp(text, s["device_id"])
             s["mobile"] = text; s["tid"] = data["tid"]; s["sid"] = data["sid"]
             s["state"] = "await_otp"
             await update.message.reply_text("📲 OTP sent to +91" + text + ". Send the OTP.")
@@ -855,7 +868,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif s["state"] == "await_otp":
         try:
-            v = verify_otp(s["mobile"], text, s["tid"], s["sid"])
+            v = verify_otp(s["mobile"], text, s["tid"], s["sid"],
+                           s.get("device_id"))
             try:
                 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                        "login_debug.json"), "w", encoding="utf-8") as fh:
