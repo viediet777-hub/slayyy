@@ -1,924 +1,804 @@
-#!/usr/bin/env python3
-"""
-Lenskart Run For Frame - TELEGRAM BOT
-Coupon generator with forced channel join, referral system, inline UI & admin panel.
-
-Made By Viediet
-Works locally and on Railway (reads BOT_TOKEN from env).
-"""
-
-import os
-import json
-import random
-import time
-import uuid
-import hashlib
 import base64
-import asyncio
-import threading
+import json
+import logging
+import os
+import re
+import sqlite3
+import time
+from datetime import datetime, timezone
+from hashlib import md5
+from io import BytesIO
+
 import requests
-import cloudscraper
-import warnings
-from datetime import datetime
 
-# Suppress the harmless PTBUserWarning about CallbackQueryHandler + per_message=False
-warnings.filterwarnings("ignore", message=".*per_message.*CallbackQueryHandler.*")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("bot")
 
-from telegram import Update
-from telegram.error import Conflict, TelegramError
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
-)
+# ── ENV ──────────────────────────────────────────────────────────────────────
+BOT_TOKEN = os.environ.get("BOT_TOKEN") or ""
+ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "1364476174").split(",") if x.strip()]
+DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db"))
 
-# ============================================================
-# CONFIG
-# ============================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "1364476174").split(",") if x.strip()]
+REQUIRED_CHANNELS = [
+    {"username": "viedietlooters", "url": "https://t.me/viedietlooters", "title": "Main Channel"},
+    {"username": "viedietbackup", "url": "https://t.me/viedietbackup", "title": "Backup Group"},
+]
 
-# GitHub backup → SEPARATE data repo (so pushes never trigger Railway redeploy)
-# Owner/repo default to your dedicated data repo: https://github.com/viediet777-hub/bp
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-GITHUB_OWNER = os.getenv("GITHUB_OWNER", "viediet777-hub")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "bp")
-GITHUB_PATH = "bot_data.json"
+# ── DB ───────────────────────────────────────────────────────────────────────
 
-CHANNEL_USERNAME = "@viedietlooters"
-GROUP_USERNAME = "@viedietbackup"
-CHANNEL_LINK = "https://t.me/viedietlooters"
-GROUP_LINK = "https://t.me/viedietbackup"
+def get_db():
+    db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id INTEGER PRIMARY KEY,
+            user_id TEXT, username TEXT, first_name TEXT,
+            points INTEGER DEFAULT 0,
+            referral_code TEXT UNIQUE,
+            referred_by INTEGER,
+            created_at TEXT DEFAULT (datetime('now')),
+            is_banned INTEGER DEFAULT 0
+        )""")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER,
+            referee_id INTEGER,
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            amount INTEGER,
+            type TEXT,
+            description TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+    db.commit()
+    return db
 
-DATA_FILE = "bot_data.json"
-REWARD_STEPS = 30000
 
-BASE = "https://api-gateway.juno.lenskart.com"
+def user_exists(chat_id):
+    row = get_db().execute("SELECT 1 FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+    return row is not None
 
-BRANDS = ["xiaomi", "realme", "samsung", "oneplus", "oppo", "vivo"]
-MODELS = {
-    "xiaomi": ["Mi 11X", "Redmi Note 10", "Mi 10", "Poco X3"],
-    "realme": ["RMX3031", "RMX3370", "RMX3360", "RMX3263"],
-    "samsung": ["SM-G998B", "SM-G991B", "SM-A526B", "SM-M515F"],
-    "oneplus": ["LE2115", "LE2125", "KB2001", "IN2015"],
-    "oppo": ["CPH2207", "CPH2249", "CPH2217"],
-    "vivo": ["V2024", "V2036", "V2041", "V2115"],
+
+def get_user(chat_id):
+    return get_db().execute("SELECT * FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+
+
+def create_user(chat_id, user_id, username, first_name, referred_by=None):
+    db = get_db()
+    code = md5(f"{chat_id}_{time.time()}".encode()).hexdigest()[:8]
+    db.execute("""
+        INSERT OR IGNORE INTO users (chat_id, user_id, username, first_name, referral_code, referred_by)
+        VALUES (?,?,?,?,?,?)
+    """, (chat_id, str(user_id) if user_id else "", username or "", first_name or "", code, referred_by))
+    db.commit()
+    return code
+
+
+def add_points(chat_id, amount, typ, desc):
+    db = get_db()
+    db.execute("UPDATE users SET points = points + ? WHERE chat_id=?", (amount, chat_id))
+    db.execute("INSERT INTO transactions (chat_id, amount, type, description) VALUES (?,?,?,?)",
+               (chat_id, amount, typ, desc))
+    db.commit()
+
+
+def get_points(chat_id):
+    row = get_db().execute("SELECT points FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+    return row["points"] if row else 0
+
+
+def get_leaderboard(limit=10):
+    return get_db().execute(
+        "SELECT chat_id, username, first_name, points FROM users ORDER BY points DESC LIMIT ?",
+        (limit,)).fetchall()
+
+
+def count_referrals(chat_id):
+    row = get_db().execute("SELECT COUNT(*) c FROM referrals WHERE referrer_id=?", (chat_id,)).fetchone()
+    return row["c"] if row else 0
+
+
+def record_referral(referrer_id, referee_id):
+    db = get_db()
+    db.execute("INSERT INTO referrals (referrer_id, referee_id) VALUES (?,?)", (referrer_id, referee_id))
+    db.commit()
+
+
+def all_users():
+    return get_db().execute("SELECT * FROM users ORDER BY created_at DESC").fetchall()
+
+
+def total_users():
+    return get_db().execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+
+
+def total_points():
+    return get_db().execute("SELECT COALESCE(SUM(points),0) s FROM users").fetchone()["s"]
+
+
+def total_referrals():
+    return get_db().execute("SELECT COUNT(*) c FROM referrals").fetchone()["c"]
+
+
+# ── SWIGGY OFFER API ─────────────────────────────────────────────────────────
+
+CAMPAIGN_HOST = "https://disc.swiggy.com"
+CAMPAIGN_ID = "rakhi_wars"
+CAMPAIGN_DETAILS = "/api/v1/campaign/details"
+CAMPAIGN_SUBMIT = "/api/v1/campaign/submit"
+CAMPAIGN_POLL = "/api/v1/campaign/poll"
+
+SMS_OTP_URL = "https://profile.swiggy.com/api/v3/app/sms_otp"
+VERIFY_URL = "https://profile.swiggy.com/api/v3/app/login/verify"
+DEVICE_ID = "9b69ea5de1ef3f99"
+
+OFFER_LINKS = [
+    "https://r.swiggy.com/rakhi_wars/rakhi_wars-1adhdtaCdQ",
+    "https://r.swiggy.com/rakhi_wars/rakhi_wars-MZxgRHuBN",
+    "https://r.swiggy.com/rakhi_wars/rakhi_wars-2Out6vNL00",
+    "https://r.swiggy.com/rakhi_wars/rakhi_wars-3RvWb1Aj0IL",
+    "https://r.swiggy.com/rakhi_wars/rakhi_wars-8OkuWB2dr",
+    "https://r.swiggy.com/rakhi_wars/rakhi_wars-8OkuF7L1h",
+    "https://r.swiggy.com/rakhi_wars/rakhi_wars-1jfCJc8KB6",
+    "https://r.swiggy.com/rakhi_wars/rakhi_wars-1jfCJxsjBk",
+    "https://r.swiggy.com/rakhi_wars/rakhi_wars-9ggQmy8CP",
+    "https://r.swiggy.com/rakhi_wars/rakhi_wars-2SmfgnlXXd",
+]
+
+LOGIN_HEADERS = {
+    "Accept": "application/json; charset=utf-8",
+    "app-version": "4.106.1", "category": "food",
+    "deviceId": DEVICE_ID, "swuid": DEVICE_ID,
+    "os-version": "9", "pl-version": "131",
+    "User-Agent": "Swiggy-Android", "version-code": "1716", "x-channel": "swiggy",
 }
-ANDROID_VERSIONS = ["13", "14"]
+
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 4 Build/RD2A.211001.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/83.0.4103.120 Mobile Safari/537.36",
+    "platform": "Swiggy-Android", "version-code": "1795", "model-name": "PIXEL 4",
+    "manufacturer": "GOOGLE", "application_name": "swiggy-app", "appversion": "4.113.0",
+    "cityid": "18", "lat": "22.74215", "lng": "75.9078633",
+    "x-requested-with": "in.swiggy.android", "x-theme": "base",
+    "accept-language": "en-IN,en-US;q=0.9,en;q=0.8",
+}
+
+
+class SwiggyError(Exception):
+    pass
+
+
+def send_otp(mobile10):
+    r = requests.get(f"{SMS_OTP_URL}?mobile={mobile10}", headers=LOGIN_HEADERS, timeout=30)
+    return _checked(r)
+
+
+def verify_otp(mobile10, otp, tid, sid):
+    h = {**LOGIN_HEADERS, "sid": sid, "Tid": tid, "Content-Type": "application/json; charset=utf-8"}
+    p = {"cloningSignalsData": {"appFilesDirPathInvalid": 0, "developerModeEnabled": 1,
+                                "deviceModelVmos": 0, "emulatorStatus": 0,
+                                "packageName": "in.swiggy.android", "workProfileEnabled": 0},
+         "otp": otp}
+    r = requests.post(f"{VERIFY_URL}?otp_source=Sms-automatic", headers=h, json=p, timeout=30)
+    return _checked(r)
+
+
+def _jwt_payload(token):
+    try:
+        p = token.split(".")[1] + "=" * (-len(token.split(".")[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(p))
+    except Exception:
+        return {}
+
+
+def build_session(v):
+    tid = v.get("tid", "")
+    sid = v.get("sid", "")
+    payload = _jwt_payload(tid)
+    userid = payload.get("user_id") or ""
+    if not userid:
+        d = v.get("data") or {}
+        user = d.get("user") or {}
+        userid = str(user.get("id") or d.get("user_id") or d.get("userId") or "")
+    token = ""
+    for k in ("token", "accessToken", "refreshToken"):
+        if (v.get("data") or {}).get(k):
+            token = (v.get("data") or {})[k]
+            break
+    return {"userid": userid, "tid": tid, "sid": sid, "token": token}
+
+
+def _checked(r):
+    try:
+        d = r.json()
+    except Exception:
+        d = None
+    if d is None:
+        raise SwiggyError(f"non-JSON HTTP {r.status_code}")
+    st = d.get("statusCode")
+    if st == 999:
+        raise SwiggyError(f"session expired: {d.get('statusMessage')}")
+    if isinstance(st, int) and st != 0:
+        raise SwiggyError(f"api error {st}: {d.get('statusMessage')}")
+    return d
+
+
+def _sh(session, referral="", **extra):
+    h = dict(BASE_HEADERS)
+    h.update(session)
+    h["campaignId"] = CAMPAIGN_ID
+    if referral:
+        h["referral-code"] = referral
+    h.update(extra)
+    return h
+
+
+def campaign_details(session, r):
+    return _checked(requests.get(CAMPAIGN_HOST + CAMPAIGN_DETAILS, headers=_sh(session, r), timeout=30))
+
+
+def campaign_submit(session, a, t, r=""):
+    return _checked(requests.post(CAMPAIGN_HOST + CAMPAIGN_SUBMIT,
+                                  headers=_sh(session, r, **{"Content-Type": "application/json"}),
+                                  json={"action": a, "teamSelected": t, "campaignId": CAMPAIGN_ID}, timeout=30))
+
+
+def campaign_poll(session, r=""):
+    return _checked(requests.get(CAMPAIGN_HOST + CAMPAIGN_POLL, headers=_sh(session, r), timeout=30))
+
+
+def run_one(session, ref, team=1):
+    try:
+        campaign_details(session, ref)
+        campaign_submit(session, "JOIN_MATCH", team, ref)
+        for _ in range(5):
+            if (campaign_submit(session, "ATTACK", team, ref).get("data") or {}).get("userState", {}).get("attacksLeft", 0) <= 0:
+                break
+            time.sleep(1)
+        campaign_poll(session, ref)
+        return (True, "")
+    except SwiggyError as e:
+        return (False, str(e))
+
+
+# ── TELEGRAM BOT ─────────────────────────────────────────────────────────────
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
+                          MessageHandler, filters, ContextTypes)
+
+LOGIN_SESSIONS = {}
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def btn(text, cb, style="primary"):
+    return InlineKeyboardButton(text, callback_data=cb, style=style)
 
 
 def is_admin(uid):
-    return int(uid) in ADMIN_IDS
+    return uid in ADMIN_IDS
 
 
-# ============================================================
-# PERSISTENCE
-# ============================================================
-def load_data():
-    try:
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {"users": {}, "referrals": {}}
+# ── force-join ───────────────────────────────────────────────────────────────
 
-
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-    # Push to GitHub in background so it never blocks the bot event loop
-    if GITHUB_TOKEN:
-        threading.Thread(target=github_push, daemon=True).start()
-
-
-def github_push():
-    """Backup bot_data.json to GitHub repo (owner/repo above)."""
-    try:
-        if not GITHUB_TOKEN:
-            return
-        url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_PATH}"
-        headers = {
-            "Authorization": f"token {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github+json",
-        }
+async def check_membership(bot, user_id):
+    """Returns (ok, missing_channel). ok=False if user must join something."""
+    for ch in REQUIRED_CHANNELS:
         try:
-            with open(DATA_FILE, "r") as f:
-                content = f.read()
+            member = await bot.get_chat_member(chat_id=ch["username"], user_id=user_id)
+            if member.status not in ("creator", "administrator", "member", "restricted"):
+                return False, ch
         except Exception:
-            return
-        sha = None
-        try:
-            r = requests.get(url, headers=headers, timeout=20)
-            if r.status_code == 200:
-                sha = r.json().get("sha")
-        except Exception:
-            pass
-        payload = {
-            "message": "Update bot_data.json [bot backup]",
-            "content": base64.b64encode(content.encode()).decode(),
-        }
-        if sha:
-            payload["sha"] = sha
-        requests.put(url, headers=headers, json=payload, timeout=20)
-    except Exception as e:
-        print(f"[GitHub Backup] failed: {e}")
+            return False, ch
+    return True, None
 
 
-DATA = load_data()
+def force_join_kb():
+    rows = [[InlineKeyboardButton(f"🔗 {ch['title']}", url=ch["url"])]
+            for ch in REQUIRED_CHANNELS]
+    rows.append([btn("✅ I've Joined", "join_verified", "success")])
+    return InlineKeyboardMarkup(rows)
 
-DEFAULT_USER = {
-    "points": 0, "codes": 0, "referred_by": None,
-    "credited": False, "joined": False, "username": None,
-    "phone": None, "codes_list": [],
-}
 
+def force_join_text():
+    lines = ["🔒 **Join to continue using the bot**\n"]
+    for ch in REQUIRED_CHANNELS:
+        lines.append(f"• {ch['title']}: {ch['url']}")
+    lines.append("\nJoin both, then tap 'I've Joined' ✅")
+    return "\n".join(lines)
 
-def get_user(uid):
-    uid = str(uid)
-    if uid not in DATA["users"]:
-        DATA["users"][uid] = dict(DEFAULT_USER)
-    else:
-        for k, v in DEFAULT_USER.items():
-            if k not in DATA["users"][uid]:
-                DATA["users"][uid][k] = v
-    return DATA["users"][uid]
 
-
-# ============================================================
-# RAW TELEGRAM API (styled buttons)
-# ============================================================
-def _tg_request(method, payload):
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-        r = requests.post(url, json=payload, timeout=30)
-        try:
-            return r.json()
-        except Exception:
-            return {"ok": False, "raw": r.text[:200]}
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:200]}
-
-
-def _strip_icons(mk):
-    if not isinstance(mk, dict):
-        return mk
-    out = {}
-    for k, v in mk.items():
-        if k in ("keyboard", "inline_keyboard"):
-            out[k] = [[{kk: vv for kk, vv in b.items() if kk != "icon_custom_emoji_id"} for b in row] for row in v]
-        else:
-            out[k] = v
-    return out
-
-
-async def tg_send(chat_id, text, reply_markup=None, parse_mode="Markdown",
-                  message_id=None, disable_web_page_preview=True):
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    if disable_web_page_preview:
-        payload["disable_web_page_preview"] = True
-    method = "editMessageText" if message_id else "sendMessage"
-    if message_id:
-        payload["message_id"] = message_id
-    res = await asyncio.to_thread(_tg_request, method, payload)
-    if not res.get("ok") and reply_markup and "icon" in str(res.get("description", "")).lower():
-        payload["reply_markup"] = _strip_icons(reply_markup)
-        res = await asyncio.to_thread(_tg_request, method, payload)
-    return res
-
-
-# ---- styled keyboard builders ----
-def inline_kb(rows):
-    return {"inline_keyboard": rows}
-
-
-ICO = {
-    "blue": "5373141891321699086", "red": "5370810157871667232",
-    "green": "5471984997361523302", "cancel": "5382224089295365367",
-}
-
-
-def main_menu_kb(uid):
-    rows = [
-        [{"text": "🎟️ Generate Code", "callback_data": "gen", "style": "success", "icon_custom_emoji_id": ICO["green"]}],
-        [
-            {"text": "📋 My Codes", "callback_data": "mycodes", "style": "primary", "icon_custom_emoji_id": ICO["blue"]},
-            {"text": "👥 My Referrals", "callback_data": "ref", "style": "primary", "icon_custom_emoji_id": ICO["blue"]},
-        ],
-        [
-            {"text": "📊 My Stats", "callback_data": "stats", "style": "primary", "icon_custom_emoji_id": ICO["blue"]},
-            {"text": "ℹ️ Help", "callback_data": "help", "style": "danger", "icon_custom_emoji_id": ICO["red"]},
-        ],
-    ]
-    if is_admin(uid):
-        rows.append([{"text": "🛡️ Admin Panel", "callback_data": "admin", "style": "danger", "icon_custom_emoji_id": ICO["red"]}])
-    return inline_kb(rows)
-
-
-def join_kb():
-    return inline_kb([
-        [{"text": "📢 Join Channel", "url": CHANNEL_LINK, "style": "primary", "icon_custom_emoji_id": ICO["blue"]}],
-        [{"text": "👥 Join Group", "url": GROUP_LINK, "style": "primary", "icon_custom_emoji_id": ICO["blue"]}],
-        [{"text": "✅ I Have Joined", "callback_data": "verify_join", "style": "success", "icon_custom_emoji_id": ICO["green"]}],
-    ])
-
-
-def referral_kb(link):
-    return inline_kb([
-        [{"text": "📤 Share Link", "url": f"https://t.me/share/url?url={link}&text=Get%20free%20Lenskart%20coupons!", "style": "primary", "icon_custom_emoji_id": ICO["blue"]}],
-        [{"text": "🔙 Back", "callback_data": "back_menu", "style": "danger", "icon_custom_emoji_id": ICO["cancel"]}],
-    ])
-
-
-def no_points_kb():
-    return inline_kb([
-        [{"text": "👥 Get Referral Link", "callback_data": "ref", "style": "primary", "icon_custom_emoji_id": ICO["blue"]}],
-        [{"text": "🔙 Back", "callback_data": "back_menu", "style": "danger", "icon_custom_emoji_id": ICO["cancel"]}],
-    ])
-
-
-def cancel_inline():
-    return inline_kb([[{"text": "🔙 Back", "callback_data": "gen_cancel", "style": "danger", "icon_custom_emoji_id": ICO["cancel"]}]])
-
-
-def back_kb():
-    return inline_kb([[{"text": "🔙 Back", "callback_data": "back_menu", "style": "danger", "icon_custom_emoji_id": ICO["cancel"]}]])
-
-
-def admin_panel_kb():
-    return inline_kb([
-        [{"text": "➕ Give Points to All", "callback_data": "admin_giveall", "style": "success", "icon_custom_emoji_id": ICO["green"]}],
-        [{"text": "📢 Broadcast Msg", "callback_data": "admin_broadcast", "style": "primary", "icon_custom_emoji_id": ICO["blue"]}],
-        [{"text": "🔄 Refresh", "callback_data": "admin", "style": "primary", "icon_custom_emoji_id": ICO["blue"]},
-         {"text": "🔙 Close", "callback_data": "back_menu", "style": "danger", "icon_custom_emoji_id": ICO["cancel"]}],
-    ])
-
-
-# ============================================================
-# LENSKART DEVICE LOGIC (cloudscraper bypasses Cloudflare)
-# ============================================================
-class LenskartDevice:
-    def __init__(self, phone: str, phone_code: str = "+91"):
-        self.phone = phone
-        self.phone_code = phone_code
-        self.brand = random.choice(BRANDS)
-        self.model = random.choice(MODELS.get(self.brand, ["RMX3031"]))
-        self.android_version = random.choice(ANDROID_VERSIONS)
-        self.udid = uuid.uuid4().hex[:16]
-        self.advertising_id = str(uuid.uuid4())
-        self.build_version = f"TP1A.220905.00{random.randint(1,9)}"
-        self.session_token = None
-        self.auth_token = None
-        self.user_id = None
-        self.customer_type = "EXISTING"
-        self.s = self._new_scraper()
-        self.x_assertion = self._x_assertion()
-        # Prime: collect Cloudflare cookies so the API call isn't challenged
-        try:
-            self.s.get(BASE, headers=self._headers(), timeout=20)
-        except Exception:
-            pass
-
-    def _new_scraper(self):
-        return cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-
-    def _x_assertion(self):
-        d = f"{self.udid}:{self.advertising_id}:{self.brand}:{self.model}:{self.phone}"
-        h = hashlib.sha256(d.encode()).digest()
-        a = base64.b64encode(h).decode().replace("+", "-").replace("/", "_")
-        while len(a) < 100:
-            a += random.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
-        return a[:100]
-
-    def _headers(self, extra=None):
-        h = {
-            "Content-Type": "application/json; charset=UTF-8",
-            "api_key": "valyoo123",
-            "x-api-client": "android",
-            "x-app-version": "5.8.2 (260713001)",
-            "appversion": "5.8.2 (260713001)",
-            "X-Build-Version": "260713001",
-            "x-country-code": "IN",
-            "x-country-code-override": "IN",
-            "x-accept-language": "en",
-            "accept-language": "en",
-            "x-customer-type": self.customer_type,
-            "udid": self.udid,
-            "uniqueId": self.advertising_id[:16],
-            "brand": self.brand,
-            "model": self.model,
-            "x-b3-traceid": str(int(time.time() * 1000)),
-            "User-Agent": f"Dalvik/2.1.0 (Linux; U; Android {self.android_version}; {self.model} Build/{self.build_version})",
-            "Accept-Encoding": "gzip",
-            "Connection": "Keep-Alive",
-            "x-customer-phone": self.phone,
-            "x-customer-phone-code": self.phone_code.replace("+", ""),
-        }
-        if self.session_token:
-            h["x-session-token"] = self.session_token
-        if self.x_assertion:
-            h["x-assertion"] = self.x_assertion
-        if extra:
-            h.update(extra)
-        return h
-
-    def _post(self, path, body=None, params=None):
-        url = f"{BASE}{path}"
-        if params:
-            url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
-        return self.s.post(url, headers=self._headers(), json=body, timeout=30)
-
-    def create_session(self):
-        last = None
-        for attempt in range(4):
-            try:
-                r = self._post("/v2/sessions", {})
-                last = (r.status_code, r.text[:120])
-                if r.status_code == 200:
-                    sid = r.json().get("result", {}).get("id")
-                    if sid:
-                        self.session_token = sid
-                        return True
-            except Exception as e:
-                last = ("EXC", str(e)[:120])
-            # Fresh scraper to beat a new Cloudflare challenge, then backoff
-            self.s = self._new_scraper()
-            time.sleep(1.5 * (attempt + 1))
-        print(f"[create_session] FAILED after retries. last_response={last}")
-        return False
-
-    def send_otp(self):
-        if not self.session_token:
-            return None
-        body = {"phoneCode": self.phone_code, "telephone": self.phone}
-        for attempt in range(4):
-            try:
-                r = self._post("/v3/customers/sendOtp", body)
-                if r.status_code == 200:
-                    res = r.json().get("result") or {}
-                    self.customer_type = "NEW" if res.get("isNewUser") else "EXISTING"
-                    return res
-            except Exception:
-                pass
-            self.s = self._new_scraper()
-            time.sleep(1.5 * (attempt + 1))
-        return None
-
-    def verify_otp(self, code: str):
-        body = {"code": code, "phoneCode": self.phone_code, "telephone": self.phone}
-        r = self._post("/v2/customers/authenticate/mobile", body)
-        if r.status_code == 200:
-            res = r.json().get("result") or {}
-            self.auth_token = res.get("token")
-            self.user_id = res.get("user_id")
-            if self.auth_token:
-                self.session_token = self.auth_token
-            return res
-        return None
-
-    def claim_reward(self, steps=REWARD_STEPS):
-        def build_payload():
-            DAY = 86400000
-            ist = 5.5 * 3600 * 1000
-            now_utc = int(time.time() * 1000)
-            now_ist = now_utc + ist
-            midnight_ist = (now_ist // DAY) * DAY
-            midnight_utc = midnight_ist - ist
-            counts = [0, 0, 0, 0, 0, 0, steps]
-            payload = []
-            for i in range(6, -1, -1):
-                payload.append({"distance": 0.0, "steps": counts[i],
-                                "timestamp": int(midnight_utc - i * DAY)})
-            return payload
-
-        r = self._post("/v2/customers/bff/campaign/eligibility", build_payload(),
-                       {"campaignName": "run-for-frame"})
-        try:
-            data = r.json()
-        except Exception:
-            return {"ok": False, "message": f"Error {r.status_code}"}
-        if r.status_code == 200:
-            res = data.get("result") or {}
-            voucher = res.get("giftVoucher")
-            if voucher:
-                return {"ok": True, "voucher": voucher, "tier": res.get("tier"),
-                        "steps": res.get("steps"), "expiry": res.get("giftVoucherExpiryDate")}
-            return {"ok": False, "message": res.get("message", "Reward not unlocked")}
-        return {"ok": False, "message": f"Error {r.status_code}"}
-
-
-# ============================================================
-# STATES
-# ============================================================
-PHONE, OTP = range(2)
-ADMIN_GIVE, ADMIN_BC = range(2, 4)
-PENDING = {}
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-async def check_membership(user_id, context):
-    try:
-        c = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        g = await context.bot.get_chat_member(GROUP_USERNAME, user_id)
-        return c.status in ("member", "administrator", "creator") and \
-               g.status in ("member", "administrator", "creator")
-    except Exception:
-        return False
-
-
-async def ask_join(chat_id, message_id=None):
-    text = (
-        "🔒 *Access Locked*\n\n"
-        "To use this bot you must join our official *Channel* and *Group*.\n\n"
-        f"📢 Channel: {CHANNEL_USERNAME}\n"
-        f"👥 Group: {GROUP_USERNAME}\n\n"
-        "Join both, then press ✅ below."
-    )
-    await tg_send(chat_id, text, reply_markup=join_kb(), message_id=message_id)
-
-
-async def show_menu(chat_id, uid, message_id=None):
-    u = get_user(uid)
-    text = (
-        "╔══════════════════════════╗\n"
-        "║  🎟️ *RUN FOR FRAME* — COUPON HUB 🎟️  ║\n"
-        "╚══════════════════════════╝\n\n"
-        "👋 Welcome, coupon hunter!\n\n"
-        f"💎 *Points:* `{u['points']}`\n"
-        f"🎟️ *Codes Left:* `{u['points']}`\n"
-        f"📦 *Codes Generated:* `{u['codes']}`\n\n"
-        "🔗 Refer friends: 1 Referral = 1 Point = 1 Code 🎯\n\n"
-        "_Made By Viediet_"
-    )
-    await tg_send(chat_id, text, reply_markup=main_menu_kb(uid), message_id=message_id)
-
-
-async def credit_referrer(uid):
-    u = get_user(uid)
-    if u["referred_by"] and not u["credited"]:
-        ref = u["referred_by"]
-        if ref in DATA["users"]:
-            DATA["users"][ref]["points"] += 1
-            DATA["referrals"].setdefault(ref, []).append(str(uid))
-        u["credited"] = True
-        save_data(DATA)
-
-
-def admin_stats_text():
-    users = DATA["users"]
-    total_users = len(users)
-    total_codes = sum(u["codes"] for u in users.values())
-    total_points = sum(u["points"] for u in users.values())
-    total_refs = sum(len(v) for v in DATA["referrals"].values())
-    return (
-        "🛡️ *ADMIN PANEL*\n\n"
-        f"👥 Total Users: `{total_users}`\n"
-        f"🎟️ Total Codes Generated: `{total_codes}`\n"
-        f"💎 Points in Circulation: `{total_points}`\n"
-        f"🔗 Total Referrals: `{total_refs}`\n\n"
-        "Choose an action below 👇"
-    )
-
-
-# ============================================================
-# HANDLERS
-# ============================================================
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    uid = str(user.id)
-    u = get_user(uid)
-    u["username"] = user.username or user.first_name
-    save_data(DATA)
-
-    if context.args and context.args[0].startswith("ref_"):
-        ref = context.args[0][4:]
-        if ref != uid and u["referred_by"] is None:
-            u["referred_by"] = ref
-            save_data(DATA)
-
-    chat_id = update.effective_chat.id
-    if not await check_membership(uid, context):
-        await ask_join(chat_id)
-        return
-
-    u["joined"] = True
-    await credit_referrer(uid)
-    await show_menu(chat_id, uid)
-
-
-async def verify_join_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = str(q.from_user.id)
-    if not await check_membership(uid, context):
-        await q.answer("❌ You have not joined both yet!", show_alert=True)
-        return
-    u = get_user(uid)
-    u["joined"] = True
-    await credit_referrer(uid)
-    await show_menu(q.message.chat_id, uid, message_id=q.message.message_id)
-
-
-async def back_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await show_menu(q.message.chat_id, str(q.from_user.id), message_id=q.message.message_id)
-
-
-async def referrals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, q=None):
-    uid = str(update.effective_user.id) if not q else str(q.from_user.id)
-    chat_id = update.effective_chat.id if not q else q.message.chat_id
-    msg_id = None if not q else q.message.message_id
-    u = get_user(uid)
-    bot_username = (await context.bot.get_me()).username
-    link = f"https://t.me/{bot_username}?start=ref_{uid}"
-    count = len(DATA["referrals"].get(uid, []))
-    text = (
-        "👥 *Your Referral Panel*\n\n"
-        f"🔗 *Your Link:*\n`{link}`\n\n"
-        f"👤 Total Referrals: `{count}`\n"
-        f"💎 Points: `{u['points']}`\n\n"
-        "📢 Share your link! Every join gives +1 point.\n"
-        "1 Point = 1 Free Code 🎟️"
-    )
-    await tg_send(chat_id, text, reply_markup=referral_kb(link), message_id=msg_id)
-
-
-async def ref_panel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await referrals_cmd(update, context, q)
-
-
-async def my_codes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, q=None):
-    if q:
-        await q.answer()
-    uid = str(update.effective_user.id) if not q else str(q.from_user.id)
-    chat_id = update.effective_chat.id if not q else q.message.chat_id
-    msg_id = None if not q else q.message.message_id
-    u = get_user(uid)
-    codes = u.get("codes_list", [])
-    if not codes:
-        text = "📋 *My Codes*\n\n❌ You haven't generated any coupon yet.\nUse 🎟️ Generate Code to get one!"
-    else:
-        lines = ["📋 *My Generated Coupons*\n"]
-        for i, c in enumerate(codes, 1):
-            lines.append(
-                f"\n*{i}. 🎫 Voucher:* `{c.get('voucher','-')}`\n"
-                f"   🏆 Tier: `{c.get('tier','-')}`\n"
-                f"   ⏰ Expiry: `{c.get('expiry','-')}`\n"
-                f"   📱 Phone: `{c.get('phone','-')}`\n"
-                f"   🕒 {c.get('time','-')}"
-            )
-        text = "\n".join(lines)
-    kb = inline_kb([[{"text": "🔙 Back", "callback_data": "back_menu", "style": "danger", "icon_custom_emoji_id": ICO["cancel"]}]])
-    await tg_send(chat_id, text, reply_markup=kb, message_id=msg_id)
-
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, q=None):
-    if q:
-        await q.answer()
-    uid = str(update.effective_user.id) if not q else str(q.from_user.id)
-    chat_id = update.effective_chat.id if not q else q.message.chat_id
-    msg_id = None if not q else q.message.message_id
-    u = get_user(uid)
-    count = len(DATA["referrals"].get(uid, []))
-    text = (
-        "📊 *Your Stats*\n\n"
-        f"💎 Points: `{u['points']}`\n"
-        f"🎟️ Codes Available: `{u['points']}`\n"
-        f"📦 Codes Generated: `{u['codes']}`\n"
-        f"👥 Referrals: `{count}`\n\n"
-        "_Made By Viediet_"
-    )
-    await tg_send(chat_id, text, reply_markup=back_kb(), message_id=msg_id)
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, q=None):
-    if q:
-        await q.answer()
-    chat_id = update.effective_chat.id if not q else q.message.chat_id
-    msg_id = None if not q else q.message.message_id
-    uid = str(update.effective_user.id) if not q else str(q.from_user.id)
-    text = (
-        "ℹ️ *Help*\n\n"
-        "🎟️ *Generate Code* — Use 1 point to generate a Lenskart coupon.\n"
-        "👥 *My Referrals* — Get your invite link.\n"
-        "📊 *My Stats* — View points & codes.\n\n"
-        "📢 Must stay joined to Channel & Group.\n"
-        "🔗 Refer = +1 point = +1 code.\n\n"
-        "_Made By Viediet_"
-    )
-    await tg_send(chat_id, text, reply_markup=back_kb(), message_id=msg_id)
-
-
-# ---- Generate flow ----
-async def generate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q:
-        await q.answer()
-    uid = str(update.effective_user.id)
-    chat_id = update.effective_chat.id
-    if not await check_membership(uid, context):
-        await ask_join(chat_id)
-        return ConversationHandler.END
-    u = get_user(uid)
-    if u["points"] <= 0:
-        await tg_send(chat_id,
-                      "⚠️ *No Points Left!*\n\nYou need *1 point* to generate a code.\nRefer a friend to earn points 💎",
-                      reply_markup=no_points_kb())
-        return ConversationHandler.END
-    mid = q.message.message_id if q else None
-    PENDING[str(uid)] = {"dev": None, "mid": mid}
-    await tg_send(chat_id,
-                  "📱 *Enter your phone number* (10 digit, e.g. 9876543210)\n\nWe'll send an OTP to verify. 🔐",
-                  reply_markup=cancel_inline(), message_id=mid)
-    return PHONE
-
-
-async def gen_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    entry = PENDING.pop(str(q.from_user.id), None)
-    mid = entry.get("mid") if entry else q.message.message_id
-    await show_menu(q.message.chat_id, str(q.from_user.id), message_id=mid)
-    return ConversationHandler.END
-
-
-async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-    entry = PENDING.get(uid)
-    if not entry:
-        await tg_send(update.effective_chat.id, "⏳ Session expired. Start again with 🎟️ Generate Code.")
-        return ConversationHandler.END
-    phone = update.message.text.strip()
-    if not phone.isdigit() or len(phone) != 10:
-        await tg_send(update.effective_chat.id, "❌ Invalid number. Send 10 digit mobile number.")
-        return PHONE
-    dev = LenskartDevice(phone)
-    ok = await asyncio.to_thread(dev.create_session)
+async def ensure_joined(update, ctx):
+    """If user not in required channels, show join prompt and return False."""
+    uid = update.effective_user.id
+    ok, _ = await check_membership(ctx.bot, uid)
     if not ok:
-        PENDING.pop(uid, None)
-        await tg_send(update.effective_chat.id, "❌ Could not create session. Try again later.",
-                      reply_markup=cancel_inline(), message_id=entry["mid"])
-        return ConversationHandler.END
-    sent = await asyncio.to_thread(dev.send_otp)
-    if not sent:
-        PENDING.pop(uid, None)
-        await tg_send(update.effective_chat.id, "❌ Failed to send OTP. Try again.",
-                      reply_markup=cancel_inline(), message_id=entry["mid"])
-        return ConversationHandler.END
-    entry["dev"] = dev
-    await tg_send(update.effective_chat.id,
-                  f"✅ OTP sent to `{phone}`\n\n🔑 *Enter the OTP* you received:",
-                  reply_markup=cancel_inline(), message_id=entry["mid"])
-    return OTP
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(
+                force_join_text(), parse_mode="Markdown",
+                reply_markup=force_join_kb())
+        else:
+            await update.message.reply_text(force_join_text(), parse_mode="Markdown",
+                                            reply_markup=force_join_kb())
+        return False
+    return True
 
 
-async def otp_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-    entry = PENDING.get(uid)
-    if not entry or not entry.get("dev"):
-        await tg_send(update.effective_chat.id, "⏳ Session expired. Start again with 🎟️ Generate Code.")
-        return ConversationHandler.END
-    dev = entry["dev"]
-    mid = entry["mid"]
-    code = update.message.text.strip()
-    if not code.isdigit():
-        await tg_send(update.effective_chat.id, "❌ OTP must be numbers.", message_id=mid)
-        return OTP
-
-    await tg_send(update.effective_chat.id, "⏳ *Verifying & generating your coupon...* 🔄", message_id=mid)
-
-    verify = await asyncio.to_thread(dev.verify_otp, code)
-    if not verify:
-        await tg_send(update.effective_chat.id, "❌ OTP verification failed. Restart 🎟️ Generate Code.",
-                      reply_markup=cancel_inline(), message_id=mid)
-        PENDING.pop(uid, None)
-        return ConversationHandler.END
-
-    result = await asyncio.to_thread(dev.claim_reward)
-
-    u = get_user(uid)
-    if result.get("ok"):
-        u["points"] -= 1
-        u["codes"] += 1
-        u["phone"] = dev.phone
-        exp = ""
-        if result.get("expiry"):
-            try:
-                exp = datetime.fromtimestamp(result["expiry"] / 1000).strftime("%d %b %Y")
-            except Exception:
-                pass
-        u["codes_list"].append({
-            "voucher": result.get("voucher"),
-            "tier": result.get("tier"),
-            "steps": result.get("steps"),
-            "expiry": exp or "N/A",
-            "phone": dev.phone,
-            "time": datetime.now().strftime("%d %b %Y %H:%M"),
-        })
-        save_data(DATA)
-        PENDING.pop(uid, None)
-        text = (
-            "🎉 *COUPON UNLOCKED!*\n\n"
-            f"🏆 Tier: `{result.get('tier','-')}`\n"
-            f"🎫 *Voucher:* `{result.get('voucher')}`\n"
-            f"📊 Steps: `{result.get('steps','-')}`\n"
-            f"⏰ Expiry: `{exp or 'N/A'}`\n\n"
-            f"💎 Points Left: `{u['points']}`\n\n"
-            "_Made By Viediet_"
-        )
-        await tg_send(update.effective_chat.id, text, reply_markup=main_menu_kb(uid), message_id=mid)
-    else:
-        await tg_send(update.effective_chat.id,
-                      f"⚠️ *Could not generate coupon*\n\nReason: {result.get('message','Unknown')}\n\n"
-                      "Your point was NOT deducted. Try again 🎟️",
-                      reply_markup=cancel_inline(), message_id=mid)
-        PENDING.pop(uid, None)
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    PENDING.pop(str(update.effective_user.id), None)
-    await show_menu(update.effective_chat.id, str(update.effective_user.id))
-    return ConversationHandler.END
-
-
-# ---- Admin panel ----
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def join_verified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    uid = str(q.from_user.id)
+    uid = q.from_user.id
+    ok, missing = await check_membership(ctx.bot, uid)
+    if not ok:
+        await q.edit_message_text(force_join_text(), parse_mode="Markdown",
+                                  reply_markup=force_join_kb())
+        return
+    if not user_exists(uid):
+        user = q.from_user
+        create_user(uid, user.id, user.username, user.first_name)
+        add_points(uid, 2, "signup", "New user bonus")
+        await q.edit_message_text(
+            f"🎉 Welcome {user.first_name}! +2 points credited.\n"
+            f"Invite friends to earn more points!",
+            reply_markup=main_menu())
+    else:
+        await q.edit_message_text("✅ Verified! Welcome back.", reply_markup=main_menu())
+
+
+def main_menu():
+    return InlineKeyboardMarkup([
+        [btn("👤 My Balance", "balance", "primary")],
+        [btn("👥 Invite Friends", "invite", "success"),
+         btn("🏆 Leaderboard", "leaderboard", "primary")],
+        [btn("⚡ Rakhi Offer", "rakhi_offer", "danger")],
+        [btn("🔧 Admin Panel", "admin_panel", "danger")],
+    ])
+
+
+# ── handlers ─────────────────────────────────────────────────────────────────
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = update.effective_user
+    args = ctx.args or []
+    referrer_code = args[0] if args else None
+
+    # store pending referral for when they join
+    if referrer_code:
+        LOGIN_SESSIONS[uid] = {"state": "pending_ref", "referrer_code": referrer_code}
+
+    if not await ensure_joined(update, ctx):
+        return
+
+    # referral applied only after membership verified
+    pending = LOGIN_SESSIONS.pop(uid, None)
+    if pending and pending.get("referrer_code") and not user_exists(uid):
+        referrer_code = pending["referrer_code"]
+
+    if not user_exists(uid):
+        referred_by = None
+        if referrer_code:
+            r = get_db().execute("SELECT chat_id FROM users WHERE referral_code=?", (referrer_code,)).fetchone()
+            if r and r["chat_id"] != uid:
+                referred_by = r["chat_id"]
+        create_user(uid, user.id, user.username, user.first_name, referred_by)
+        add_points(uid, 2, "signup", "New user bonus")
+        if referred_by:
+            record_referral(referred_by, uid)
+            add_points(referred_by, 2, "referral_bonus", f"Referred user {uid}")
+            try:
+                await ctx.bot.send_message(referred_by, f"🎉 Referral bonus! +2 points (user @{user.username or uid})")
+            except Exception:
+                pass
+        await update.message.reply_text(
+            f"🎉 Welcome {user.first_name}! +2 points credited.\n"
+            f"Invite friends to earn more points!\n"
+            f"Your referral: {referrer_code or ''}",
+            reply_markup=main_menu())
+    else:
+        await update.message.reply_text(f"👋 Welcome back {user.first_name}!", reply_markup=main_menu())
+
+
+async def balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    u = get_user(uid)
+    refs = count_referrals(uid)
+    txt = (
+        f"👤 **Your Dashboard**\n\n"
+        f"💰 Points: `{u['points']}`\n"
+        f"👥 Referrals: `{refs}`\n"
+        f"🔗 Code: `{u['referral_code']}`\n"
+        f"📅 Joined: {u['created_at']}"
+    )
+    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=main_menu())
+
+
+async def invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    u = get_user(uid)
+    link = f"https://t.me/Viedietbypass_bot?start={u['referral_code']}"
+    txt = (
+        f"👥 **Invite Friends**\n\n"
+        f"Share your referral link:\n`{link}`\n\n"
+        f"🎁 You get **+2 points** and your friend gets **+2 points**\n"
+        f"📊 Referrals so far: `{count_referrals(uid)}`"
+    )
+    kb = InlineKeyboardMarkup([
+        [btn("📋 Copy Link", f"copy_{link}", "primary")],
+        [btn("🔙 Back", "back_menu", "danger")],
+    ])
+    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+
+
+async def leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    lb = get_leaderboard(10)
+    lines = []
+    for i, row in enumerate(lb, 1):
+        name = row["first_name"] or row["username"] or f"User{row['chat_id']}"
+        lines.append(f"{i}. {name} — `{row['points']}` pts")
+    txt = "🏆 **Leaderboard**\n\n" + "\n".join(lines) + "\n\n🔙 Back to menu"
+    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=main_menu())
+
+
+async def back_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("📌 **Main Menu**", parse_mode="Markdown", reply_markup=main_menu())
+
+
+async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    if not is_admin(uid):
+        await q.edit_message_text("⛔ Access denied. Only admins.", reply_markup=main_menu())
+        return
+    txt = (
+        f"🔧 **Admin Panel**\n\n"
+        f"👥 Total users: `{total_users()}`\n"
+        f"💰 Total points: `{total_points()}`\n"
+        f"🔗 Total referrals: `{total_referrals()}`\n\n"
+        f"Commands:\n"
+        f"`/give [user_id] [points]`\n"
+        f"`/stats` — detailed stats\n"
+        f"`/users` — list all users"
+    )
+    kb = InlineKeyboardMarkup([
+        [btn("📊 Stats", "admin_stats", "primary")],
+        [btn("👥 All Users", "admin_users", "primary")],
+        [btn("🔙 Back", "back_menu", "danger")],
+    ])
+    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+
+
+async def admin_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        return
+    txt = (
+        f"📊 **Bot Statistics**\n\n"
+        f"👥 Total users: `{total_users()}`\n"
+        f"💰 Total points issued: `{total_points()}`\n"
+        f"🔗 Total referrals: `{total_referrals()}`\n"
+        f"🆔 Admins: `{ADMIN_IDS}`"
+    )
+    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=admin_back_kb())
+
+
+def admin_back_kb():
+    return InlineKeyboardMarkup([[btn("🔙 Back to Admin", "admin_panel", "danger")]])
+
+
+async def admin_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        return
+    us = all_users()
+    lines = []
+    for u in us[:20]:
+        lines.append(f"`{u['chat_id']}` | {u['first_name'] or u['username'] or '?'} | `{u['points']}` pts")
+    txt = "👥 **Users (last 20)**\n\n" + "\n".join(lines) + "\n\n🔙 Back"
+    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=admin_back_kb())
+
+
+async def handle_give(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Only admins can use this command.")
+        return
+    args = ctx.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: `/give [user_id] [points]`", parse_mode="Markdown")
+        return
+    try:
+        target = int(args[0])
+        pts = int(args[1])
+    except ValueError:
+        await update.message.reply_text("Invalid user_id or points.")
+        return
+    if not user_exists(target):
+        await update.message.reply_text(f"User `{target}` not found in database.", parse_mode="Markdown")
+        return
+    add_points(target, pts, "admin_gift", f"Admin {uid} gave {pts} points")
+    await update.message.reply_text(f"✅ `{pts}` points given to user `{target}`.", parse_mode="Markdown")
+
+
+async def handle_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
     if not is_admin(uid):
         return
-    await tg_send(q.message.chat_id, admin_stats_text(),
-                  reply_markup=admin_panel_kb(), message_id=q.message.message_id)
+    txt = (
+        f"📊 **Bot Statistics**\n\n"
+        f"👥 Total users: `{total_users()}`\n"
+        f"💰 Total points: `{total_points()}`\n"
+        f"🔗 Total referrals: `{total_referrals()}`\n"
+        f"🆔 Admins: `{ADMIN_IDS}`"
+    )
+    await update.message.reply_text(txt, parse_mode="Markdown")
 
 
-async def admin_give_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin(q.from_user.id):
-        return ConversationHandler.END
-    await tg_send(q.message.chat_id,
-                  "➕ *Give Points to ALL users*\n\nSend the amount (e.g. `5`):",
-                  reply_markup=cancel_inline(), message_id=q.message.message_id)
-    return ADMIN_GIVE
-
-
-async def admin_give_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        amt = int(update.message.text.strip())
-    except ValueError:
-        await tg_send(update.effective_chat.id, "❌ Send a valid number.")
-        return ADMIN_GIVE
-    for u in DATA["users"].values():
-        u["points"] += amt
-    save_data(DATA)
-    await tg_send(update.effective_chat.id,
-                  f"✅ Added `{amt}` points to ALL users!",
-                  reply_markup=admin_panel_kb())
-    return ConversationHandler.END
-
-
-async def admin_bc_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin(q.from_user.id):
-        return ConversationHandler.END
-    await tg_send(q.message.chat_id,
-                  "📢 *Broadcast*\n\nSend the message to send to all users:",
-                  reply_markup=cancel_inline(), message_id=q.message.message_id)
-    return ADMIN_BC
-
-
-async def admin_bc_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    sent = 0
-    failed = 0
-    for uid in list(DATA["users"].keys()):
-        res = await tg_send(uid, f"📢 *Broadcast*\n\n{text}")
-        if res.get("ok"):
-            sent += 1
-        else:
-            failed += 1
-    await tg_send(update.effective_chat.id,
-                  f"📢 Broadcast done!\n✅ Sent: `{sent}`\n❌ Failed: `{failed}`",
-                  reply_markup=admin_panel_kb())
-    return ConversationHandler.END
-
-
-async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Fallback for plain text when no conversation is active
-    await tg_send(update.effective_chat.id,
-                  "👇 Use the buttons below to navigate.",
-                  reply_markup=main_menu_kb(str(update.effective_user.id)))
-
-
-async def err_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    err = context.error
-    if isinstance(err, Conflict):
-        print("⚠️ Telegram Conflict: two instances are using this bot token. "
-              "Run ONLY ONE instance (stop local bot / set Railway replicas to 1).")
+async def handle_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
         return
-    print(f"Unhandled error: {err}")
+    us = all_users()
+    lines = []
+    for u in us:
+        lines.append(f"`{u['chat_id']}` | `{u['first_name'] or u['username'] or '?'}` | `{u['points']}` pts | `{u['referral_code']}`")
+    chunk = "\n".join(lines)
+    for i in range(0, len(chunk), 4000):
+        await update.message.reply_text(chunk[i:i + 4000], parse_mode="Markdown")
 
+
+# ── Rakhi Offer flow ─────────────────────────────────────────────────────────
+
+def login_method_kb():
+    """Choose OTP or JSON login."""
+    return InlineKeyboardMarkup([
+        [btn("📱 Login with OTP", "login_otp", "primary")],
+        [btn("📄 Login with JSON", "login_json", "success")],
+        [btn("🔙 Back", "back_menu", "danger")],
+    ])
+
+
+async def rakhi_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not await ensure_joined(update, ctx):
+        return
+    await q.edit_message_text(
+        "⚡ **Rakhi Sibling Wars Offer**\n\n"
+        "Choose login method:",
+        parse_mode="Markdown", reply_markup=login_method_kb())
+
+
+async def login_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    LOGIN_SESSIONS[uid] = {"state": "await_mobile", "mobile": None, "tid": None,
+                           "sid": None, "headers": None, "team": 1}
+    await q.edit_message_text(
+        "📱 **OTP Login**\n\nSend your 10-digit mobile number:\n(/cancel to exit)",
+        parse_mode="Markdown")
+
+
+async def login_json(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    LOGIN_SESSIONS[uid] = {"state": "await_json", "headers": None, "team": 1}
+    await q.edit_message_text(
+        "📄 **JSON Login**\n\n"
+        "Paste your session JSON:\n"
+        "```json\n{\"tid\": \"...\", \"sid\": \"...\", "
+        "\"userid\": \"...\", \"token\": \"...\"}\n```\n"
+        "Or paste the full login response JSON.\n"
+        "Minimum required: `tid` + `sid` or `userid`.\n"
+        "(/cancel to exit)",
+        parse_mode="Markdown")
+
+
+def build_session_from_json(obj):
+    tid = obj.get("tid") or ""
+    sid = obj.get("sid") or ""
+    # if it looks like a full verify response (has data + top-level tid)
+    if "data" in obj and tid:
+        return build_session(obj)
+    userid = str(obj.get("userid") or obj.get("userId") or obj.get("user_id") or "")
+    token = obj.get("token") or ""
+    if not userid and tid:
+        userid = str(_jwt_payload(tid).get("user_id") or "")
+    return {"userid": userid, "tid": tid, "sid": sid, "token": token}
+
+
+# ── callback router ──────────────────────────────────────────────────────────
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data
+    uid = q.from_user.id
+    admin_only = data in ("admin_panel", "admin_stats", "admin_users")
+    if data != "join_verified" and not admin_only and not is_admin(uid):
+        if not await check_membership(ctx.bot, uid)[0]:
+            await q.answer()
+            await q.edit_message_text(force_join_text(), parse_mode="Markdown",
+                                      reply_markup=force_join_kb())
+            return
+    handlers = {
+        "balance": balance,
+        "invite": invite,
+        "leaderboard": leaderboard,
+        "back_menu": back_menu,
+        "admin_panel": admin_panel,
+        "admin_stats": admin_stats,
+        "admin_users": admin_users,
+        "rakhi_offer": rakhi_offer,
+        "login_otp": login_otp,
+        "login_json": login_json,
+        "join_verified": join_verified,
+    }
+    if data.startswith("copy_"):
+        await q.answer(text=data[5:], show_alert=True)
+        return
+    if data.startswith("team:"):
+        uid = q.from_user.id
+        s = LOGIN_SESSIONS.get(uid)
+        if s:
+            s["team"] = int(data.split(":")[1])
+        await q.edit_message_text(f"Team set. Now Run:", reply_markup=team_kb())
+        return
+    if data == "run":
+        await run_offers(update, ctx)
+        return
+    fn = handlers.get(data)
+    if fn:
+        await fn(update, ctx)
+
+
+def team_kb():
+    return InlineKeyboardMarkup([
+        [btn("Sister (SIS)", "team:1", "primary"),
+         btn("Brother (BRO)", "team:2", "danger")],
+        [btn("Run all 10 offers", "run", "success")],
+    ])
+
+
+async def run_offers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    s = LOGIN_SESSIONS.get(uid)
+    if not s or not s.get("headers"):
+        await q.edit_message_text("❌ Not logged in. Start again with ⚡ Rakhi Offer.")
+        return
+    team = s["team"]
+    msg = await q.edit_message_text(f"Running {len(OFFER_LINKS)} offers (team {team})...")
+    results = []
+    for i, link in enumerate(OFFER_LINKS, 1):
+        m = re.search(r"rakhi_wars-([A-Za-z0-9_-]+)", link)
+        code = m.group(1) if m else link
+        ok, err = run_one(s["headers"], code, team)
+        results.append((code, ok, err))
+        lines = "\n".join(f"{'OK' if ok else 'ERR'}  {c}" for c, ok, *_ in results)
+        try:
+            await msg.edit_text(f"Running {len(OFFER_LINKS)} offers...\n\n{lines}" +
+                                ("\n\nWorking..." if i < len(OFFER_LINKS) else "\n\nDone!"))
+        except Exception:
+            pass
+    done = sum(1 for _, ok, _ in results if ok)
+    detail = "\n".join(f"{'OK' if ok else 'ERR'} `{c}`" + (f"\n    {e}" if not ok else "") for c, ok, e in results)
+    await ctx.bot.send_message(uid, f"Finished: {done}/{len(OFFER_LINKS)} completed.\n\n{detail}", parse_mode="Markdown")
+
+
+# ── OTP text handler ─────────────────────────────────────────────────────────
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.message:
+        return
+    uid = update.effective_chat.id
+    text = (update.message.text or "").strip()
+
+    # non-login messages: keep bot locked until membership verified
+    s = LOGIN_SESSIONS.get(uid)
+    if not s or s.get("state") not in ("await_mobile", "await_otp", "await_json"):
+        if not await ensure_joined(update, ctx):
+            return
+        await update.message.reply_text("Use the main menu buttons below 👇", reply_markup=main_menu())
+        return
+
+    if s["state"] == "await_mobile":
+        if not re.fullmatch(r"\d{10}", text):
+            await update.message.reply_text("Enter 10-digit number only.")
+            return
+        try:
+            data = send_otp(text)
+            s["mobile"] = text
+            s["tid"] = data["tid"]
+            s["sid"] = data["sid"]
+            s["state"] = "await_otp"
+            await update.message.reply_text(f"OTP sent to +91{text}. Send the OTP.")
+        except SwiggyError as e:
+            await update.message.reply_text(f"Error: {e}")
+        except Exception as e:
+            log.exception("send_otp")
+            await update.message.reply_text(f"Error: {e}")
+
+    elif s["state"] == "await_otp":
+        try:
+            v = verify_otp(s["mobile"], text, s["tid"], s["sid"])
+            with open(DB_PATH.replace(".db", "_login_debug.json"), "w", encoding="utf-8") as fh:
+                json.dump(v, fh, indent=2, ensure_ascii=False)
+            h = build_session(v)
+            if not h.get("userid"):
+                await update.message.reply_text("Login failed: no user in response. " + json.dumps(v, ensure_ascii=False)[:300])
+                return
+            s["headers"] = h
+            s["state"] = "logged_in"
+            await update.message.reply_text(f"Logged in as user {h['userid']}.", reply_markup=team_kb())
+        except SwiggyError as e:
+            await update.message.reply_text(f"OTP error: {e}")
+        except Exception as e:
+            log.exception("verify")
+            await update.message.reply_text(f"OTP error: {e}")
+
+    elif s["state"] == "await_json":
+        try:
+            obj = json.loads(text)
+            h = build_session_from_json(obj)
+            if not h.get("tid") and not h.get("userid"):
+                raise SwiggyError("JSON missing tid/sid/userid")
+            s["headers"] = h
+            s["state"] = "logged_in"
+            await update.message.reply_text(
+                f"✅ JSON session loaded (userid: {h.get('userid') or '?'}).",
+                reply_markup=team_kb())
+        except Exception as e:
+            await update.message.reply_text(f"❌ Invalid JSON: {e}\nPaste a valid session JSON.")
+
+
+async def handle_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    LOGIN_SESSIONS.pop(uid, None)
+    await update.message.reply_text("Cancelled. /start for main menu.", reply_markup=main_menu())
+
+
+def error_handler(update, ctx):
+    log.warning("handler error: %s", ctx.error)
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    import asyncio
     asyncio.set_event_loop(asyncio.new_event_loop())
-
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_error_handler(error_handler)
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", lambda u, c: help_cmd(u, c)))
-    app.add_handler(CommandHandler("admin", lambda u, c: admin_panel(u, c)))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", handle_cancel))
+    app.add_handler(CommandHandler("give", handle_give))
+    app.add_handler(CommandHandler("stats", handle_stats))
+    app.add_handler(CommandHandler("users", handle_users))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    app.add_handler(CallbackQueryHandler(verify_join_cb, pattern="^verify_join$"))
-    app.add_handler(CallbackQueryHandler(ref_panel_cb, pattern="^ref$"))
-    app.add_handler(CallbackQueryHandler(my_codes_cmd, pattern="^mycodes$"))
-    app.add_handler(CallbackQueryHandler(back_menu_cb, pattern="^back_menu$"))
-    app.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin$"))
-    app.add_handler(CallbackQueryHandler(stats_cmd, pattern="^stats$"))
-    app.add_handler(CallbackQueryHandler(help_cmd, pattern="^help$"))
-
-    gen_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(generate_start, pattern="^gen$")],
-        states={
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received),
-                    CallbackQueryHandler(gen_cancel_cb, pattern="^gen_cancel$")],
-            OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, otp_received),
-                  CallbackQueryHandler(gen_cancel_cb, pattern="^gen_cancel$")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    app.add_handler(gen_conv)
-
-    admin_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_give_entry, pattern="^admin_giveall$"),
-                      CallbackQueryHandler(admin_bc_entry, pattern="^admin_broadcast$")],
-        states={
-            ADMIN_GIVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_give_amount),
-                         CallbackQueryHandler(gen_cancel_cb, pattern="^gen_cancel$")],
-            ADMIN_BC: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_bc_text),
-                       CallbackQueryHandler(gen_cancel_cb, pattern="^gen_cancel$")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    app.add_handler(admin_conv)
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
-    app.add_error_handler(err_handler)
-
-    # Periodic GitHub backup every 5 minutes (background thread, no job-queue needed)
-    if GITHUB_TOKEN:
-        def _github_backup_loop():
-            while True:
-                time.sleep(300)
-                try:
-                    github_push()
-                except Exception:
-                    pass
-        threading.Thread(target=_github_backup_loop, daemon=True).start()
-
-    print("🤖 Bot started... Made By Viediet")
-
-    public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
-    webhook_url = os.getenv("WEBHOOK_URL")
-    use_webhook = bool(public_domain or webhook_url)
-
-    if use_webhook:
-        base = webhook_url or f"https://{public_domain}"
-        full = f"{base}/{BOT_TOKEN}"
-        print(f"🌐 Webhook mode: {base}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=int(os.getenv("PORT", "8080")),
-            url_path=BOT_TOKEN,
-            webhook_url=full,
-        )
-    else:
-        while True:
-            try:
-                app.run_polling(drop_pending_updates=True, close_loop=False)
-                break
-            except Conflict:
-                print("⚠️ Conflict: another bot instance is already polling this token. "
-                      "Make sure ONLY ONE instance is running (stop local bot if deployed, "
-                      "or set Railway replicas to 1). Retrying in 15s...")
-                time.sleep(15)
-            except KeyboardInterrupt:
-                break
+    log.info("Bot started (admin_ids=%s)", ADMIN_IDS)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
