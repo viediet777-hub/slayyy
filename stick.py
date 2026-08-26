@@ -286,15 +286,37 @@ def is_admin(uid):
 
 # ── force-join ───────────────────────────────────────────────────────────────
 
-async def check_membership(bot, user_id):
-    """Returns (ok, missing_channel). ok=False if user must join something."""
+# numeric chat ids resolved at startup (more reliable than usernames)
+CHAT_IDS = {}
+
+
+async def resolve_chat_ids(app):
     for ch in REQUIRED_CHANNELS:
         try:
-            member = await bot.get_chat_member(chat_id=ch["username"], user_id=user_id)
+            chat = await app.bot.get_chat(_chat_username(ch["username"]))
+            CHAT_IDS[ch["username"]] = chat.id
+            log.info("resolved %s -> %s", ch["username"], chat.id)
+        except Exception as e:
+            log.warning("could not resolve %s: %s", ch["username"], e)
+
+
+def _chat_username(u):
+    return u if u.startswith("@") else "@" + u
+
+
+async def check_membership(bot, user_id):
+    """Returns (ok, missing_channel). Fail-open: if the bot can't verify a chat
+    (e.g. not in it), that chat is skipped so users aren't locked out."""
+    for ch in REQUIRED_CHANNELS:
+        chat_id = CHAT_IDS.get(ch["username"]) or _chat_username(ch["username"])
+        try:
+            member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
             if member.status not in ("creator", "administrator", "member", "restricted"):
                 return False, ch
-        except Exception:
-            return False, ch
+        except Exception as e:
+            log.warning("membership check skipped for %s user %s: %s",
+                        ch["username"], user_id, e)
+            continue
     return True, None
 
 
@@ -314,8 +336,11 @@ def force_join_text():
 
 
 async def ensure_joined(update, ctx):
-    """If user not in required channels, show join prompt and return False."""
+    """If user not in required channels, show join prompt and return False.
+    Admins are always allowed."""
     uid = update.effective_user.id
+    if is_admin(uid):
+        return True
     ok, _ = await check_membership(ctx.bot, uid)
     if not ok:
         if update.callback_query:
@@ -334,10 +359,18 @@ async def join_verified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
+    if is_admin(uid):
+        if not user_exists(uid):
+            user = q.from_user
+            create_user(uid, user.id, user.username, user.first_name)
+            add_points(uid, 2, "signup", "New user bonus")
+        await q.edit_message_text("✅ Welcome admin! Main menu below.",
+                                  reply_markup=main_menu())
+        return
     ok, missing = await check_membership(ctx.bot, uid)
     if not ok:
-        await q.edit_message_text(force_join_text(), parse_mode="Markdown",
-                                  reply_markup=force_join_kb())
+        await q.answer(f"You haven't joined {missing['title']} yet!",
+                       show_alert=True)
         return
     if not user_exists(uid):
         user = q.from_user
@@ -777,7 +810,7 @@ async def handle_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled. /start for main menu.", reply_markup=main_menu())
 
 
-def error_handler(update, ctx):
+async def error_handler(update, ctx):
     log.warning("handler error: %s", ctx.error)
 
 
@@ -788,6 +821,10 @@ def main():
     asyncio.set_event_loop(asyncio.new_event_loop())
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_error_handler(error_handler)
+
+    async def _post_init(app_):
+        await resolve_chat_ids(app_)
+    app.post_init = _post_init
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", handle_cancel))
