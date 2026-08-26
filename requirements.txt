@@ -1,3 +1,2 @@
-python-telegram-bot==21.11.1
-requests==2.34.2
-cloudscraper==1.2.71
+requests>=2.31
+python-telegram-bot==22.8
