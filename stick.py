@@ -50,6 +50,9 @@ def _init_db():
             """CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, amount INTEGER,
                 type TEXT, description TEXT, created_at TEXT DEFAULT (datetime('now')))""",
+            """CREATE TABLE IF NOT EXISTS offer_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, link TEXT UNIQUE,
+                created_at TEXT DEFAULT (datetime('now')))""",
         ):
             _db_conn.execute(ddl)
         _db_conn.commit()
@@ -151,6 +154,49 @@ def total_points():
 def total_referrals():
     r = _one("SELECT COUNT(*) c FROM referrals")
     return r["c"] if r else 0
+
+
+# ── offer links (admin-managed, stored in DB) ───────────────────────────────
+
+def get_offer_links(limit=10):
+    """Return stored links (up to limit); falls back to default OFFER_LINKS."""
+    rows = _all("SELECT link FROM offer_links ORDER BY id LIMIT ?", (limit,))
+    links = [r["link"] for r in rows]
+    return links if links else OFFER_LINKS
+
+
+def add_offer_links(text):
+    """Parse bulk links (one per line / comma / space), dedupe, insert.
+    Returns (added_count, skipped_duplicates, stored_total)."""
+    raw = re.split(r"[\s,]+", text.strip())
+    links = []
+    seen = set()
+    skipped = 0
+    for l in raw:
+        l = l.strip().strip('"').strip("'")
+        if not l or not l.lower().startswith("http"):
+            continue
+        if l in seen:
+            skipped += 1
+            continue
+        seen.add(l)
+        links.append(l)
+    added = 0
+    with _db_lock:
+        _init_db()
+        for l in links:
+            cur = _db_conn.execute("INSERT OR IGNORE INTO offer_links (link) VALUES (?)", (l,))
+            if cur.rowcount:
+                added += 1
+            else:
+                skipped += 1
+        _db_conn.commit()
+    stored = _one("SELECT COUNT(*) c FROM offer_links")["c"]
+    return added, skipped, stored
+
+
+def clear_offer_links():
+    _run("DELETE FROM offer_links")
 
 
 # ── SWIGGY API ───────────────────────────────────────────────────────────────
@@ -304,6 +350,7 @@ from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, filters, ContextTypes)
 
 LOGIN_SESSIONS = {}
+ADMIN_STATE = {}
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -511,6 +558,9 @@ async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [btn("📊 Stats", "admin_stats", "primary")],
         [btn("👥 All Users", "admin_users", "primary")],
+        [btn("➕ Add Links", "admin_add_links", "success"),
+         btn("📋 Links", "admin_view_links", "primary")],
+        [btn("🗑 Clear Links", "admin_clear_links", "danger")],
         [btn("🔙 Back", "back_menu", "danger")],
     ])
     await q.edit_message_text(txt, reply_markup=kb)
@@ -543,6 +593,46 @@ async def admin_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"`{u['chat_id']}` | {u['first_name'] or u['username'] or '?'} | `{u['points']}` pts")
     txt = "👥 **Users (last 20)**\n\n" + "\n".join(lines)
     await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[btn("🔙 Back to Admin", "admin_panel", "danger")]]))
+
+
+async def admin_add_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        return
+    ADMIN_STATE[q.from_user.id] = "await_links"
+    await q.edit_message_text(
+        "➕ **Add Offer Links**\n\n"
+        "Paste links (one per line, or comma/space separated).\n"
+        "Duplicates are skipped automatically.\n"
+        "Bot will use up to 10 stored links.\n\n"
+        "Type /cancel to abort.",
+        parse_mode="Markdown")
+
+
+async def admin_view_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        return
+    stored = _all("SELECT link FROM offer_links ORDER BY id")
+    if not stored:
+        txt = "📋 **Offer Links**\n\nUsing default 10 links (none added yet)."
+    else:
+        lines = [f"{i}. `{r['link']}`" for i, r in enumerate(stored, 1)]
+        txt = "📋 **Offer Links** (" + str(len(stored)) + " stored)\n\n" + "\n".join(lines)
+    kb = InlineKeyboardMarkup([[btn("🔙 Back to Admin", "admin_panel", "danger")]])
+    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+
+
+async def admin_clear_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        return
+    clear_offer_links()
+    await q.edit_message_text("🗑 All stored offer links cleared. Bot will use default 10 links.",
+                              reply_markup=InlineKeyboardMarkup([[btn("🔙 Back to Admin", "admin_panel", "danger")]]))
 
 
 async def handle_give(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -641,22 +731,23 @@ async def run_offers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ Not logged in. Start again with ⚡ Rakhi Offer.")
         return
     team = s["team"]
-    msg = await q.edit_message_text("⚡ Running " + str(len(OFFER_LINKS)) + " offers (team " + str(team) + ")...")
+    links = get_offer_links()
+    msg = await q.edit_message_text("⚡ Running " + str(len(links)) + " offers (team " + str(team) + ")...")
     results = []
-    for i, link in enumerate(OFFER_LINKS, 1):
+    for i, link in enumerate(links, 1):
         m = re.search(r"rakhi_wars-([A-Za-z0-9_-]+)", link)
         code = m.group(1) if m else link
         ok, err = run_one(s["headers"], code, team)
         results.append((code, ok, err))
         lines = "\n".join(f"{'✅' if ok else '❌'}  {c}" for c, ok, *_ in results)
         try:
-            await msg.edit_text("⚡ Running " + str(len(OFFER_LINKS)) + " offers...\n\n" + lines +
-                                ("\n\n⏳ Working..." if i < len(OFFER_LINKS) else "\n\n✅ Done!"))
+            await msg.edit_text("⚡ Running " + str(len(links)) + " offers...\n\n" + lines +
+                                ("\n\n⏳ Working..." if i < len(links) else "\n\n✅ Done!"))
         except Exception:
             pass
     done = sum(1 for _, ok, _ in results if ok)
     detail = "\n".join(f"{'✅' if ok else '❌'} `{c}`" + (f"\n   {e}" if not ok else "") for c, ok, e in results)
-    await ctx.bot.send_message(uid, "🏁 **Finished:** " + str(done) + "/" + str(len(OFFER_LINKS)) + " completed.\n\n" + detail, parse_mode="Markdown")
+    await ctx.bot.send_message(uid, "🏁 **Finished:** " + str(done) + "/" + str(len(links)) + " completed.\n\n" + detail, parse_mode="Markdown")
 
 
 # ── callback router ──────────────────────────────────────────────────────────
@@ -686,7 +777,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # membership gate for non-admin, non-join buttons
-    admin_only = data in ("admin_panel", "admin_stats", "admin_users")
+    admin_only = data in ("admin_panel", "admin_stats", "admin_users",
+                          "admin_add_links", "admin_view_links", "admin_clear_links")
     if data != "join_verified" and not admin_only and not is_admin(uid):
         ok, _ = await check_membership(ctx.bot, uid)
         if not ok:
@@ -698,6 +790,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "balance": balance, "invite": invite, "leaderboard": leaderboard,
         "back_menu": back_menu, "admin_panel": admin_panel,
         "admin_stats": admin_stats, "admin_users": admin_users,
+        "admin_add_links": admin_add_links, "admin_view_links": admin_view_links,
+        "admin_clear_links": admin_clear_links,
         "rakhi_offer": rakhi_offer, "login_otp": login_otp, "login_json": login_json,
         "join_verified": join_verified,
     }
@@ -720,6 +814,24 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     uid = update.effective_chat.id
     text = (update.message.text or "").strip()
+
+    # admin pasting bulk offer links
+    if ADMIN_STATE.get(uid) == "await_links":
+        ADMIN_STATE.pop(uid, None)
+        if not is_admin(uid):
+            return
+        if text.lower() in ("/cancel", "cancel"):
+            await update.message.reply_text("Cancelled.", reply_markup=main_menu(uid))
+            return
+        added, skipped, stored = add_offer_links(text)
+        await update.message.reply_text(
+            "✅ Done!\n"
+            "➕ Added: " + str(added) + "\n"
+            "⚠️ Duplicates skipped: " + str(skipped) + "\n"
+            "📋 Total stored: " + str(stored) + " (bot uses up to 10)\n\n"
+            "Send /cancel to finish.",
+            reply_markup=main_menu(uid))
+        return
 
     s = LOGIN_SESSIONS.get(uid)
     if not s or s.get("state") not in ("await_mobile", "await_otp", "await_json"):
@@ -769,6 +881,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     LOGIN_SESSIONS.pop(uid, None)
+    ADMIN_STATE.pop(uid, None)
     await update.message.reply_text("❌ Cancelled. /start for main menu.", reply_markup=main_menu(uid))
 
 
