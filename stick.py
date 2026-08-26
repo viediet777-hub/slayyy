@@ -23,90 +23,134 @@ REQUIRED_CHANNELS = [
 
 # ── DB ───────────────────────────────────────────────────────────────────────
 
-def get_db():
-    db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("""CREATE TABLE IF NOT EXISTS users (
-        chat_id INTEGER PRIMARY KEY, user_id TEXT, username TEXT, first_name TEXT,
-        points INTEGER DEFAULT 0, referral_code TEXT UNIQUE, referred_by INTEGER,
-        created_at TEXT DEFAULT (datetime('now')), is_banned INTEGER DEFAULT 0)""")
-    db.execute("""CREATE TABLE IF NOT EXISTS referrals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, referee_id INTEGER,
-        created_at TEXT DEFAULT (datetime('now')))""")
-    db.execute("""CREATE TABLE IF NOT EXISTS transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, amount INTEGER,
-        type TEXT, description TEXT, created_at TEXT DEFAULT (datetime('now')))""")
-    db.commit()
-    return db
+# ── DB (thread-safe single connection) ──────────────────────────────────────
+
+import threading
+
+_db_lock = threading.Lock()
+_db_conn = None
+
+
+def _init_db():
+    global _db_conn
+    if _db_conn is None:
+        _db_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _db_conn.row_factory = sqlite3.Row
+        _db_conn.execute("PRAGMA journal_mode=WAL")
+        _db_conn.execute("PRAGMA busy_timeout=30000")
+        _db_conn.execute("PRAGMA synchronous=NORMAL")
+        for ddl in (
+            """CREATE TABLE IF NOT EXISTS users (
+                chat_id INTEGER PRIMARY KEY, user_id TEXT, username TEXT, first_name TEXT,
+                points INTEGER DEFAULT 0, referral_code TEXT UNIQUE, referred_by INTEGER,
+                created_at TEXT DEFAULT (datetime('now')), is_banned INTEGER DEFAULT 0)""",
+            """CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, referee_id INTEGER,
+                created_at TEXT DEFAULT (datetime('now')))""",
+            """CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, amount INTEGER,
+                type TEXT, description TEXT, created_at TEXT DEFAULT (datetime('now')))""",
+        ):
+            _db_conn.execute(ddl)
+        _db_conn.commit()
+
+
+def _one(sql, args=()):
+    with _db_lock:
+        _init_db()
+        return _db_conn.execute(sql, args).fetchone()
+
+
+def _all(sql, args=()):
+    with _db_lock:
+        _init_db()
+        return _db_conn.execute(sql, args).fetchall()
+
+
+def _run(sql, args=()):
+    with _db_lock:
+        _init_db()
+        _db_conn.execute(sql, args)
+        _db_conn.commit()
+
+
+def _multi(statements):
+    """Run several statements atomically under one lock."""
+    with _db_lock:
+        _init_db()
+        for sql, args in statements:
+            _db_conn.execute(sql, args)
+        _db_conn.commit()
 
 
 def user_exists(chat_id):
-    return get_db().execute("SELECT 1 FROM users WHERE chat_id=?", (chat_id,)).fetchone() is not None
+    return _one("SELECT 1 FROM users WHERE chat_id=?", (chat_id,)) is not None
 
 
 def get_user(chat_id):
-    return get_db().execute("SELECT * FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+    return _one("SELECT * FROM users WHERE chat_id=?", (chat_id,))
 
 
 def ensure_user(chat_id, user_id, username, first_name):
-    u = get_db().execute("SELECT * FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+    u = get_user(chat_id)
     if u:
         return u
     code = md5(f"{chat_id}_{time.time()}".encode()).hexdigest()[:8]
-    get_db().execute("""INSERT OR IGNORE INTO users (chat_id, user_id, username, first_name, referral_code)
+    _run("""INSERT OR IGNORE INTO users (chat_id, user_id, username, first_name, referral_code)
         VALUES (?,?,?,?,?)""", (chat_id, str(user_id) or "", username or "", first_name or "", code))
-    get_db().commit()
     return get_user(chat_id)
 
 
 def create_user(chat_id, user_id, username, first_name, referred_by=None):
     code = md5(f"{chat_id}_{time.time()}".encode()).hexdigest()[:8]
-    get_db().execute("""INSERT OR IGNORE INTO users (chat_id, user_id, username, first_name, referral_code, referred_by)
+    _run("""INSERT OR IGNORE INTO users (chat_id, user_id, username, first_name, referral_code, referred_by)
         VALUES (?,?,?,?,?,?)""", (chat_id, str(user_id) or "", username or "", first_name or "", code, referred_by))
-    get_db().commit()
     return code
 
 
 def add_points(chat_id, amount, typ, desc):
-    db = get_db()
-    db.execute("UPDATE users SET points = points + ? WHERE chat_id=?", (amount, chat_id))
-    db.execute("INSERT INTO transactions (chat_id, amount, type, description) VALUES (?,?,?,?)",
-               (chat_id, amount, typ, desc))
-    db.commit()
+    _multi([
+        ("UPDATE users SET points = points + ? WHERE chat_id=?", (amount, chat_id)),
+        ("INSERT INTO transactions (chat_id, amount, type, description) VALUES (?,?,?,?)",
+         (chat_id, amount, typ, desc)),
+    ])
 
 
 def get_points(chat_id):
-    return (get_db().execute("SELECT points FROM users WHERE chat_id=?", (chat_id,)).fetchone() or {}).get("points", 0)
+    r = _one("SELECT points FROM users WHERE chat_id=?", (chat_id,))
+    return r["points"] if r else 0
 
 
 def get_leaderboard(limit=10):
-    return get_db().execute("SELECT chat_id, username, first_name, points FROM users ORDER BY points DESC LIMIT ?", (limit,)).fetchall()
+    return _all("SELECT chat_id, username, first_name, points FROM users ORDER BY points DESC LIMIT ?", (limit,))
 
 
 def count_referrals(chat_id):
-    return (get_db().execute("SELECT COUNT(*) c FROM referrals WHERE referrer_id=?", (chat_id,)).fetchone() or {}).get("c", 0)
+    r = _one("SELECT COUNT(*) c FROM referrals WHERE referrer_id=?", (chat_id,))
+    return r["c"] if r else 0
 
 
 def record_referral(referrer_id, referee_id):
-    get_db().execute("INSERT INTO referrals (referrer_id, referee_id) VALUES (?,?)", (referrer_id, referee_id))
-    get_db().commit()
+    _run("INSERT INTO referrals (referrer_id, referee_id) VALUES (?,?)", (referrer_id, referee_id))
 
 
 def all_users():
-    return get_db().execute("SELECT * FROM users ORDER BY created_at DESC").fetchall()
+    return _all("SELECT * FROM users ORDER BY created_at DESC")
 
 
 def total_users():
-    return (get_db().execute("SELECT COUNT(*) c FROM users").fetchone() or {}).get("c", 0)
+    r = _one("SELECT COUNT(*) c FROM users")
+    return r["c"] if r else 0
 
 
 def total_points():
-    return (get_db().execute("SELECT COALESCE(SUM(points),0) s FROM users").fetchone() or {}).get("s", 0)
+    r = _one("SELECT COALESCE(SUM(points),0) s FROM users")
+    return r["s"] if r else 0
 
 
 def total_referrals():
-    return (get_db().execute("SELECT COUNT(*) c FROM referrals").fetchone() or {}).get("c", 0)
+    r = _one("SELECT COUNT(*) c FROM referrals")
+    return r["c"] if r else 0
 
 
 # ── SWIGGY API ───────────────────────────────────────────────────────────────
@@ -382,7 +426,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not user_exists(uid):
         referred_by = None
         if referrer_code:
-            r = get_db().execute("SELECT chat_id FROM users WHERE referral_code=?", (referrer_code,)).fetchone()
+            r = _one("SELECT chat_id FROM users WHERE referral_code=?", (referrer_code,))
             if r and r["chat_id"] != uid:
                 referred_by = r["chat_id"]
         create_user(uid, user.id, user.username, user.first_name, referred_by)
