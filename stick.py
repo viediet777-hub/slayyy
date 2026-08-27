@@ -341,15 +341,23 @@ def campaign_poll(session, r=""):
 
 
 def run_one(session, ref, team=1):
+    # details/poll are informational — ignore their errors so the offer still
+    # completes even if Swiggy returns "session expired" on those calls.
     try:
         campaign_details(session, ref)
+    except SwiggyError:
+        pass
+    try:
         campaign_submit(session, "JOIN_MATCH", team, ref)
         for _ in range(5):
             atk = campaign_submit(session, "ATTACK", team, ref)
             if (atk.get("data") or {}).get("userState", {}).get("attacksLeft", 0) <= 0:
                 break
             time.sleep(1)
-        campaign_poll(session, ref)
+        try:
+            campaign_poll(session, ref)
+        except SwiggyError:
+            pass
         return (True, "")
     except SwiggyError as e:
         return (False, str(e))
@@ -376,9 +384,8 @@ def is_admin(uid):
 
 def main_menu(uid=None):
     rows = [
-        [btn("👤 My Balance", "balance", "primary")],
-        [btn("👥 Invite Friends", "invite", "success"),
-         btn("🏆 Leaderboard", "leaderboard", "primary")],
+        [btn("👤 My Dashboard", "balance", "primary")],
+        [btn("📖 Offer Guide", "offer_guide", "success")],
         [btn("⚡ Rakhi Offer", "rakhi_offer", "danger")],
     ]
     if uid and is_admin(uid):
@@ -452,7 +459,6 @@ async def join_verified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not user_exists(uid):
             u = q.from_user
             create_user(uid, u.id, u.username, u.first_name)
-            add_points(uid, 2, "signup", "New user bonus")
         await q.edit_message_text("✅ Welcome admin!", reply_markup=main_menu(uid))
         return
     ok, missing = await check_membership(ctx.bot, uid)
@@ -462,8 +468,7 @@ async def join_verified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not user_exists(uid):
         u = q.from_user
         create_user(uid, u.id, u.username, u.first_name)
-        add_points(uid, 2, "signup", "New user bonus")
-        await q.edit_message_text("🎉 Welcome! +2 points credited.\n👥 Invite friends to earn more!", reply_markup=main_menu(uid))
+        await q.edit_message_text("✅ Verified! Welcome to the free bot.\nTap ⚡ Rakhi Offer to claim.", reply_markup=main_menu(uid))
     else:
         await q.edit_message_text("✅ Verified! Welcome back.", reply_markup=main_menu(uid))
 
@@ -473,31 +478,11 @@ async def join_verified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = update.effective_user
-    args = ctx.args or []
-    referrer_code = args[0] if args else None
-    if referrer_code:
-        LOGIN_SESSIONS[uid] = {"state": "pending_ref", "referrer_code": referrer_code}
     if not await ensure_joined(update, ctx):
         return
-    pending = LOGIN_SESSIONS.pop(uid, None)
-    if pending and pending.get("referrer_code") and not user_exists(uid):
-        referrer_code = pending["referrer_code"]
     if not user_exists(uid):
-        referred_by = None
-        if referrer_code:
-            r = _one("SELECT chat_id FROM users WHERE referral_code=?", (referrer_code,))
-            if r and r["chat_id"] != uid:
-                referred_by = r["chat_id"]
-        create_user(uid, user.id, user.username, user.first_name, referred_by)
-        add_points(uid, 2, "signup", "New user bonus")
-        if referred_by:
-            record_referral(referred_by, uid)
-            add_points(referred_by, 2, "referral_bonus", "Referred user " + str(uid))
-            try:
-                await ctx.bot.send_message(referred_by, "Referral bonus! +2 points (user @" + str(user.username or uid) + ")")
-            except Exception:
-                pass
-        await update.message.reply_text("🎉 Welcome! +2 points credited.\n👥 Invite friends to earn more!", reply_markup=main_menu(uid))
+        create_user(uid, user.id, user.username, user.first_name)
+        await update.message.reply_text("🎉 Welcome " + (user.first_name or "") + "!\n\nThis bot is **100% FREE** — no credits, no refer system.\n\nTap ⚡ Rakhi Offer to claim the offer!", parse_mode="Markdown", reply_markup=main_menu(uid))
     else:
         await update.message.reply_text("👋 Welcome back " + (user.first_name or "") + "!", reply_markup=main_menu(uid))
 
@@ -508,41 +493,58 @@ async def balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     ensure_user(uid, uid, q.from_user.username, q.from_user.first_name)
     u = get_user(uid)
-    refs = count_referrals(uid)
     txt = ("👤 **Your Dashboard**\n\n"
-           "💰 Points: `" + str(u["points"]) + "`\n"
-           "👥 Referrals: `" + str(refs) + "`\n"
-           "🔗 Code: `" + u["referral_code"] + "`\n"
-           "📅 Joined: " + u["created_at"])
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=main_menu(uid))
-
-
-async def invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    ensure_user(uid, uid, q.from_user.username, q.from_user.first_name)
-    u = get_user(uid)
-    link = "https://t.me/Viedietbypass_bot?start=" + u["referral_code"]
-    txt = ("👥 **Invite Friends**\n\n"
-           "Share your referral link:\n`" + link + "`\n\n"
-           "🎁 You get **+2 points** and your friend gets **+2 points**\n"
-           "📊 Referrals: `" + str(count_referrals(uid)) + "`")
-    kb = InlineKeyboardMarkup([[btn("📋 Copy Link", f"copy_{link}", "primary")], [btn("🔙 Back", "back_menu", "danger")]])
+           "👤 User: `" + (u["first_name"] or u["username"] or str(uid)) + "`\n"
+           "📅 Joined: `" + u["created_at"] + "`\n\n"
+           "⚡ **Rakhi Sibling Wars**\n"
+           "• Status: LIVE\n"
+           "• Complete all 10 links to earn reward cash\n"
+           "• Cash applies on orders **₹250+**\n"
+           "• Cash does **NOT** apply on already-discounted items\n\n"
+           "📖 Read the Offer Guide to understand how to claim!")
+    kb = InlineKeyboardMarkup([
+        [btn("📖 Offer Guide", "offer_guide", "success")],
+        [btn("⚡ Claim Offer Now", "rakhi_offer", "danger")],
+        [btn("🔙 Menu", "back_menu", "danger")],
+    ])
     await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
 
 
-async def leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+OFFER_GUIDE = """📖 **RAKHI SIBLING WARS — OFFER GUIDE**
+
+**What is this offer?**
+Swiggy's Rakhi Sibling Wars campaign gives reward cash on your Swiggy account through 10 referral links. This bot opens & completes all 10 links for you automatically. **100% FREE** — no credits, no charges.
+
+**How to claim (steps):**
+1️⃣ Tap **⚡ Rakhi Offer**
+2️⃣ Login: send your 10-digit number → enter OTP (or paste your session JSON)
+3️⃣ Pick a team (**SIS** or **BRO**)
+4️⃣ Tap **"Run all 10 offers"** — done!
+
+**How the offer applies:**
+✅ Reward cash is credited to your Swiggy account
+✅ Applies automatically on your next order
+⚠️ Cash does **NOT** apply on products that already have a discount/offer
+⚠️ Keep minimum order value **₹250+** so the cash applies properly
+
+**Pro tips:**
+🆕 **New accounts get the best benefits**
+❌ Already claimed before? **Delete your Swiggy account** → login again via a **clone/master app** → repeat the same steps
+🔁 If an offer doesn't apply, use a **different mobile number** and follow the same steps
+⏳ Reward cash has an expiry — use it before it's gone
+
+Need help? Tap **⚡ Claim Offer Now** below."""
+
+
+async def offer_guide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    lb = get_leaderboard(10)
-    lines = []
-    for i, row in enumerate(lb, 1):
-        name = row["first_name"] or row["username"] or f"User{row['chat_id']}"
-        lines.append(f"{i}. {name} - `{row['points']}` pts")
-    txt = "🏆 **Leaderboard**\n\n" + "\n".join(lines) + "\n\n🔙 Back to menu"
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=main_menu(uid))
+    kb = InlineKeyboardMarkup([
+        [btn("⚡ Claim Offer Now", "rakhi_offer", "danger")],
+        [btn("🔙 Menu", "back_menu", "danger")],
+    ])
+    await q.edit_message_text(OFFER_GUIDE, parse_mode="Markdown", reply_markup=kb)
 
 
 async def back_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -744,22 +746,69 @@ async def run_offers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     team = s["team"]
     links = get_offer_links()
-    msg = await q.edit_message_text("⚡ Running " + str(len(links)) + " offers (team " + str(team) + ")...")
+    total = len(links)
+    start_time = time.time()
+
+    def bar(done, total, width=10):
+        filled = "█" * min(done, width)
+        empty = "░" * (width - min(done, width))
+        return f"[{filled}{empty}] {done}/{total}"
+
+    msg = await q.edit_message_text("⚡ **Rakhi Offer Progress**\n\n" + bar(0, total) + "\n\nStarting...", parse_mode="Markdown")
+
     results = []
     for i, link in enumerate(links, 1):
         m = re.search(r"rakhi_wars-([A-Za-z0-9_-]+)", link)
         code = m.group(1) if m else link
         ok, err = run_one(s["headers"], code, team)
         results.append((code, ok, err))
-        lines = "\n".join(f"{'✅' if ok else '❌'}  {c}" for c, ok, *_ in results)
+
+        # build progress display
+        lines = []
+        elapsed = int(time.time() - start_time)
+        for idx, (c, o, e) in enumerate(results, 1):
+            if idx == i:
+                lines.append(f"⏳ `{c}`  Working...")
+            else:
+                lines.append(f"{'✅' if o else '❌'} `{c}`")
+        progress = bar(i, total)
+        remaining = total - i
+        eta = int(elapsed / i * remaining) if i > 0 else 0
+        status = "✅ Done!" if i == total else f"⏳ Working... (ETA: {eta}s)"
         try:
-            await msg.edit_text("⚡ Running " + str(len(links)) + " offers...\n\n" + lines +
-                                ("\n\n⏳ Working..." if i < len(links) else "\n\n✅ Done!"))
+            await msg.edit_text(
+                "⚡ **Rakhi Offer Progress**\n\n"
+                f"`{progress}`\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                + "\n".join(lines) + "\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"⏱ Elapsed: `{elapsed}s`  |  {status}",
+                parse_mode="Markdown")
         except Exception:
             pass
+
+    # final summary
     done = sum(1 for _, ok, _ in results if ok)
-    detail = "\n".join(f"{'✅' if ok else '❌'} `{c}`" + (f"\n   {e}" if not ok else "") for c, ok, e in results)
-    await ctx.bot.send_message(uid, "🏁 **Finished:** " + str(done) + "/" + str(len(links)) + " completed.\n\n" + detail, parse_mode="Markdown")
+    failed = total - done
+    elapsed = int(time.time() - start_time)
+    summary = []
+    for c, ok, e in results:
+        summary.append(f"{'✅' if ok else '❌'} `{c}`" + (f"\n   ⚠️ `{e}`" if not ok else ""))
+    final_msg = (
+        "🏁 **Rakhi Offer — Complete**\n\n"
+        f"✅ Completed: `{done}/{total}`\n"
+        f"❌ Failed: `{failed}`\n"
+        f"⏱ Time: `{elapsed}s`\n\n"
+        "━━━━━━━━━━━━━━━━━━\n" +
+        "\n".join(summary) + "\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "📖 **How to use the reward cash:**\n"
+        "• Open Swiggy app → place any order ₹250+\n"
+        "• Cash auto-applies at checkout\n"
+        "• Does NOT apply on already discounted items\n"
+        "• New to Swiggy? Delete account → clone/master login → repeat"
+    )
+    await ctx.bot.send_message(uid, final_msg, parse_mode="Markdown")
 
 
 # ── callback router ──────────────────────────────────────────────────────────
@@ -771,11 +820,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # answer immediately so no loading spinner lingers
     await q.answer()
-
-    # handle copy
-    if data.startswith("copy_"):
-        await q.answer(text=data[5:], show_alert=True)
-        return
 
     # handle team / run (no membership check needed — already in offer flow)
     if data.startswith("team:"):
@@ -799,13 +843,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # dispatch to handler
     handlers = {
-        "balance": balance, "invite": invite, "leaderboard": leaderboard,
-        "back_menu": back_menu, "admin_panel": admin_panel,
+        "balance": balance, "back_menu": back_menu, "admin_panel": admin_panel,
         "admin_stats": admin_stats, "admin_users": admin_users,
         "admin_add_links": admin_add_links, "admin_view_links": admin_view_links,
         "admin_clear_links": admin_clear_links,
         "rakhi_offer": rakhi_offer, "login_otp": login_otp, "login_json": login_json,
-        "join_verified": join_verified,
+        "join_verified": join_verified, "offer_guide": offer_guide,
     }
     fn = handlers.get(data)
     if fn:
