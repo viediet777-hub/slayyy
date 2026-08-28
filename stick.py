@@ -1,13 +1,18 @@
+import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import random
-import re
 import sqlite3
 import string
+import threading
 import time
 from hashlib import md5
+from typing import Optional
+from urllib.parse import urlencode
 
 import requests
 
@@ -23,11 +28,25 @@ REQUIRED_CHANNELS = [
     {"username": "viedietbackup", "url": "https://t.me/viedietbackup", "title": "Backup Group"},
 ]
 
-# ── DB ───────────────────────────────────────────────────────────────────────
+CREMICA_BASE_URL = "https://cremicabacktoschool.woohoo.in"
+MASTER_KEY = "1007327481"
+UTM_SOURCE = "telegram_bot"
+DEFAULT_BATCH_CODE = "CD09G26"
+FREE_USES = 10
+REFERRAL_BONUS = 10
+REDEMPTION_URL = "https://cremicabacktoschool.woohoo.in/redemption"
+
+VALID_STATES = [
+    "Punjab", "Uttar Pradesh", "Haryana", "Rajasthan", "Karnataka",
+    "Himachal Pradesh", "Jammu and Kashmir", "Delhi", "Uttarakhand",
+    "Bihar", "Maharashtra", "Madhya Pradesh", "Assam", "Kerala",
+    "West Bengal", "Gujarat", "Telangana", "Ladakh", "Chandigarh",
+    "Goa", "Mizoram", "Nagaland", "Andhra Pradesh", "Jharkhand",
+    "Meghalaya", "Tripura", "Chhattisgarh", "Odisha", "Manipur",
+    "Pondicherry", "Others",
+]
 
 # ── DB (thread-safe single connection) ──────────────────────────────────────
-
-import threading
 
 _db_lock = threading.Lock()
 _db_conn = None
@@ -44,20 +63,41 @@ def _init_db():
         for ddl in (
             """CREATE TABLE IF NOT EXISTS users (
                 chat_id INTEGER PRIMARY KEY, user_id TEXT, username TEXT, first_name TEXT,
-                points INTEGER DEFAULT 0, referral_code TEXT UNIQUE, referred_by INTEGER,
+                uses_remaining INTEGER DEFAULT ?, total_uses INTEGER DEFAULT 0,
+                referred_by INTEGER, referral_code TEXT UNIQUE,
                 created_at TEXT DEFAULT (datetime('now')), is_banned INTEGER DEFAULT 0)""",
-            """CREATE TABLE IF NOT EXISTS referrals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, referee_id INTEGER,
+            """CREATE TABLE IF NOT EXISTS submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                user_key TEXT, batch_code TEXT, status TEXT DEFAULT 'completed',
+                reward TEXT DEFAULT 'Rs.20',
                 created_at TEXT DEFAULT (datetime('now')))""",
+            """CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER,
+                referee_id INTEGER, created_at TEXT DEFAULT (datetime('now')))""",
             """CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, amount INTEGER,
                 type TEXT, description TEXT, created_at TEXT DEFAULT (datetime('now')))""",
-            """CREATE TABLE IF NOT EXISTS offer_links (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, link TEXT UNIQUE,
-                created_at TEXT DEFAULT (datetime('now')))""",
         ):
-            _db_conn.execute(ddl)
+            _db_conn.execute(ddl, (FREE_USES,))
         _db_conn.commit()
+        _migrate_db()
+
+
+def _migrate_db():
+    """Handle schema migration from old bot.db (had 'points' column) to new schema (uses_remaining)."""
+    try:
+        cols = [r[1] for r in _db_conn.execute("PRAGMA table_info(users)").fetchall()]
+        if "uses_remaining" not in cols:
+            _db_conn.execute("ALTER TABLE users ADD COLUMN uses_remaining INTEGER DEFAULT " + str(FREE_USES))
+        if "total_uses" not in cols:
+            _db_conn.execute("ALTER TABLE users ADD COLUMN total_uses INTEGER DEFAULT 0")
+        if "referred_by" not in cols and "referrer_id" not in cols:
+            _db_conn.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+        if "points" in cols:
+            _db_conn.execute("UPDATE users SET uses_remaining = points WHERE uses_remaining = 0 AND points > 0")
+        _db_conn.commit()
+    except Exception as e:
+        log.warning("migration note: %s", e)
 
 
 def _one(sql, args=()):
@@ -80,16 +120,11 @@ def _run(sql, args=()):
 
 
 def _multi(statements):
-    """Run several statements atomically under one lock."""
     with _db_lock:
         _init_db()
         for sql, args in statements:
             _db_conn.execute(sql, args)
         _db_conn.commit()
-
-
-def user_exists(chat_id):
-    return _one("SELECT 1 FROM users WHERE chat_id=?", (chat_id,)) is not None
 
 
 def get_user(chat_id):
@@ -101,33 +136,37 @@ def ensure_user(chat_id, user_id, username, first_name):
     if u:
         return u
     code = md5(f"{chat_id}_{time.time()}".encode()).hexdigest()[:8]
-    _run("""INSERT OR IGNORE INTO users (chat_id, user_id, username, first_name, referral_code)
-        VALUES (?,?,?,?,?)""", (chat_id, str(user_id) or "", username or "", first_name or "", code))
+    _run("INSERT OR IGNORE INTO users (chat_id, user_id, username, first_name, referral_code) VALUES (?,?,?,?,?)",
+         (chat_id, str(user_id) or "", username or "", first_name or "", code))
     return get_user(chat_id)
 
 
 def create_user(chat_id, user_id, username, first_name, referred_by=None):
     code = md5(f"{chat_id}_{time.time()}".encode()).hexdigest()[:8]
-    _run("""INSERT OR IGNORE INTO users (chat_id, user_id, username, first_name, referral_code, referred_by)
-        VALUES (?,?,?,?,?,?)""", (chat_id, str(user_id) or "", username or "", first_name or "", code, referred_by))
+    _run("INSERT OR IGNORE INTO users (chat_id, user_id, username, first_name, referral_code, referred_by) VALUES (?,?,?,?,?,?)",
+         (chat_id, str(user_id) or "", username or "", first_name or "", code, referred_by))
     return code
 
 
-def add_points(chat_id, amount, typ, desc):
-    _multi([
-        ("UPDATE users SET points = points + ? WHERE chat_id=?", (amount, chat_id)),
-        ("INSERT INTO transactions (chat_id, amount, type, description) VALUES (?,?,?,?)",
-         (chat_id, amount, typ, desc)),
-    ])
+def deduct_use(chat_id):
+    u = get_user(chat_id)
+    if u and u["uses_remaining"] > 0:
+        _run("UPDATE users SET uses_remaining = uses_remaining - 1, total_uses = total_uses + 1 WHERE chat_id=?", (chat_id,))
+        return True
+    return False
 
 
-def get_points(chat_id):
-    r = _one("SELECT points FROM users WHERE chat_id=?", (chat_id,))
-    return r["points"] if r else 0
+def add_uses(chat_id, amount):
+    _run("UPDATE users SET uses_remaining = uses_remaining + ? WHERE chat_id=?", (amount, chat_id))
 
 
-def get_leaderboard(limit=10):
-    return _all("SELECT chat_id, username, first_name, points FROM users ORDER BY points DESC LIMIT ?", (limit,))
+def record_submission(user_id, user_key, batch_code):
+    _run("INSERT INTO submissions (user_id, user_key, batch_code) VALUES (?,?,?)", (user_id, user_key, batch_code))
+
+
+def count_submissions(chat_id):
+    r = _one("SELECT COUNT(*) c FROM submissions WHERE user_id=?", (chat_id,))
+    return r["c"] if r else 0
 
 
 def count_referrals(chat_id):
@@ -139,18 +178,14 @@ def record_referral(referrer_id, referee_id):
     _run("INSERT INTO referrals (referrer_id, referee_id) VALUES (?,?)", (referrer_id, referee_id))
 
 
-def all_users():
-    return _all("SELECT * FROM users ORDER BY created_at DESC")
-
-
 def total_users():
     r = _one("SELECT COUNT(*) c FROM users")
     return r["c"] if r else 0
 
 
-def total_points():
-    r = _one("SELECT COALESCE(SUM(points),0) s FROM users")
-    return r["s"] if r else 0
+def total_submissions():
+    r = _one("SELECT COUNT(*) c FROM submissions")
+    return r["c"] if r else 0
 
 
 def total_referrals():
@@ -158,209 +193,94 @@ def total_referrals():
     return r["c"] if r else 0
 
 
-# ── offer links (admin-managed, stored in DB) ───────────────────────────────
-
-def get_offer_links(limit=10):
-    """Return stored links (up to limit); falls back to default OFFER_LINKS."""
-    rows = _all("SELECT link FROM offer_links ORDER BY id LIMIT ?", (limit,))
-    links = [r["link"] for r in rows]
-    return links if links else OFFER_LINKS
+def all_users():
+    return _all("SELECT * FROM users ORDER BY created_at DESC")
 
 
-def add_offer_links(text):
-    """Parse bulk links (one per line / comma / space), dedupe, insert.
-    Returns (added_count, skipped_duplicates, stored_total)."""
-    raw = re.split(r"[\s,]+", text.strip())
-    links = []
-    seen = set()
-    skipped = 0
-    for l in raw:
-        l = l.strip().strip('"').strip("'")
-        if not l or not l.lower().startswith("http"):
-            continue
-        if l in seen:
-            skipped += 1
-            continue
-        seen.add(l)
-        links.append(l)
-    added = 0
-    with _db_lock:
-        _init_db()
-        for l in links:
-            cur = _db_conn.execute("INSERT OR IGNORE INTO offer_links (link) VALUES (?)", (l,))
-            if cur.rowcount:
-                added += 1
-            else:
-                skipped += 1
-        _db_conn.commit()
-    stored = _one("SELECT COUNT(*) c FROM offer_links")["c"]
-    return added, skipped, stored
+def user_exists(chat_id):
+    return _one("SELECT 1 FROM users WHERE chat_id=?", (chat_id,)) is not None
 
 
-def clear_offer_links():
-    _run("DELETE FROM offer_links")
+# ── Creamica API ───────────────────────────────────────────────────────────
 
 
-# ── SWIGGY API ───────────────────────────────────────────────────────────────
+class CreamicaAPI:
+    def __init__(self):
+        self.base = CREMICA_BASE_URL
+        self.http = requests.Session()
+        self.http.headers.update({
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+        })
 
-CAMPAIGN_HOST = "https://disc.swiggy.com"
-CAMPAIGN_ID = "rakhi_wars"
-CAMPAIGN_DETAILS = "/api/v1/campaign/details"
-CAMPAIGN_SUBMIT = "/api/v1/campaign/submit"
-CAMPAIGN_POLL = "/api/v1/campaign/poll"
-
-SMS_OTP_URL = "https://profile.swiggy.com/api/v3/app/sms_otp"
-VERIFY_URL = "https://profile.swiggy.com/api/v3/app/login/verify"
-DEVICE_ID = "9b69ea5de1ef3f99"
-
-
-def random_device_id():
-    """Fresh random device id per login attempt so Swiggy doesn't rate-limit."""
-    return "".join(random.choices(string.hexdigits[:16], k=16)).lower()
-
-OFFER_LINKS = [
-    "https://r.swiggy.com/rakhi_wars/rakhi_wars-1adhdtaCdQ",
-    "https://r.swiggy.com/rakhi_wars/rakhi_wars-MZxgRHuBN",
-    "https://r.swiggy.com/rakhi_wars/rakhi_wars-2Out6vNL00",
-    "https://r.swiggy.com/rakhi_wars/rakhi_wars-3RvWb1Aj0IL",
-    "https://r.swiggy.com/rakhi_wars/rakhi_wars-8OkuWB2dr",
-    "https://r.swiggy.com/rakhi_wars/rakhi_wars-8OkuF7L1h",
-    "https://r.swiggy.com/rakhi_wars/rakhi_wars-1jfCJc8KB6",
-    "https://r.swiggy.com/rakhi_wars/rakhi_wars-1jfCJxsjBk",
-    "https://r.swiggy.com/rakhi_wars/rakhi_wars-9ggQmy8CP",
-    "https://r.swiggy.com/rakhi_wars/rakhi_wars-2SmfgnlXXd",
-]
-
-def _login_headers(device_id):
-    return {
-        "Accept": "application/json; charset=utf-8", "app-version": "4.106.1", "category": "food",
-        "deviceId": device_id, "swuid": device_id, "os-version": "9", "pl-version": "131",
-        "User-Agent": "Swiggy-Android", "version-code": "1716", "x-channel": "swiggy",
-    }
-
-BASE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 4 Build/RD2A.211001.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/83.0.4103.120 Mobile Safari/537.36",
-    "platform": "Swiggy-Android", "version-code": "1795", "model-name": "PIXEL 4",
-    "manufacturer": "GOOGLE", "application_name": "swiggy-app", "appversion": "4.113.0",
-    "cityid": "18", "lat": "22.74215", "lng": "75.9078633",
-    "x-requested-with": "in.swiggy.android", "x-theme": "base",
-    "accept-language": "en-IN,en-US;q=0.9,en;q=0.8",
-}
-
-
-class SwiggyError(Exception):
-    pass
-
-
-def _checked(r):
-    try:
-        d = r.json()
-    except Exception:
-        d = None
-    if d is None:
-        raise SwiggyError(f"non-JSON HTTP {r.status_code}")
-    st = d.get("statusCode")
-    if st == 999:
-        raise SwiggyError(f"session expired: {d.get('statusMessage')}")
-    if isinstance(st, int) and st != 0:
-        raise SwiggyError(f"api error {st}: {d.get('statusMessage')}")
-    return d
-
-
-def send_otp(mobile10, device_id=None):
-    device_id = device_id or random_device_id()
-    return _checked(requests.get(f"{SMS_OTP_URL}?mobile={mobile10}",
-                                 headers=_login_headers(device_id), timeout=30))
-
-
-def verify_otp(mobile10, otp, tid, sid, device_id=None):
-    device_id = device_id or random_device_id()
-    h = {**_login_headers(device_id), "sid": sid, "Tid": tid,
-         "Content-Type": "application/json; charset=utf-8"}
-    p = {"cloningSignalsData": {"appFilesDirPathInvalid": 0, "developerModeEnabled": 1,
-                                "deviceModelVmos": 0, "emulatorStatus": 0,
-                                "packageName": "in.swiggy.android", "workProfileEnabled": 0},
-         "otp": otp}
-    return _checked(requests.post(f"{VERIFY_URL}?otp_source=Sms-automatic", headers=h, json=p, timeout=30))
-
-
-def _jwt_payload(token):
-    try:
-        part = token.split(".")[1] + "=" * (-len(token.split(".")[1]) % 4)
-        return json.loads(base64.urlsafe_b64decode(part))
-    except Exception:
-        return {}
-
-
-def build_session(v):
-    tid = v.get("tid", "")
-    sid = v.get("sid", "")
-    userid = _jwt_payload(tid).get("user_id") or ""
-    token = ""
-    for k in ("token", "accessToken", "refreshToken"):
-        if (v.get("data") or {}).get(k):
-            token = (v.get("data") or {})[k]
-            break
-    return {"userid": userid, "tid": tid, "sid": sid, "token": token}
-
-
-def build_session_from_json(obj):
-    tid = obj.get("tid") or ""
-    sid = obj.get("sid") or ""
-    if "data" in obj and tid:
-        return build_session(obj)
-    userid = str(obj.get("userid") or obj.get("userId") or obj.get("user_id") or "")
-    token = obj.get("token") or ""
-    if not userid and tid:
-        userid = str(_jwt_payload(tid).get("user_id") or "")
-    return {"userid": userid, "tid": tid, "sid": sid, "token": token}
-
-
-def _sh(session, referral="", **extra):
-    h = dict(BASE_HEADERS)
-    h.update(session)
-    h["campaignId"] = CAMPAIGN_ID
-    if referral:
-        h["referral-code"] = referral
-    h.update(extra)
-    return h
-
-
-def campaign_details(session, r):
-    return _checked(requests.get(CAMPAIGN_HOST + CAMPAIGN_DETAILS, headers=_sh(session, r), timeout=30))
-
-
-def campaign_submit(session, a, t, r=""):
-    return _checked(requests.post(CAMPAIGN_HOST + CAMPAIGN_SUBMIT,
-                                  headers=_sh(session, r, **{"Content-Type": "application/json"}),
-                                  json={"action": a, "teamSelected": t, "campaignId": CAMPAIGN_ID}, timeout=30))
-
-
-def campaign_poll(session, r=""):
-    return _checked(requests.get(CAMPAIGN_HOST + CAMPAIGN_POLL, headers=_sh(session, r), timeout=30))
-
-
-def run_one(session, ref, team=1):
-    # details/poll are informational — ignore their errors so the offer still
-    # completes even if Swiggy returns "session expired" on those calls.
-    try:
-        campaign_details(session, ref)
-    except SwiggyError:
-        pass
-    try:
-        campaign_submit(session, "JOIN_MATCH", team, ref)
-        for _ in range(5):
-            atk = campaign_submit(session, "ATTACK", team, ref)
-            if (atk.get("data") or {}).get("userState", {}).get("attacksLeft", 0) <= 0:
-                break
-            time.sleep(1)
+    def create_user(self) -> Optional[dict]:
         try:
-            campaign_poll(session, ref)
-        except SwiggyError:
-            pass
-        return (True, "")
-    except SwiggyError as e:
-        return (False, str(e))
+            resp = self.http.post(f"{self.base}/api/users",
+                                  json={"masterKey": MASTER_KEY, "utm_source": UTM_SOURCE}, timeout=15)
+            if resp.ok:
+                data = resp.json()
+                if "resp" in data and isinstance(data["resp"], str):
+                    return json.loads(base64.b64decode(data["resp"]).decode())
+                return data
+            log.warning("create_user failed: %s %s", resp.status_code, resp.text)
+            return None
+        except Exception as e:
+            log.error("create_user error: %s", e)
+            return None
+
+    def _sign_payload(self, payload: dict, user_key: str, data_key: str) -> dict:
+        payload["userKey"] = user_key
+        payload["t"] = int(time.time() * 1000)
+        json_str = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        s = base64.b64encode(json_str.encode()).decode()
+        u = base64.b64encode(str(payload["t"]).encode()).decode()
+        hmac_key = data_key[4:18]
+        hmac_input = f"{u}.{s}"
+        hmac_hex = hmac.new(hmac_key.encode(), hmac_input.encode(), hashlib.sha256).hexdigest()
+        f = base64.b64encode(hmac_hex.encode()).decode()
+        h_val = random.randint(1, 6)
+        p_val = random.randint(2, 8)
+        random_chars = string.ascii_letters + string.digits
+        padding = "".join(random.choice(random_chars) for _ in range(p_val))
+        data = f"{u}.{s}.{p_val}{h_val}{f[:h_val]}{padding}{f[h_val:]}"
+        return {"userKey": user_key, "data": data}
+
+    def _signed_request(self, endpoint: str, payload: dict, user_key: str, data_key: str,
+                        access_token: str = None) -> Optional[dict]:
+        try:
+            signed = self._sign_payload(payload, user_key, data_key)
+            headers = {"Accept": "*/*", "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"}
+            if access_token:
+                headers["Authorization"] = f"Bearer {access_token}"
+            resp = self.http.post(f"{self.base}/api/{endpoint}{user_key}",
+                                  data=urlencode(signed), headers=headers, timeout=15)
+            if resp.ok:
+                data = resp.json()
+                if "resp" in data and isinstance(data["resp"], str):
+                    return json.loads(base64.b64decode(data["resp"]).decode())
+                return data
+            log.warning("signed_request %s failed: %s %s", endpoint, resp.status_code, resp.text)
+            return None
+        except Exception as e:
+            log.error("signed_request %s error: %s", endpoint, e)
+            return None
+
+    def register(self, name: str, mobile: str, user_key: str, data_key: str):
+        return self._signed_request("users/register/", {"name": name, "mobile": mobile}, user_key, data_key)
+
+    def verify_otp(self, otp: str, user_key: str, data_key: str) -> Optional[dict]:
+        return self._signed_request("users/verifyOTP/", {"otp": otp}, user_key, data_key)
+
+    def resend_otp(self, user_key: str, data_key: str):
+        return self._signed_request("users/resendOtp/", {}, user_key, data_key)
+
+    def get_batch_code(self, batch_code: str, state: str, user_key: str, data_key: str, access_token: str):
+        return self._signed_request("users/getBatchCode/",
+                                    {"batchCode": batch_code, "state": state}, user_key, data_key, access_token)
+
+    def start_game(self, user_key: str, data_key: str, access_token: str = None):
+        return self._signed_request("users/startGame/", {}, user_key, data_key, access_token)
 
 
 # ── TELEGRAM BOT ─────────────────────────────────────────────────────────────
@@ -369,10 +289,11 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, filters, ContextTypes)
 
-LOGIN_SESSIONS = {}
+REGISTRATION_SESSIONS = {}
 ADMIN_STATE = {}
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
 
 def btn(text, cb, style="primary"):
     return InlineKeyboardButton(text, callback_data=cb, style=style)
@@ -384,9 +305,10 @@ def is_admin(uid):
 
 def main_menu(uid=None):
     rows = [
-        [btn("👤 My Dashboard", "balance", "primary")],
-        [btn("📖 Offer Guide", "offer_guide", "success")],
-        [btn("⚡ Rakhi Offer", "rakhi_offer", "danger")],
+        [btn("👤 Dashboard", "dashboard", "primary")],
+        [btn("🎮 Start Registration", "start_reg", "success")],
+        [btn("📊 My Stats", "my_stats", "primary")],
+        [btn("🔗 Referral Link", "my_referral", "primary")],
     ]
     if uid and is_admin(uid):
         rows.append([btn("🔧 Admin Panel", "admin_panel", "danger")])
@@ -422,17 +344,17 @@ async def check_membership(bot, user_id):
 
 
 def force_join_kb():
-    rows = [[InlineKeyboardButton("🔗 Join " + ch["title"], url=ch["url"])]
+    rows = [[InlineKeyboardButton("Join " + ch["title"], url=ch["url"])]
             for ch in REQUIRED_CHANNELS]
-    rows.append([btn("✅ I've Joined", "join_verified", "success")])
+    rows.append([btn("I've Joined", "join_verified", "success")])
     return InlineKeyboardMarkup(rows)
 
 
 def force_join_text():
-    lines = ["🔒 **Join to continue using the bot**"]
+    lines = ["**Join to continue using the bot**"]
     for ch in REQUIRED_CHANNELS:
-        lines.append("• " + ch["title"] + ": " + ch["url"])
-    lines.append("\nJoin both, then tap '✅ I've Joined'.")
+        lines.append("- " + ch["title"] + ": " + ch["url"])
+    lines.append("\nJoin both, then tap 'I've Joined'.")
     return "\n".join(lines)
 
 
@@ -459,18 +381,18 @@ async def join_verified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not user_exists(uid):
             u = q.from_user
             create_user(uid, u.id, u.username, u.first_name)
-        await q.edit_message_text("✅ Welcome admin!", reply_markup=main_menu(uid))
+        await q.edit_message_text("Welcome admin!", reply_markup=main_menu(uid))
         return
     ok, missing = await check_membership(ctx.bot, uid)
     if not ok:
-        await q.answer("❌ You haven't joined " + missing["title"] + " yet!", show_alert=True)
+        await q.answer("You haven't joined " + missing["title"] + " yet!", show_alert=True)
         return
     if not user_exists(uid):
         u = q.from_user
         create_user(uid, u.id, u.username, u.first_name)
-        await q.edit_message_text("✅ Verified! Welcome to the free bot.\nTap ⚡ Rakhi Offer to claim.", reply_markup=main_menu(uid))
+        await q.edit_message_text("Verified! Welcome to the bot.\nTap Start Registration to begin.", reply_markup=main_menu(uid))
     else:
-        await q.edit_message_text("✅ Verified! Welcome back.", reply_markup=main_menu(uid))
+        await q.edit_message_text("Verified! Welcome back.", reply_markup=main_menu(uid))
 
 
 # ── handlers ─────────────────────────────────────────────────────────────────
@@ -480,335 +402,140 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await ensure_joined(update, ctx):
         return
+    args = ctx.args or []
+    if args and args[0].startswith("ref_"):
+        try:
+            referrer_id = int(args[0].split("_")[1])
+            if referrer_id != uid and not get_user(uid):
+                referrer = get_user(referrer_id)
+                if referrer:
+                    create_user(uid, user.id, user.username, user.first_name, referred_by=referrer_id)
+                    record_referral(referrer_id, uid)
+                    add_uses(referrer_id, REFERRAL_BONUS)
+                    try:
+                        await ctx.bot.send_message(referrer_id,
+                            f"New referral! {user.first_name or 'Someone'} joined via your link. +{REFERRAL_BONUS} uses added!")
+                    except Exception:
+                        pass
+        except (ValueError, IndexError):
+            pass
     if not user_exists(uid):
         create_user(uid, user.id, user.username, user.first_name)
-        await update.message.reply_text("🎉 Welcome " + (user.first_name or "") + "!\n\nThis bot is **100% FREE** — no credits, no refer system.\n\nTap ⚡ Rakhi Offer to claim the offer!", parse_mode="Markdown", reply_markup=main_menu(uid))
+        await update.message.reply_text(
+            "Welcome " + (user.first_name or "") + "!\n\n"
+            "Cremica Back to School Game Bot\n"
+            "Complete registration and get Rs.20 reward!\n\n"
+            "You have " + str(FREE_USES) + " free uses. Refer friends for more!",
+            reply_markup=main_menu(uid))
     else:
-        await update.message.reply_text("👋 Welcome back " + (user.first_name or "") + "!", reply_markup=main_menu(uid))
+        await update.message.reply_text("Welcome back " + (user.first_name or "") + "!", reply_markup=main_menu(uid))
 
 
-async def balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
     ensure_user(uid, uid, q.from_user.username, q.from_user.first_name)
     u = get_user(uid)
-    txt = ("👤 **Your Dashboard**\n\n"
-           "👤 User: `" + (u["first_name"] or u["username"] or str(uid)) + "`\n"
-           "📅 Joined: `" + u["created_at"] + "`\n\n"
-           "⚡ **Rakhi Sibling Wars**\n"
-           "• Status: LIVE\n"
-           "• Complete all 10 links to earn reward cash\n"
-           "• Cash applies on orders **₹250+**\n"
-           "• Cash does **NOT** apply on already-discounted items\n\n"
-           "📖 Read the Offer Guide to understand how to claim!")
+    subs = count_submissions(uid)
+    refs = count_referrals(uid)
+    txt = (
+        "**Your Dashboard**\n\n"
+        "Name: " + (u["first_name"] or u["username"] or str(uid)) + "\n"
+        "Uses Remaining: " + str(u["uses_remaining"]) + "\n"
+        "Total Submissions: " + str(subs) + "\n"
+        "Referrals: " + str(refs) + "\n"
+        "Joined: " + u["created_at"] + "\n\n"
+        "Each registration earns Rs.20 reward!\n"
+        "Refer friends to get " + str(REFERRAL_BONUS) + " more uses."
+    )
     kb = InlineKeyboardMarkup([
-        [btn("📖 Offer Guide", "offer_guide", "success")],
-        [btn("⚡ Claim Offer Now", "rakhi_offer", "danger")],
-        [btn("🔙 Menu", "back_menu", "danger")],
+        [btn("Start Registration", "start_reg", "success")],
+        [btn("Referral Link", "my_referral", "primary")],
+        [btn("Menu", "back_menu", "danger")],
     ])
     await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
 
 
-OFFER_GUIDE = """📖 **RAKHI SIBLING WARS — OFFER GUIDE**
-
-**What is this offer?**
-Swiggy's Rakhi Sibling Wars campaign gives reward cash on your Swiggy account through 10 referral links. This bot opens & completes all 10 links for you automatically. **100% FREE** — no credits, no charges.
-
-**How to claim (steps):**
-1️⃣ Tap **⚡ Rakhi Offer**
-2️⃣ Login: send your 10-digit number → enter OTP (or paste your session JSON)
-3️⃣ Pick a team (**SIS** or **BRO**)
-4️⃣ Tap **"Run all 10 offers"** — done!
-
-**How the offer applies:**
-✅ Reward cash is credited to your Swiggy account
-✅ Applies automatically on your next order
-⚠️ Cash does **NOT** apply on products that already have a discount/offer
-⚠️ Keep minimum order value **₹250+** so the cash applies properly
-
-**Pro tips:**
-🆕 **New accounts get the best benefits**
-❌ Already claimed before? **Delete your Swiggy account** → login again via a **clone/master app** → repeat the same steps
-🔁 If an offer doesn't apply, use a **different mobile number** and follow the same steps
-⏳ Reward cash has an expiry — use it before it's gone
-
-Need help? Tap **⚡ Claim Offer Now** below."""
-
-
-async def offer_guide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def my_stats_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    kb = InlineKeyboardMarkup([
-        [btn("⚡ Claim Offer Now", "rakhi_offer", "danger")],
-        [btn("🔙 Menu", "back_menu", "danger")],
-    ])
-    await q.edit_message_text(OFFER_GUIDE, parse_mode="Markdown", reply_markup=kb)
+    user = get_user(uid)
+    if not user:
+        await q.edit_message_text("User not found.")
+        return
+    subs = count_submissions(uid)
+    refs = count_referrals(uid)
+    text = (
+        "**Your Stats**\n\n"
+        "Name: " + (user["first_name"] or "Not set") + "\n"
+        "Uses Remaining: " + str(user["uses_remaining"]) + "\n"
+        "Total Submissions: " + str(subs) + "\n"
+        "Referrals: " + str(refs) + "\n"
+        "Joined: " + user["created_at"]
+    )
+    await q.edit_message_text(text, parse_mode="Markdown",
+                              reply_markup=InlineKeyboardMarkup([[btn("Menu", "back_menu", "danger")]]))
+
+
+async def my_referral_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    refs = count_referrals(uid)
+    bot_username = (await ctx.bot.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start=ref_{uid}"
+    await q.edit_message_text(
+        f"**Your Referral Link**\n\n`{ref_link}`\n\n"
+        f"Share with friends!\n"
+        f"Each referral gives +{REFERRAL_BONUS} uses.\n"
+        f"Total referrals: {refs}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[btn("Menu", "back_menu", "danger")]]))
 
 
 async def back_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    await q.edit_message_text("📌 **Main Menu**", parse_mode="Markdown", reply_markup=main_menu(uid))
+    await q.edit_message_text("**Main Menu**", parse_mode="Markdown", reply_markup=main_menu(uid))
 
 
-async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ── Registration Flow ───────────────────────────────────────────────────────
+
+
+async def start_reg_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    if not is_admin(uid):
-        await q.edit_message_text("⛔ Access denied. Only admins.", reply_markup=main_menu(uid))
+    if not await ensure_joined(update, ctx):
         return
-    txt = ("🔧 **Admin Panel**\n\n"
-           "👥 Total users: `" + str(total_users()) + "`\n"
-           "💰 Total points: `" + str(total_points()) + "`\n"
-           "🔗 Total referrals: `" + str(total_referrals()) + "`\n\n"
-           "Commands:\n"
-           "`/give [user_id] [points]`\n"
-           "`/stats` - detailed stats\n"
-           "`/users` - list all users")
-    kb = InlineKeyboardMarkup([
-        [btn("📊 Stats", "admin_stats", "primary")],
-        [btn("👥 All Users", "admin_users", "primary")],
-        [btn("➕ Add Links", "admin_add_links", "success"),
-         btn("📋 Links", "admin_view_links", "primary")],
-        [btn("🗑 Clear Links", "admin_clear_links", "danger")],
-        [btn("🔙 Back", "back_menu", "danger")],
-    ])
-    await q.edit_message_text(txt, reply_markup=kb)
-
-
-async def admin_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin(q.from_user.id):
+    user = get_user(uid)
+    if not user:
+        ensure_user(uid, uid, q.from_user.username, q.from_user.first_name)
+        user = get_user(uid)
+    if user["uses_remaining"] < 1:
+        markup = InlineKeyboardMarkup([
+            [btn("Referral Link", "my_referral", "primary")],
+            [btn("Menu", "back_menu", "danger")],
+        ])
+        await q.edit_message_text(
+            f"No uses remaining!\nGet +{REFERRAL_BONUS} uses for each referral!",
+            reply_markup=markup)
         return
-    uid = q.from_user.id
-    txt = ("📊 **Bot Statistics**\n\n"
-           "👥 Total users: `" + str(total_users()) + "`\n"
-           "💰 Total points: `" + str(total_points()) + "`\n"
-           "🔗 Total referrals: `" + str(total_referrals()) + "`\n"
-           "🆔 Admins: `" + str(ADMIN_IDS) + "`")
-    kb = InlineKeyboardMarkup([[btn("🔙 Back to Admin", "admin_panel", "danger")]])
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
-
-
-async def admin_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin(q.from_user.id):
-        return
-    uid = q.from_user.id
-    us = all_users()
-    lines = []
-    for u in us[:20]:
-        lines.append(f"`{u['chat_id']}` | {u['first_name'] or u['username'] or '?'} | `{u['points']}` pts")
-    txt = "👥 **Users (last 20)**\n\n" + "\n".join(lines)
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[btn("🔙 Back to Admin", "admin_panel", "danger")]]))
-
-
-async def admin_add_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin(q.from_user.id):
-        return
-    ADMIN_STATE[q.from_user.id] = "await_links"
+    REGISTRATION_SESSIONS[uid] = {"state": "await_mobile"}
     await q.edit_message_text(
-        "➕ **Add Offer Links**\n\n"
-        "Paste links (one per line, or comma/space separated).\n"
-        "Duplicates are skipped automatically.\n"
-        "Bot will use up to 10 stored links.\n\n"
-        "Type /cancel to abort.",
+        "**Cremica Registration**\n\n"
+        "Step 1/2: Enter your 10-digit mobile number:\n"
+        "(Send /cancel to exit)",
         parse_mode="Markdown")
 
 
-async def admin_view_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin(q.from_user.id):
-        return
-    stored = _all("SELECT link FROM offer_links ORDER BY id")
-    if not stored:
-        txt = "📋 **Offer Links**\n\nUsing default 10 links (none added yet)."
-    else:
-        lines = [f"{i}. `{r['link']}`" for i, r in enumerate(stored, 1)]
-        txt = "📋 **Offer Links** (" + str(len(stored)) + " stored)\n\n" + "\n".join(lines)
-    kb = InlineKeyboardMarkup([[btn("🔙 Back to Admin", "admin_panel", "danger")]])
-    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
-
-
-async def admin_clear_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin(q.from_user.id):
-        return
-    clear_offer_links()
-    await q.edit_message_text("🗑 All stored offer links cleared. Bot will use default 10 links.",
-                              reply_markup=InlineKeyboardMarkup([[btn("🔙 Back to Admin", "admin_panel", "danger")]]))
-
-
-async def handle_give(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not is_admin(uid):
-        await update.message.reply_text("⛔ Only admins can use this command.")
-        return
-    args = ctx.args
-    if len(args) < 2:
-        await update.message.reply_text("Usage: `/give [user_id] [points]`", parse_mode="Markdown")
-        return
-    try:
-        target = int(args[0])
-        pts = int(args[1])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user_id or points.")
-        return
-    if not user_exists(target):
-        await update.message.reply_text("❌ User `" + str(target) + "` not found in database.", parse_mode="Markdown")
-        return
-    add_points(target, pts, "admin_gift", "Admin " + str(uid) + " gave " + str(pts) + " points")
-    await update.message.reply_text("✅ `" + str(pts) + "` points given to user `" + str(target) + "`.", parse_mode="Markdown")
-
-
-async def handle_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    txt = ("📊 **Bot Statistics**\n\n"
-           "👥 Total users: `" + str(total_users()) + "`\n"
-           "💰 Total points: `" + str(total_points()) + "`\n"
-           "🔗 Total referrals: `" + str(total_referrals()) + "`\n"
-           "🆔 Admins: `" + str(ADMIN_IDS) + "`")
-    await update.message.reply_text(txt, parse_mode="Markdown")
-
-
-async def handle_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    us = all_users()
-    lines = []
-    for u in us:
-        lines.append(f"`{u['chat_id']}` | {u['first_name'] or u['username'] or '?'} | `{u['points']}` pts | `{u['referral_code']}`")
-    chunk = "\n".join(lines)
-    for i in range(0, len(chunk), 4000):
-        await update.message.reply_text(chunk[i:i + 4000], parse_mode="Markdown")
-
-
-# ── Rakhi Offer flow ─────────────────────────────────────────────────────────
-
-def login_method_kb():
-    return InlineKeyboardMarkup([
-        [btn("📱 Login with OTP", "login_otp", "primary")],
-        [btn("📄 Login with JSON", "login_json", "success")],
-        [btn("🔙 Back", "back_menu", "danger")],
-    ])
-
-
-async def rakhi_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not await ensure_joined(update, ctx):
-        return
-    uid = q.from_user.id
-    await q.edit_message_text("⚡ **Rakhi Sibling Wars Offer**\n\nChoose login method:", parse_mode="Markdown", reply_markup=login_method_kb())
-
-
-async def login_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    LOGIN_SESSIONS[uid] = {"state": "await_mobile", "mobile": None, "tid": None, "sid": None, "headers": None, "team": 1, "device_id": None}
-    await q.edit_message_text("📱 **OTP Login**\n\nSend your 10-digit mobile number:\n(/cancel to exit)", parse_mode="Markdown")
-
-
-async def login_json(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    LOGIN_SESSIONS[uid] = {"state": "await_json", "headers": None, "team": 1}
-    await q.edit_message_text("📄 **JSON Login**\n\nPaste your session JSON:\n`{\"tid\": \"...\", \"sid\": \"...\", \"userid\": \"...\"}`\nMinimum: tid + sid\n(/cancel to exit)", parse_mode="Markdown")
-
-
-def team_kb():
-    return InlineKeyboardMarkup([
-        [btn("👧 Sister (SIS)", "team:1", "primary"), btn("👦 Brother (BRO)", "team:2", "danger")],
-        [btn("⚡ Run all 10 offers", "run", "success")],
-    ])
-
-
-async def run_offers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    s = LOGIN_SESSIONS.get(uid)
-    if not s or not s.get("headers"):
-        await q.edit_message_text("❌ Not logged in. Start again with ⚡ Rakhi Offer.")
-        return
-    team = s["team"]
-    links = get_offer_links()
-    total = len(links)
-    start_time = time.time()
-
-    def bar(done, total, width=10):
-        filled = "█" * min(done, width)
-        empty = "░" * (width - min(done, width))
-        return f"[{filled}{empty}] {done}/{total}"
-
-    msg = await q.edit_message_text("⚡ **Rakhi Offer Progress**\n\n" + bar(0, total) + "\n\nStarting...", parse_mode="Markdown")
-
-    results = []
-    for i, link in enumerate(links, 1):
-        m = re.search(r"rakhi_wars-([A-Za-z0-9_-]+)", link)
-        code = m.group(1) if m else link
-        ok, err = run_one(s["headers"], code, team)
-        results.append((code, ok, err))
-
-        # build progress display
-        lines = []
-        elapsed = int(time.time() - start_time)
-        for idx, (c, o, e) in enumerate(results, 1):
-            if idx == i:
-                lines.append(f"⏳ `{c}`  Working...")
-            else:
-                lines.append(f"{'✅' if o else '❌'} `{c}`")
-        progress = bar(i, total)
-        remaining = total - i
-        eta = int(elapsed / i * remaining) if i > 0 else 0
-        status = "✅ Done!" if i == total else f"⏳ Working... (ETA: {eta}s)"
-        try:
-            await msg.edit_text(
-                "⚡ **Rakhi Offer Progress**\n\n"
-                f"`{progress}`\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                + "\n".join(lines) + "\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"⏱ Elapsed: `{elapsed}s`  |  {status}",
-                parse_mode="Markdown")
-        except Exception:
-            pass
-
-    # final summary
-    done = sum(1 for _, ok, _ in results if ok)
-    failed = total - done
-    elapsed = int(time.time() - start_time)
-    summary = []
-    for c, ok, e in results:
-        summary.append(f"{'✅' if ok else '❌'} `{c}`" + (f"\n   ⚠️ `{e}`" if not ok else ""))
-    final_msg = (
-        "🏁 **Rakhi Offer — Complete**\n\n"
-        f"✅ Completed: `{done}/{total}`\n"
-        f"❌ Failed: `{failed}`\n"
-        f"⏱ Time: `{elapsed}s`\n\n"
-        "━━━━━━━━━━━━━━━━━━\n" +
-        "\n".join(summary) + "\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "📖 **How to use the reward cash:**\n"
-        "• Open Swiggy app → place any order ₹250+\n"
-        "• Cash auto-applies at checkout\n"
-        "• Does NOT apply on already discounted items\n"
-        "• New to Swiggy? Delete account → clone/master login → repeat"
-    )
-    await ctx.bot.send_message(uid, final_msg, parse_mode="Markdown")
+    REGISTRATION_SESSIONS.pop(uid, None)
+    await update.message.reply_text("Cancelled. /start for main menu.", reply_markup=main_menu(uid))
 
 
 # ── callback router ──────────────────────────────────────────────────────────
@@ -818,37 +545,24 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = q.data
     uid = q.from_user.id
 
-    # answer immediately so no loading spinner lingers
     await q.answer()
 
-    # handle team / run (no membership check needed — already in offer flow)
-    if data.startswith("team:"):
-        s = LOGIN_SESSIONS.get(uid)
-        if s:
-            s["team"] = int(data.split(":")[1])
-        await q.edit_message_text("Team set. Now Run:", reply_markup=team_kb())
-        return
-    if data == "run":
-        await run_offers(update, ctx)
+    if data == "join_verified":
+        await join_verified(update, ctx)
         return
 
-    # membership gate for non-admin, non-join buttons
-    admin_only = data in ("admin_panel", "admin_stats", "admin_users",
-                          "admin_add_links", "admin_view_links", "admin_clear_links")
-    if data != "join_verified" and not admin_only and not is_admin(uid):
+    admin_only = data in ("admin_panel", "admin_stats", "admin_users", "admin_broadcast", "admin_add_uses")
+    if not admin_only and not is_admin(uid):
         ok, _ = await check_membership(ctx.bot, uid)
         if not ok:
             await q.edit_message_text(force_join_text(), reply_markup=force_join_kb())
             return
 
-    # dispatch to handler
     handlers = {
-        "balance": balance, "back_menu": back_menu, "admin_panel": admin_panel,
+        "dashboard": dashboard, "back_menu": back_menu, "admin_panel": admin_panel,
         "admin_stats": admin_stats, "admin_users": admin_users,
-        "admin_add_links": admin_add_links, "admin_view_links": admin_view_links,
-        "admin_clear_links": admin_clear_links,
-        "rakhi_offer": rakhi_offer, "login_otp": login_otp, "login_json": login_json,
-        "join_verified": join_verified, "offer_guide": offer_guide,
+        "start_reg": start_reg_callback, "my_stats": my_stats_callback,
+        "my_referral": my_referral_callback,
     }
     fn = handlers.get(data)
     if fn:
@@ -862,7 +576,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pass
 
 
-# ── text handler ─────────────────────────────────────────────────────────────
+# ── text handler (registration flow) ────────────────────────────────────────
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or not update.message:
@@ -870,98 +584,255 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_chat.id
     text = (update.message.text or "").strip()
 
-    # admin pasting bulk offer links
-    if ADMIN_STATE.get(uid) == "await_links":
+    if ADMIN_STATE.get(uid) == "await_broadcast":
         ADMIN_STATE.pop(uid, None)
         if not is_admin(uid):
             return
         if text.lower() in ("/cancel", "cancel"):
             await update.message.reply_text("Cancelled.", reply_markup=main_menu(uid))
             return
-        added, skipped, stored = add_offer_links(text)
-        await update.message.reply_text(
-            "✅ Done!\n"
-            "➕ Added: " + str(added) + "\n"
-            "⚠️ Duplicates skipped: " + str(skipped) + "\n"
-            "📋 Total stored: " + str(stored) + " (bot uses up to 10)\n\n"
-            "Send /cancel to finish.",
-            reply_markup=main_menu(uid))
+        rows = _all("SELECT chat_id FROM users")
+        sent = 0
+        failed = 0
+        for row in rows:
+            try:
+                await ctx.bot.send_message(row["chat_id"], f"**Broadcast**\n\n{text}", parse_mode="Markdown")
+                sent += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                failed += 1
+        await update.message.reply_text(f"Broadcast sent to {sent} users. Failed: {failed}")
         return
 
-    s = LOGIN_SESSIONS.get(uid)
-    if not s or s.get("state") not in ("await_mobile", "await_otp", "await_json"):
+    s = REGISTRATION_SESSIONS.get(uid)
+    if not s:
         if not await ensure_joined(update, ctx):
             return
-        await update.message.reply_text("📌 Use the main menu buttons below:", reply_markup=main_menu(uid))
+        await update.message.reply_text("Use the main menu buttons below:", reply_markup=main_menu(uid))
         return
 
     if s["state"] == "await_mobile":
-        if not re.fullmatch(r"\d{10}", text):
-            await update.message.reply_text("⚠️ Enter 10-digit number only.")
+        mobile = "".join(c for c in text if c.isdigit())
+        if len(mobile) != 10:
+            await update.message.reply_text("Enter a valid 10-digit mobile number.")
             return
-        try:
-            s["device_id"] = random_device_id()
-            data = send_otp(text, s["device_id"])
-            s["mobile"] = text; s["tid"] = data["tid"]; s["sid"] = data["sid"]
-            s["state"] = "await_otp"
-            await update.message.reply_text("📲 OTP sent to +91" + text + ". Send the OTP.")
-        except (SwiggyError, Exception) as e:
-            log.exception("send_otp")
-            await update.message.reply_text("❌ Error: " + str(e))
+
+        status_msg = await update.message.reply_text("Creating your session ...")
+        api = CreamicaAPI()
+        user_data = api.create_user()
+        if not user_data:
+            await status_msg.edit_text("Failed to create session. Try again later.")
+            REGISTRATION_SESSIONS.pop(uid, None)
+            return
+
+        user_key = user_data.get("userKey")
+        data_key = user_data.get("dataKey")
+        if not user_key or not data_key:
+            await status_msg.edit_text("Invalid server response. Try again.")
+            REGISTRATION_SESSIONS.pop(uid, None)
+            return
+
+        s["user_key"] = user_key
+        s["data_key"] = data_key
+        s["mobile"] = mobile
+
+        await status_msg.edit_text("Registering your details ...")
+        user = get_user(uid)
+        name = user["first_name"] or user["username"] or "User"
+        reg = api.register(name=name, mobile=mobile, user_key=user_key, data_key=data_key)
+        if not reg:
+            await status_msg.edit_text("Registration failed. Try again later.")
+            REGISTRATION_SESSIONS.pop(uid, None)
+            return
+
+        s["state"] = "await_otp"
+        await status_msg.edit_text(
+            "OTP sent to +91" + mobile + "!\n\n"
+            "Step 2/2: Enter the OTP you received:\n"
+            "(Send /cancel to exit)")
 
     elif s["state"] == "await_otp":
-        try:
-            v = verify_otp(s["mobile"], text, s["tid"], s["sid"],
-                           s.get("device_id"))
-            try:
-                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                       "login_debug.json"), "w", encoding="utf-8") as fh:
-                    json.dump(v, fh, indent=2, ensure_ascii=False)
-            except Exception:
-                pass
-            h = build_session(v)
-            if not h.get("userid"):
-                await update.message.reply_text("❌ Login failed: no user in response.")
-                return
-            s["headers"] = h; s["state"] = "logged_in"
-            # test session against campaign API
-            test_link = get_offer_links(1)[0]
-            test_ref = re.search(r"rakhi_wars-([A-Za-z0-9_-]+)", test_link)
-            test_ref = test_ref.group(1) if test_ref else test_link
-            try:
-                campaign_details(h, test_ref)
-                session_ok = "✅ Session valid"
-            except SwiggyError as e:
-                session_ok = "❌ Session invalid: " + str(e)
-            await update.message.reply_text(
-                "✅ Logged in as user `" + h["userid"] + "`.\n"
-                + session_ok + "\n\n"
-                "userid: `" + h["userid"] + "`\n"
-                "tid: `" + h["tid"][:30] + "...`\n"
-                "sid: `" + h["sid"][:20] + "...`\n"
-                "token: `" + ("present" if h["token"] else "MISSING") + "`",
-                parse_mode="Markdown", reply_markup=team_kb())
-        except (SwiggyError, Exception) as e:
-            log.exception("verify")
-            await update.message.reply_text("❌ OTP error: " + str(e))
+        otp = "".join(c for c in text if c.isdigit())
+        if len(otp) != 6:
+            await update.message.reply_text("Enter a valid 6-digit OTP.")
+            return
 
-    elif s["state"] == "await_json":
-        try:
-            obj = json.loads(text)
-            h = build_session_from_json(obj)
-            if not h.get("tid") and not h.get("userid"):
-                raise SwiggyError("JSON missing tid/sid/userid")
-            s["headers"] = h; s["state"] = "logged_in"
-            await update.message.reply_text("✅ JSON session loaded (userid: `" + str(h.get("userid") or "?") + "`).", parse_mode="Markdown", reply_markup=team_kb())
-        except Exception as e:
-            await update.message.reply_text("❌ Invalid JSON: " + str(e) + "\nPaste a valid session JSON.")
+        status_msg = await update.message.reply_text("Verifying OTP ...")
+        api = CreamicaAPI()
+        user_key = s.get("user_key")
+        data_key = s.get("data_key")
+
+        verify = api.verify_otp(otp, user_key, data_key)
+        if not verify or not verify.get("accessToken"):
+            await status_msg.edit_text("Invalid OTP. Try again or send /cancel to abort.")
+            return
+
+        access_token = verify["accessToken"]
+        await status_msg.edit_text("OTP verified! Submitting batch code ...")
+
+        batch_code = DEFAULT_BATCH_CODE
+        state = random.choice(VALID_STATES)
+
+        batch = api.get_batch_code(batch_code, state, user_key, data_key, access_token)
+        if not batch:
+            await status_msg.edit_text("Batch code submission failed. Try again later.")
+            REGISTRATION_SESSIONS.pop(uid, None)
+            return
+
+        await status_msg.edit_text("Starting game ...")
+        api.start_game(user_key, data_key, access_token)
+
+        if not deduct_use(uid):
+            await status_msg.edit_text("No uses remaining.")
+            REGISTRATION_SESSIONS.pop(uid, None)
+            return
+
+        record_submission(uid, user_key, batch_code)
+
+        user = get_user(uid)
+        markup = InlineKeyboardMarkup([
+            [btn("Redeem Now", url=REDEMPTION_URL)],
+            [btn("Menu", "back_menu", "danger")],
+        ])
+        await status_msg.edit_text(
+            "**Registration Complete!**\n\n"
+            "Name: " + (user["first_name"] or "User") + "\n"
+            "Mobile: " + s["mobile"] + "\n"
+            "Batch Code: " + batch_code + "\n"
+            "State: " + state + "\n\n"
+            "Reward: Rs.20 (credited within 24 hours)\n"
+            "Remaining uses: " + str(user["uses_remaining"]) + "\n\n"
+            "Tap **Redeem Now** to claim your reward!",
+            parse_mode="Markdown", reply_markup=markup)
+
+        REGISTRATION_SESSIONS.pop(uid, None)
 
 
-async def handle_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ── Admin Commands ──────────────────────────────────────────────────────────
+
+
+async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    if not is_admin(uid):
+        await q.edit_message_text("Access denied.", reply_markup=main_menu(uid))
+        return
+    txt = (
+        "**Admin Panel**\n\n"
+        "Total users: " + str(total_users()) + "\n"
+        "Total submissions: " + str(total_submissions()) + "\n"
+        "Total referrals: " + str(total_referrals()) + "\n\n"
+        "Commands:\n"
+        "`/give [user_id] [uses]` - Add uses\n"
+        "`/stats` - Detailed stats\n"
+        "`/users` - List all users\n"
+        "`/broadcast [msg]` - Send message to all users"
+    )
+    kb = InlineKeyboardMarkup([
+        [btn("Stats", "admin_stats", "primary"), btn("All Users", "admin_users", "primary")],
+        [btn("Broadcast", "admin_broadcast", "success")],
+        [btn("Menu", "back_menu", "danger")],
+    ])
+    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+
+
+async def admin_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        return
+    txt = (
+        "**Bot Statistics**\n\n"
+        "Total users: " + str(total_users()) + "\n"
+        "Total submissions: " + str(total_submissions()) + "\n"
+        "Total referrals: " + str(total_referrals()) + "\n"
+        "Admins: " + str(ADMIN_IDS)
+    )
+    kb = InlineKeyboardMarkup([[btn("Back to Admin", "admin_panel", "danger")]])
+    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+
+
+async def admin_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        return
+    us = all_users()
+    lines = []
+    for u in us[:20]:
+        lines.append(f"`{u['chat_id']}` | {u['first_name'] or u['username'] or '?'} | uses: `{u['uses_remaining']}`")
+    txt = "**Users (last 20)**\n\n" + "\n".join(lines)
+    await q.edit_message_text(txt, parse_mode="Markdown",
+                              reply_markup=InlineKeyboardMarkup([[btn("Back to Admin", "admin_panel", "danger")]]))
+
+
+async def admin_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    LOGIN_SESSIONS.pop(uid, None)
-    ADMIN_STATE.pop(uid, None)
-    await update.message.reply_text("❌ Cancelled. /start for main menu.", reply_markup=main_menu(uid))
+    if not is_admin(uid):
+        return
+    msg = " ".join(ctx.args)
+    if not msg:
+        await update.message.reply_text("Usage: /broadcast <message>")
+        return
+    rows = _all("SELECT chat_id FROM users")
+    sent = 0
+    failed = 0
+    for row in rows:
+        try:
+            await ctx.bot.send_message(row["chat_id"], f"**Broadcast**\n\n{msg}", parse_mode="Markdown")
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    await update.message.reply_text(f"Broadcast sent to {sent} users. Failed: {failed}")
+
+
+async def handle_give(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("Only admins can use this command.")
+        return
+    args = ctx.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: `/give [user_id] [uses]`", parse_mode="Markdown")
+        return
+    try:
+        target = int(args[0])
+        amount = int(args[1])
+    except ValueError:
+        await update.message.reply_text("Invalid user_id or amount.")
+        return
+    if not user_exists(target):
+        await update.message.reply_text("User `" + str(target) + "` not found.", parse_mode="Markdown")
+        return
+    add_uses(target, amount)
+    await update.message.reply_text(f"Added {amount} uses to user `{target}`.", parse_mode="Markdown")
+
+
+async def handle_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    txt = (
+        "**Bot Statistics**\n\n"
+        "Total users: " + str(total_users()) + "\n"
+        "Total submissions: " + str(total_submissions()) + "\n"
+        "Total referrals: " + str(total_referrals()) + "\n"
+        "Admins: " + str(ADMIN_IDS)
+    )
+    await update.message.reply_text(txt, parse_mode="Markdown")
+
+
+async def handle_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    us = all_users()
+    lines = []
+    for u in us:
+        lines.append(f"`{u['chat_id']}` | {u['first_name'] or u['username'] or '?'} | uses: `{u['uses_remaining']}` | refs: `{count_referrals(u['chat_id'])}`")
+    chunk = "\n".join(lines)
+    for i in range(0, len(chunk), 4000):
+        await update.message.reply_text(chunk[i:i + 4000], parse_mode="Markdown")
 
 
 async def error_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -971,7 +842,6 @@ async def error_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    import asyncio
     asyncio.set_event_loop(asyncio.new_event_loop())
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_error_handler(error_handler)
@@ -981,10 +851,11 @@ def main():
     app.post_init = _post_init
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("cancel", handle_cancel))
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("give", handle_give))
     app.add_handler(CommandHandler("stats", handle_stats))
     app.add_handler(CommandHandler("users", handle_users))
+    app.add_handler(CommandHandler("broadcast", admin_broadcast))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
