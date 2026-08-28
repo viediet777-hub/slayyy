@@ -63,9 +63,9 @@ def _init_db():
         for ddl in (
             """CREATE TABLE IF NOT EXISTS users (
                 chat_id INTEGER PRIMARY KEY, user_id TEXT, username TEXT, first_name TEXT,
-                uses_remaining INTEGER DEFAULT ?, total_uses INTEGER DEFAULT 0,
+                uses_remaining INTEGER DEFAULT %d, total_uses INTEGER DEFAULT 0,
                 referred_by INTEGER, referral_code TEXT UNIQUE,
-                created_at TEXT DEFAULT (datetime('now')), is_banned INTEGER DEFAULT 0)""",
+                created_at TEXT DEFAULT (datetime('now')), is_banned INTEGER DEFAULT 0)""" % FREE_USES,
             """CREATE TABLE IF NOT EXISTS submissions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
                 user_key TEXT, batch_code TEXT, status TEXT DEFAULT 'completed',
@@ -78,7 +78,7 @@ def _init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, amount INTEGER,
                 type TEXT, description TEXT, created_at TEXT DEFAULT (datetime('now')))""",
         ):
-            _db_conn.execute(ddl, (FREE_USES,))
+            _db_conn.execute(ddl)
         _db_conn.commit()
         _migrate_db()
 
