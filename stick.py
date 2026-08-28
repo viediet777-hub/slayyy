@@ -46,6 +46,18 @@ VALID_STATES = [
     "Pondicherry", "Others",
 ]
 
+INDIAN_NAMES = [
+    "Aarav", "Vivaan", "Aditya", "Arjun", "Sai", "Reyansh", "Krishna", "Ishaan",
+    "Shaurya", "Atharv", "Advik", "Pranav", "Advaith", "Aarush", "Vihaan",
+    "Ananya", "Diya", "Myra", "Sara", "Aanya", "Aadhya", "Aarohi", "Anvi",
+    "Prisha", "Riya", "Kabir", "Arnav", "Dhruv", "Veer", "Ayaan", "Rudra",
+    "Rohan", "Karan", "Nikhil", "Suresh", "Ramesh", "Mahesh", "Rajesh",
+    "Priya", "Pooja", "Neha", "Sunita", "Geeta", "Suman", "Kavita", "Meena",
+    "Rahul", "Amit", "Sanjay", "Manoj", "Pankaj", "Sunil", "Deepak", "Vikram",
+    "Rajesh", "Sachin", "Alok", "Nitin", "Ashish", "Gaurav", "Manish", "Ankit",
+    "Shreya", "Pallavi", "Sneha", "Divya", "Aarti", "Rekha", "Sapna", "Nisha",
+]
+
 # ── DB (thread-safe single connection) ──────────────────────────────────────
 
 _db_lock = threading.Lock()
@@ -84,7 +96,7 @@ def _init_db():
 
 
 def _migrate_db():
-    """Handle schema migration from old bot.db (had 'points' column) to new schema (uses_remaining)."""
+    """Handle schema migration from old bot.db."""
     try:
         cols = [r[1] for r in _db_conn.execute("PRAGMA table_info(users)").fetchall()]
         if "uses_remaining" not in cols:
@@ -95,6 +107,9 @@ def _migrate_db():
             _db_conn.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
         if "points" in cols:
             _db_conn.execute("UPDATE users SET uses_remaining = points WHERE uses_remaining = 0 AND points > 0")
+        sub_cols = [r[1] for r in _db_conn.execute("PRAGMA table_info(submissions)").fetchall()]
+        if "mobile" not in sub_cols:
+            _db_conn.execute("ALTER TABLE submissions ADD COLUMN mobile TEXT")
         _db_conn.commit()
     except Exception as e:
         log.warning("migration note: %s", e)
@@ -160,8 +175,13 @@ def add_uses(chat_id, amount):
     _run("UPDATE users SET uses_remaining = uses_remaining + ? WHERE chat_id=?", (amount, chat_id))
 
 
-def record_submission(user_id, user_key, batch_code):
-    _run("INSERT INTO submissions (user_id, user_key, batch_code) VALUES (?,?,?)", (user_id, user_key, batch_code))
+def record_submission(user_id, user_key, batch_code, mobile=""):
+    _run("INSERT INTO submissions (user_id, user_key, batch_code, mobile) VALUES (?,?,?,?)",
+         (user_id, user_key, batch_code, mobile))
+
+
+def get_user_submissions(chat_id):
+    return _all("SELECT * FROM submissions WHERE user_id=? ORDER BY created_at DESC", (chat_id,))
 
 
 def count_submissions(chat_id):
@@ -307,10 +327,12 @@ def is_admin(uid):
 
 def main_menu(uid=None):
     rows = [
-        [btn("👤 Dashboard", "dashboard", "primary")],
+        [btn("👤 Dashboard", "dashboard", "primary"),
+         btn("📊 My Stats", "my_stats", "primary")],
         [btn("🎮 Start Registration", "start_reg", "success")],
-        [btn("📊 My Stats", "my_stats", "primary")],
-        [btn("🔗 Referral Link", "my_referral", "primary")],
+        [btn("📱 My Numbers", "my_numbers", "primary"),
+         btn("🔗 Referral Link", "my_referral", "primary")],
+        [btn("📖 Offer Info", "offer_info", "success")],
     ]
     if uid and is_admin(uid):
         rows.append([btn("🔧 Admin Panel", "admin_panel", "danger")])
@@ -353,10 +375,10 @@ def force_join_kb():
 
 
 def force_join_text():
-    lines = ["**Join to continue using the bot**"]
+    lines = ["🔒 **Join our channels to continue**\n"]
     for ch in REQUIRED_CHANNELS:
-        lines.append("- " + ch["title"] + ": " + ch["url"])
-    lines.append("\nJoin both, then tap 'I've Joined'.")
+        lines.append("👉 " + ch["title"] + ": " + ch["url"])
+    lines.append("\n✅ Join both, then tap 'I've Joined'.")
     return "\n".join(lines)
 
 
@@ -383,18 +405,23 @@ async def join_verified(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not user_exists(uid):
             u = q.from_user
             create_user(uid, u.id, u.username, u.first_name)
-        await q.edit_message_text("Welcome admin!", reply_markup=main_menu(uid))
+        await q.edit_message_text("✅ Welcome admin!", reply_markup=main_menu(uid))
         return
     ok, missing = await check_membership(ctx.bot, uid)
     if not ok:
-        await q.answer("You haven't joined " + missing["title"] + " yet!", show_alert=True)
+        await q.answer("❌ You haven't joined " + missing["title"] + " yet!", show_alert=True)
         return
     if not user_exists(uid):
         u = q.from_user
         create_user(uid, u.id, u.username, u.first_name)
-        await q.edit_message_text("Verified! Welcome to the bot.\nTap Start Registration to begin.", reply_markup=main_menu(uid))
+        await q.edit_message_text(
+            "✅ **Verified! Welcome to the bot!**\n\n"
+            "🎮 Tap **Start Registration** to play the Cremica game.\n"
+            "📖 Tap **Offer Info** to learn more.",
+            parse_mode="Markdown", reply_markup=main_menu(uid))
     else:
-        await q.edit_message_text("Verified! Welcome back.", reply_markup=main_menu(uid))
+        await q.edit_message_text("✅ **Verified! Welcome back!**", parse_mode="Markdown",
+                                  reply_markup=main_menu(uid))
 
 
 # ── handlers ─────────────────────────────────────────────────────────────────
@@ -416,7 +443,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     add_uses(referrer_id, REFERRAL_BONUS)
                     try:
                         await ctx.bot.send_message(referrer_id,
-                            f"New referral! {user.first_name or 'Someone'} joined via your link. +{REFERRAL_BONUS} uses added!")
+                            f"🎉 New referral!\n\n{user.first_name or 'Someone'} joined via your link.\n+{REFERRAL_BONUS} uses added!")
                     except Exception:
                         pass
         except (ValueError, IndexError):
@@ -424,13 +451,22 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not user_exists(uid):
         create_user(uid, user.id, user.username, user.first_name)
         await update.message.reply_text(
-            "Welcome " + (user.first_name or "") + "!\n\n"
-            "Cremica Back to School Game Bot\n"
-            "Complete registration and get Rs.20 reward!\n\n"
-            "You have " + str(FREE_USES) + " free uses. Refer friends for more!",
-            reply_markup=main_menu(uid))
+            f"🎉 Welcome {user.first_name or ''}!\n\n"
+            "🍼 **Cremica Back to School** Game Bot\n\n"
+            "Participate in Cremica's Back to School campaign.\n"
+            "Register with your number, complete the game,\n"
+            "and get a chance to win **Rs.20 reward**!\n\n"
+            f"🎁 You have **{FREE_USES} free uses**.\n"
+            "Refer friends to get more uses!\n\n"
+            "⏰ **Redemption time: 8:15 PM daily**\n"
+            "Use the same number you registered with to redeem.",
+            parse_mode="Markdown", reply_markup=main_menu(uid))
     else:
-        await update.message.reply_text("Welcome back " + (user.first_name or "") + "!", reply_markup=main_menu(uid))
+        await update.message.reply_text(
+            f"👋 Welcome back, {user.first_name or ''}!\n\n"
+            "🍼 **Cremica Back to School** Game Bot\n"
+            "Tap 🎮 Start Registration to begin!",
+            parse_mode="Markdown", reply_markup=main_menu(uid))
 
 
 async def dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -442,19 +478,22 @@ async def dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     subs = count_submissions(uid)
     refs = count_referrals(uid)
     txt = (
-        "**Your Dashboard**\n\n"
-        "Name: " + (u["first_name"] or u["username"] or str(uid)) + "\n"
-        "Uses Remaining: " + str(u["uses_remaining"]) + "\n"
-        "Total Submissions: " + str(subs) + "\n"
-        "Referrals: " + str(refs) + "\n"
-        "Joined: " + u["created_at"] + "\n\n"
-        "Each registration earns Rs.20 reward!\n"
-        "Refer friends to get " + str(REFERRAL_BONUS) + " more uses."
+        f"👤 **Dashboard**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🧑 Name: **{u['first_name'] or u['username'] or str(uid)}**\n"
+        f"📱 Uses Left: **{u['uses_remaining']}**\n"
+        f"✅ Games Played: **{subs}**\n"
+        f"👥 Referrals: **{refs}**\n"
+        f"📅 Joined: {u['created_at']}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"⏰ **Redeem at 8:15 PM** with same number!\n"
+        f"🔗 Refer friends for +{REFERRAL_BONUS} uses each."
     )
     kb = InlineKeyboardMarkup([
-        [btn("Start Registration", "start_reg", "success")],
-        [btn("Referral Link", "my_referral", "primary")],
-        [btn("Menu", "back_menu", "danger")],
+        [btn("🎮 Start Registration", "start_reg", "success")],
+        [btn("📱 My Numbers", "my_numbers", "primary"),
+         btn("🔗 Referral Link", "my_referral", "primary")],
+        [btn("🔙 Menu", "back_menu", "danger")],
     ])
     await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
 
@@ -465,20 +504,23 @@ async def my_stats_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     user = get_user(uid)
     if not user:
-        await q.edit_message_text("User not found.")
+        await q.edit_message_text("❌ User not found.")
         return
     subs = count_submissions(uid)
     refs = count_referrals(uid)
     text = (
-        "**Your Stats**\n\n"
-        "Name: " + (user["first_name"] or "Not set") + "\n"
-        "Uses Remaining: " + str(user["uses_remaining"]) + "\n"
-        "Total Submissions: " + str(subs) + "\n"
-        "Referrals: " + str(refs) + "\n"
-        "Joined: " + user["created_at"]
+        f"📊 **Your Stats**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🧑 Name: **{user['first_name'] or 'Not set'}**\n"
+        f"📱 Uses Left: **{user['uses_remaining']}**\n"
+        f"✅ Games Played: **{subs}**\n"
+        f"👥 Referrals: **{refs}**\n"
+        f"📅 Joined: {user['created_at']}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🎁 Each game = Rs.20 reward chance!"
     )
     await q.edit_message_text(text, parse_mode="Markdown",
-                              reply_markup=InlineKeyboardMarkup([[btn("Menu", "back_menu", "danger")]]))
+                              reply_markup=InlineKeyboardMarkup([[btn("🔙 Menu", "back_menu", "danger")]]))
 
 
 async def my_referral_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -489,19 +531,91 @@ async def my_referral_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_username = (await ctx.bot.get_me()).username
     ref_link = f"https://t.me/{bot_username}?start=ref_{uid}"
     await q.edit_message_text(
-        f"**Your Referral Link**\n\n`{ref_link}`\n\n"
-        f"Share with friends!\n"
-        f"Each referral gives +{REFERRAL_BONUS} uses.\n"
-        f"Total referrals: {refs}",
+        f"🔗 **Your Referral Link**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"`{ref_link}`\n\n"
+        f"📤 Share with friends!\n"
+        f"🎁 Each referral = **+{REFERRAL_BONUS} uses**\n"
+        f"👥 Total referrals: **{refs}**\n\n"
+        f"━━━━━━━━━━━━━━━━━━━",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[btn("Menu", "back_menu", "danger")]]))
+        reply_markup=InlineKeyboardMarkup([[btn("🔙 Menu", "back_menu", "danger")]]))
 
 
 async def back_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    await q.edit_message_text("**Main Menu**", parse_mode="Markdown", reply_markup=main_menu(uid))
+    await q.edit_message_text(
+        "🍼 **Cremica Back to School**\n\n"
+        "Choose an option below:",
+        parse_mode="Markdown", reply_markup=main_menu(uid))
+
+
+async def my_numbers_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    subs = get_user_submissions(uid)
+    if not subs:
+        await q.edit_message_text(
+            "📱 **My Numbers**\n"
+            "━━━━━━━━━━━━━━━━━━━\n\n"
+            "You haven't registered any numbers yet!\n"
+            "Tap 🎮 Start Registration to begin.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[btn("🔙 Menu", "back_menu", "danger")]]))
+        return
+    lines = []
+    for i, s in enumerate(subs, 1):
+        mobile = s["mobile"] or "N/A"
+        masked = mobile[:2] + "****" + mobile[-2:] if len(mobile) >= 6 else mobile
+        lines.append(f"**{i}.** `+91{masked}` | {s['batch_code']} | {s['created_at']}")
+    txt = (
+        f"📱 **My Numbers** ({len(subs)} registered)\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        + "\n".join(lines) + "\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"⏰ Redeem at **8:15 PM** with same number!"
+    )
+    await q.edit_message_text(txt, parse_mode="Markdown",
+                              reply_markup=InlineKeyboardMarkup([[btn("🔙 Menu", "back_menu", "danger")]]))
+
+
+OFFER_INFO_TEXT = (
+    "📖 **Cremica Back to School Offer**\n"
+    "━━━━━━━━━━━━━━━━━━━\n\n"
+    "🍼 **What is this?**\n"
+    "Cremica's Back to School campaign gives you a chance\n"
+    "to win **Rs.20 reward** by registering your product batch code\n"
+    "and playing a simple game!\n\n"
+    "📋 **How it works:**\n"
+    "1. Tap 🎮 **Start Registration**\n"
+    "2. Enter your 10-digit mobile number\n"
+    "3. Enter the OTP received\n"
+    "4. Bot auto-fills name, batch code & state\n"
+    "5. Game completed!\n\n"
+    "⏰ **Redemption:**\n"
+    "Redeem your reward at **8:15 PM daily**\n"
+    "Use the **same number** you registered with!\n"
+    "Go to: https://cremicabacktoschool.woohoo.in/redemption\n\n"
+    "🎁 **Rewards:**\n"
+    "Each registration = Rs.20 reward chance\n"
+    "Refer friends = +10 uses each!\n\n"
+    "━━━━━━━━━━━━━━━━━━━\n"
+    "💡 **Pro tip:** Use different numbers for more chances!"
+)
+
+
+async def offer_info_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    await q.edit_message_text(OFFER_INFO_TEXT, parse_mode="Markdown",
+                              reply_markup=InlineKeyboardMarkup([
+                                  [btn("🎮 Start Registration", "start_reg", "success")],
+                                  [btn("🔙 Menu", "back_menu", "danger")],
+                              ]))
 
 
 # ── Registration Flow ───────────────────────────────────────────────────────
@@ -519,16 +633,20 @@ async def start_reg_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = get_user(uid)
     if user["uses_remaining"] < 1:
         markup = InlineKeyboardMarkup([
-            [btn("Referral Link", "my_referral", "primary")],
-            [btn("Menu", "back_menu", "danger")],
+            [btn("🔗 Referral Link", "my_referral", "primary")],
+            [btn("🔙 Menu", "back_menu", "danger")],
         ])
         await q.edit_message_text(
-            f"No uses remaining!\nGet +{REFERRAL_BONUS} uses for each referral!",
-            reply_markup=markup)
+            f"❌ **No uses remaining!**\n\n"
+            f"🎁 Get +{REFERRAL_BONUS} uses for each referral!\n"
+            f"Share your referral link to earn more.",
+            parse_mode="Markdown", reply_markup=markup)
         return
     REGISTRATION_SESSIONS[uid] = {"state": "await_mobile"}
     await q.edit_message_text(
-        "**Cremica Registration**\n\n"
+        "🎮 **Cremica Registration**\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📱 Uses Left: **{user['uses_remaining']}**\n\n"
         "Step 1/2: Enter your 10-digit mobile number:\n"
         "(Send /cancel to exit)",
         parse_mode="Markdown")
@@ -537,7 +655,7 @@ async def start_reg_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     REGISTRATION_SESSIONS.pop(uid, None)
-    await update.message.reply_text("Cancelled. /start for main menu.", reply_markup=main_menu(uid))
+    await update.message.reply_text("❌ Cancelled. Use /start for main menu.", reply_markup=main_menu(uid))
 
 
 # ── callback router ──────────────────────────────────────────────────────────
@@ -564,7 +682,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "dashboard": dashboard, "back_menu": back_menu, "admin_panel": admin_panel,
         "admin_stats": admin_stats, "admin_users": admin_users,
         "start_reg": start_reg_callback, "my_stats": my_stats_callback,
-        "my_referral": my_referral_callback,
+        "my_referral": my_referral_callback, "my_numbers": my_numbers_callback,
+        "offer_info": offer_info_callback,
     }
     fn = handlers.get(data)
     if fn:
@@ -610,27 +729,29 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not s:
         if not await ensure_joined(update, ctx):
             return
-        await update.message.reply_text("Use the main menu buttons below:", reply_markup=main_menu(uid))
+        await update.message.reply_text(
+            "📌 Use the buttons below to navigate:",
+            reply_markup=main_menu(uid))
         return
 
     if s["state"] == "await_mobile":
         mobile = "".join(c for c in text if c.isdigit())
         if len(mobile) != 10:
-            await update.message.reply_text("Enter a valid 10-digit mobile number.")
+            await update.message.reply_text("⚠️ Enter a valid 10-digit mobile number.")
             return
 
-        status_msg = await update.message.reply_text("Creating your session ...")
+        status_msg = await update.message.reply_text("⏳ Creating your session ...")
         api = CreamicaAPI()
         user_data = api.create_user()
         if not user_data:
-            await status_msg.edit_text("Failed to create session. Try again later.")
+            await status_msg.edit_text("❌ Failed to create session. Try again later.")
             REGISTRATION_SESSIONS.pop(uid, None)
             return
 
         user_key = user_data.get("userKey")
         data_key = user_data.get("dataKey")
         if not user_key or not data_key:
-            await status_msg.edit_text("Invalid server response. Try again.")
+            await status_msg.edit_text("❌ Invalid server response. Try again.")
             REGISTRATION_SESSIONS.pop(uid, None)
             return
 
@@ -638,28 +759,28 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["data_key"] = data_key
         s["mobile"] = mobile
 
-        await status_msg.edit_text("Registering your details ...")
-        user = get_user(uid)
-        name = user["first_name"] or user["username"] or "User"
+        await status_msg.edit_text("📝 Registering your details ...")
+        name = random.choice(INDIAN_NAMES)
+        s["reg_name"] = name
         reg = api.register(name=name, mobile=mobile, user_key=user_key, data_key=data_key)
         if not reg:
-            await status_msg.edit_text("Registration failed. Try again later.")
+            await status_msg.edit_text("❌ Registration failed. Try again later.")
             REGISTRATION_SESSIONS.pop(uid, None)
             return
 
         s["state"] = "await_otp"
         await status_msg.edit_text(
-            "OTP sent to +91" + mobile + "!\n\n"
-            "Step 2/2: Enter the OTP you received:\n"
-            "(Send /cancel to exit)")
+            f"✅ OTP sent to +91{mobile}!\n\n"
+            f"Step 2/2: Enter the OTP you received:\n"
+            f"(Send /cancel to exit)")
 
     elif s["state"] == "await_otp":
         otp = "".join(c for c in text if c.isdigit())
         if len(otp) != 6:
-            await update.message.reply_text("Enter a valid 6-digit OTP.")
+            await update.message.reply_text("⚠️ Enter a valid 6-digit OTP.")
             return
 
-        status_msg = await update.message.reply_text("Verifying OTP ...")
+        status_msg = await update.message.reply_text("🔐 Verifying OTP ...")
         api = CreamicaAPI()
         user_key = s.get("user_key")
         data_key = s.get("data_key")
@@ -669,16 +790,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log.info("verify_otp response: %s", verify)
         except Exception as e:
             log.exception("verify_otp exception")
-            await status_msg.edit_text("OTP verification error: " + str(e))
+            await status_msg.edit_text("❌ OTP verification error: " + str(e))
             return
 
         if not verify or not verify.get("accessToken"):
             log.warning("verify_otp failed: %s", verify)
-            await status_msg.edit_text("Invalid OTP. Try again or send /cancel to abort.")
+            await status_msg.edit_text("❌ Invalid OTP. Try again or send /cancel to abort.")
             return
 
         access_token = verify["accessToken"]
-        await status_msg.edit_text("OTP verified! Submitting batch code ...")
+        await status_msg.edit_text("✅ OTP verified! Submitting batch code ...")
 
         batch_code = DEFAULT_BATCH_CODE
         state = random.choice(VALID_STATES)
@@ -691,11 +812,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             batch = None
 
         if not batch:
-            await status_msg.edit_text("Batch code submission failed. Try again later.")
+            await status_msg.edit_text("❌ Batch code submission failed. Try again later.")
             REGISTRATION_SESSIONS.pop(uid, None)
             return
 
-        await status_msg.edit_text("Starting game ...")
+        await status_msg.edit_text("🎮 Starting game ...")
         try:
             game = api.start_game(user_key, data_key, access_token)
             log.info("start_game response: %s", game)
@@ -703,26 +824,31 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log.exception("start_game exception")
 
         if not deduct_use(uid):
-            await status_msg.edit_text("No uses remaining.")
+            await status_msg.edit_text("❌ No uses remaining.")
             REGISTRATION_SESSIONS.pop(uid, None)
             return
 
-        record_submission(uid, user_key, batch_code)
+        record_submission(uid, user_key, batch_code, s["mobile"])
 
         user = get_user(uid)
+        reg_name = s.get("reg_name", "User")
         markup = InlineKeyboardMarkup([
-            [btn("Redeem Now", url=REDEMPTION_URL)],
-            [btn("Menu", "back_menu", "danger")],
+            [btn("🔗 Redeem at 8:15 PM", url=REDEMPTION_URL)],
+            [btn("📱 My Numbers", "my_numbers", "primary")],
+            [btn("🔙 Menu", "back_menu", "danger")],
         ])
         await status_msg.edit_text(
-            "**Registration Complete!**\n\n"
-            "Name: " + (user["first_name"] or "User") + "\n"
-            "Mobile: " + s["mobile"] + "\n"
-            "Batch Code: " + batch_code + "\n"
-            "State: " + state + "\n\n"
-            "Reward: Rs.20 (credited within 24 hours)\n"
-            "Remaining uses: " + str(user["uses_remaining"]) + "\n\n"
-            "Tap **Redeem Now** to claim your reward!",
+            f"🎉 **GAME COMPLETED!** 🎉\n"
+            f"━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🧑 Name: **{reg_name}**\n"
+            f"📱 Mobile: `+91{s['mobile']}`\n"
+            f"📦 Batch Code: `{batch_code}`\n"
+            f"📍 State: **{state}**\n\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"⏰ **Redeem at 8:15 PM** with same number!\n"
+            f"🔗 Go to redemption page & enter your number.\n\n"
+            f"📱 Uses Left: **{user['uses_remaining']}**\n"
+            f"━━━━━━━━━━━━━━━━━━━",
             parse_mode="Markdown", reply_markup=markup)
 
         REGISTRATION_SESSIONS.pop(uid, None)
@@ -736,23 +862,26 @@ async def admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     uid = q.from_user.id
     if not is_admin(uid):
-        await q.edit_message_text("Access denied.", reply_markup=main_menu(uid))
+        await q.edit_message_text("⛔ Access denied.", reply_markup=main_menu(uid))
         return
     txt = (
-        "**Admin Panel**\n\n"
-        "Total users: " + str(total_users()) + "\n"
-        "Total submissions: " + str(total_submissions()) + "\n"
-        "Total referrals: " + str(total_referrals()) + "\n\n"
-        "Commands:\n"
-        "`/give [user_id] [uses]` - Add uses\n"
-        "`/stats` - Detailed stats\n"
-        "`/users` - List all users\n"
-        "`/broadcast [msg]` - Send message to all users"
+        f"🔧 **Admin Panel**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Total users: **{total_users()}**\n"
+        f"✅ Total submissions: **{total_submissions()}**\n"
+        f"🔗 Total referrals: **{total_referrals()}**\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 **Commands:**\n"
+        f"`/give [user_id] [uses]` - Add uses\n"
+        f"`/stats` - Detailed stats\n"
+        f"`/users` - List all users\n"
+        f"`/broadcast [msg]` - Send to all users"
     )
     kb = InlineKeyboardMarkup([
-        [btn("Stats", "admin_stats", "primary"), btn("All Users", "admin_users", "primary")],
-        [btn("Broadcast", "admin_broadcast", "success")],
-        [btn("Menu", "back_menu", "danger")],
+        [btn("📊 Stats", "admin_stats", "primary"),
+         btn("👥 Users", "admin_users", "primary")],
+        [btn("📢 Broadcast", "admin_broadcast", "success")],
+        [btn("🔙 Menu", "back_menu", "danger")],
     ])
     await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
 
@@ -763,13 +892,14 @@ async def admin_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(q.from_user.id):
         return
     txt = (
-        "**Bot Statistics**\n\n"
-        "Total users: " + str(total_users()) + "\n"
-        "Total submissions: " + str(total_submissions()) + "\n"
-        "Total referrals: " + str(total_referrals()) + "\n"
-        "Admins: " + str(ADMIN_IDS)
+        f"📊 **Bot Statistics**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Total users: **{total_users()}**\n"
+        f"✅ Total submissions: **{total_submissions()}**\n"
+        f"🔗 Total referrals: **{total_referrals()}**\n"
+        f"🆔 Admins: `{ADMIN_IDS}`"
     )
-    kb = InlineKeyboardMarkup([[btn("Back to Admin", "admin_panel", "danger")]])
+    kb = InlineKeyboardMarkup([[btn("🔙 Back to Admin", "admin_panel", "danger")]])
     await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
 
 
@@ -782,9 +912,9 @@ async def admin_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = []
     for u in us[:20]:
         lines.append(f"`{u['chat_id']}` | {u['first_name'] or u['username'] or '?'} | uses: `{u['uses_remaining']}`")
-    txt = "**Users (last 20)**\n\n" + "\n".join(lines)
+    txt = "👥 **Users (last 20)**\n\n" + "\n".join(lines)
     await q.edit_message_text(txt, parse_mode="Markdown",
-                              reply_markup=InlineKeyboardMarkup([[btn("Back to Admin", "admin_panel", "danger")]]))
+                              reply_markup=InlineKeyboardMarkup([[btn("🔙 Back to Admin", "admin_panel", "danger")]]))
 
 
 async def admin_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
