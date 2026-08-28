@@ -295,7 +295,9 @@ ADMIN_STATE = {}
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-def btn(text, cb, style="primary"):
+def btn(text, cb=None, style="primary", url=None):
+    if url:
+        return InlineKeyboardButton(text, url=url)
     return InlineKeyboardButton(text, callback_data=cb, style=style)
 
 
@@ -662,8 +664,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user_key = s.get("user_key")
         data_key = s.get("data_key")
 
-        verify = api.verify_otp(otp, user_key, data_key)
+        try:
+            verify = api.verify_otp(otp, user_key, data_key)
+            log.info("verify_otp response: %s", verify)
+        except Exception as e:
+            log.exception("verify_otp exception")
+            await status_msg.edit_text("OTP verification error: " + str(e))
+            return
+
         if not verify or not verify.get("accessToken"):
+            log.warning("verify_otp failed: %s", verify)
             await status_msg.edit_text("Invalid OTP. Try again or send /cancel to abort.")
             return
 
@@ -673,14 +683,24 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         batch_code = DEFAULT_BATCH_CODE
         state = random.choice(VALID_STATES)
 
-        batch = api.get_batch_code(batch_code, state, user_key, data_key, access_token)
+        try:
+            batch = api.get_batch_code(batch_code, state, user_key, data_key, access_token)
+            log.info("get_batch_code response: %s", batch)
+        except Exception as e:
+            log.exception("get_batch_code exception")
+            batch = None
+
         if not batch:
             await status_msg.edit_text("Batch code submission failed. Try again later.")
             REGISTRATION_SESSIONS.pop(uid, None)
             return
 
         await status_msg.edit_text("Starting game ...")
-        api.start_game(user_key, data_key, access_token)
+        try:
+            game = api.start_game(user_key, data_key, access_token)
+            log.info("start_game response: %s", game)
+        except Exception as e:
+            log.exception("start_game exception")
 
         if not deduct_use(uid):
             await status_msg.edit_text("No uses remaining.")
