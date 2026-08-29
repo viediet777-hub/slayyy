@@ -31,7 +31,10 @@ REQUIRED_CHANNELS = [
 CREMICA_BASE_URL = "https://cremicabacktoschool.woohoo.in"
 MASTER_KEY = "1007327481"
 UTM_SOURCE = "telegram_bot"
-DEFAULT_BATCH_CODE = "CD09G26"
+DEFAULT_BATCH_CODE = os.environ.get("BATCH_CODE") or "CD09G26"
+# Multiple batch codes (comma separated) - agar ek fail ho toh agla try karega.
+# Format bundle se: "e.g. MBC2024001" (Lot Number, 6+ chars, uppercase)
+BATCH_CODES = [c.strip().upper() for c in os.environ.get("BATCH_CODES", DEFAULT_BATCH_CODE).split(",") if c.strip()]
 FREE_USES = 10
 REFERRAL_BONUS = 10
 REDEMPTION_URL = "https://cremicabacktoschool.woohoo.in/redemption"
@@ -296,11 +299,53 @@ class CreamicaAPI:
         return self._signed_request("users/resendOtp/", {}, user_key, data_key)
 
     def get_batch_code(self, batch_code: str, state: str, user_key: str, data_key: str, access_token: str):
-        return self._signed_request("users/getBatchCode/",
-                                    {"batchCode": batch_code, "state": state}, user_key, data_key, access_token)
+        """Submit batch code. Retries on transient failure. Returns dict or None."""
+        last = None
+        for attempt in range(3):
+            last = self._signed_request("users/getBatchCode/",
+                                        {"batchCode": batch_code, "state": state}, user_key, data_key, access_token)
+            if last is not None:
+                return last
+            log.warning("get_batch_code attempt %d failed for %s", attempt + 1, batch_code)
+            time.sleep(1)
+        return last
 
     def start_game(self, user_key: str, data_key: str, access_token: str = None):
         return self._signed_request("users/startGame/", {}, user_key, data_key, access_token)
+
+    def end_game(self, game_key: str, score: int, time_ms: int, key1: str, key2: str, key3: str,
+                 user_key: str, data_key: str, access_token: str = None):
+        """Submit game completion + score to users/endGame/ (score = 30 x coins)."""
+        payload = {"gameKey": game_key, "score": score, "time": time_ms,
+                   "key1": key1, "key2": key2, "key3": key3}
+        return self._signed_request("users/endGame/", payload, user_key, data_key, access_token)
+
+
+# ── CryptoJS-compatible AES (score encryption for endGame) ───────────────────
+# Game score keys key1/key2/key3 = CryptoJS AES.encrypt(msg, gameKey) in
+# OpenSSL "Salted__" format. Same as game bundle's uS()/dS().
+
+def _evp_bytes_to_key(passphrase: bytes, salt: bytes, key_len=32, iv_len=16):
+    d = b""
+    prev = b""
+    while len(d) < key_len + iv_len:
+        prev = hashlib.md5(prev + passphrase + salt).digest()
+        d += prev
+    return d[:key_len], d[key_len:key_len + iv_len]
+
+
+def crypto_js_encrypt(plain_text: str, passphrase: str) -> str:
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad
+    salt = os.urandom(8)
+    key, iv = _evp_bytes_to_key(passphrase.encode(), salt)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    ct = cipher.encrypt(pad(plain_text.encode(), AES.block_size))
+    return ("Salted__" + salt.decode("latin1") + ct.decode("latin1")).encode("latin1").hex()
+
+
+GAME_TARGET_SCORE = 1020   # 34 coins * 30 = 1020 (1000 se upar)
+GAME_TIME_MS = 60000       # 60 sec game time
 
 
 # ── TELEGRAM BOT ─────────────────────────────────────────────────────────────
@@ -801,27 +846,66 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         access_token = verify["accessToken"]
         await status_msg.edit_text("✅ OTP verified! Submitting batch code ...")
 
-        batch_code = DEFAULT_BATCH_CODE
         state = random.choice(VALID_STATES)
+        batch_result = None
+        used_batch = None
 
-        try:
-            batch = api.get_batch_code(batch_code, state, user_key, data_key, access_token)
-            log.info("get_batch_code response: %s", batch)
-        except Exception as e:
-            log.exception("get_batch_code exception")
-            batch = None
+        # Try each configured batch code until one works
+        for bc in BATCH_CODES:
+            try:
+                r = api.get_batch_code(bc, state, user_key, data_key, access_token)
+                log.info("get_batch_code %s response: %s", bc, r)
+            except Exception as e:
+                log.exception("get_batch_code exception for %s", bc)
+                r = None
+            if r:
+                # success = HTTP ok; check decoded status if present
+                if isinstance(r, dict) and r.get("statusCode") not in (None, 200):
+                    log.warning("batch %s rejected: %s", bc, r)
+                    continue
+                batch_result = r
+                used_batch = bc
+                break
+            log.warning("batch %s failed (None), next...", bc)
 
-        if not batch:
-            await status_msg.edit_text("❌ Batch code submission failed. Try again later.")
+        if not batch_result:
+            await status_msg.edit_text(
+                f"❌ Batch code submission failed.\n"
+                f"Tested: {', '.join(BATCH_CODES)}\n"
+                f"Set BATCH_CODE/BATCH_CODES env with a valid lot number (format: MBC2024001).")
             REGISTRATION_SESSIONS.pop(uid, None)
             return
+        batch_code = used_batch
 
         await status_msg.edit_text("🎮 Starting game ...")
+        game = None
         try:
             game = api.start_game(user_key, data_key, access_token)
             log.info("start_game response: %s", game)
         except Exception as e:
             log.exception("start_game exception")
+
+        # Submit game completion + score (proper game complete). Score = 30 x coins.
+        game_key = ""
+        if isinstance(game, dict):
+            game_key = game.get("gameKey") or game.get("game_key") or ""
+        score_ok = False
+        if game_key:
+            try:
+                start_ms = int(time.time() * 1000) - GAME_TIME_MS
+                metadata = {"t1": start_ms, "t2": [], "t3": GAME_TARGET_SCORE // 30}
+                key1 = crypto_js_encrypt(str(GAME_TARGET_SCORE), game_key)
+                key2 = crypto_js_encrypt(str(GAME_TIME_MS), game_key)
+                key3 = crypto_js_encrypt(json.dumps(metadata), game_key)
+                e_resp = api.end_game(game_key, GAME_TARGET_SCORE, GAME_TIME_MS,
+                                      key1, key2, key3, user_key, data_key, access_token)
+                log.info("end_game response: %s", e_resp)
+                score_ok = e_resp is not None
+            except Exception as e:
+                log.exception("end_game exception")
+        else:
+            log.warning("No gameKey from start_game - endGame skip")
+        log.info("game score target=%s submitted=%s", GAME_TARGET_SCORE, score_ok)
 
         if not deduct_use(uid):
             await status_msg.edit_text("❌ No uses remaining.")
@@ -843,6 +927,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🧑 Name: **{reg_name}**\n"
             f"📱 Mobile: `+91{s['mobile']}`\n"
             f"📦 Batch Code: `{batch_code}`\n"
+            f"🎯 Score: **{GAME_TARGET_SCORE}** ({'✅ submitted' if score_ok else '⚠️ not submitted'})\n"
             f"📍 State: **{state}**\n\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"⏰ **Redeem at 8:15 PM** with same number!\n"
